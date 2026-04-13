@@ -11,18 +11,23 @@ import (
 
 // workspacePath resolves a relative path within the workspace, preventing directory traversal.
 func workspacePath(workspaceDir, path string) (string, error) {
+	// Expand ~ to indicate it's not supported here.
+	if strings.HasPrefix(path, "~") {
+		return "", fmt.Errorf("path %q uses ~, which is not supported. Use paths relative to the workspace (%s), or use the cli tool for files outside the workspace", path, workspaceDir)
+	}
+
 	cleaned := filepath.Clean(path)
 
 	if filepath.IsAbs(cleaned) {
-		return "", fmt.Errorf("absolute paths not allowed: %s", path)
+		return "", fmt.Errorf("absolute path %q not allowed. Use paths relative to the workspace (%s), or use the cli tool (e.g. cat %s) for files outside the workspace", path, workspaceDir, path)
 	}
 	if strings.HasPrefix(cleaned, "..") {
-		return "", fmt.Errorf("path escapes workspace: %s", path)
+		return "", fmt.Errorf("path %q escapes workspace (%s). Use the cli tool for files outside the workspace", path, workspaceDir)
 	}
 
 	full := filepath.Join(workspaceDir, cleaned)
 	if !strings.HasPrefix(full, workspaceDir) {
-		return "", fmt.Errorf("path escapes workspace: %s", path)
+		return "", fmt.Errorf("path %q escapes workspace (%s)", path, workspaceDir)
 	}
 
 	return full, nil

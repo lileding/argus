@@ -13,16 +13,17 @@ import (
 
 // Agent is the core agent loop with harness-based context assembly.
 type Agent struct {
-	model        model.Client
-	store        store.Store
-	toolRegistry *tool.Registry
-	skillIndex   *skill.SkillIndex
-	basePrompt   string
+	model         model.Client
+	store         store.Store
+	toolRegistry  *tool.Registry
+	skillIndex    *skill.SkillIndex
+	basePrompt    string
+	workspaceDir  string
 	contextWindow int
 	maxIterations int
 }
 
-func New(modelClient model.Client, st store.Store, toolReg *tool.Registry, skillIdx *skill.SkillIndex, basePrompt string, contextWindow, maxIterations int) *Agent {
+func New(modelClient model.Client, st store.Store, toolReg *tool.Registry, skillIdx *skill.SkillIndex, basePrompt, workspaceDir string, contextWindow, maxIterations int) *Agent {
 	if maxIterations == 0 {
 		maxIterations = 10
 	}
@@ -31,6 +32,7 @@ func New(modelClient model.Client, st store.Store, toolReg *tool.Registry, skill
 		store:         st,
 		toolRegistry:  toolReg,
 		skillIndex:    skillIdx,
+		workspaceDir:  workspaceDir,
 		basePrompt:    basePrompt,
 		contextWindow: contextWindow,
 		maxIterations: maxIterations,
