@@ -6,8 +6,9 @@ func builtinSkills() []*SkillEntry {
 	return []*SkillEntry{
 		{
 			Name:        "powershell-cli",
-			Description: "Use PowerShell commands to process files, text, and data. Covers Get-ChildItem, Select-String, Sort-Object, ConvertFrom-Json, and pipelines.",
+			Description: "Use PowerShell commands to process files, text, and data.",
 			Tools:       []string{"cli"},
+			Builtin:     true,
 			Prompt: `## PowerShell CLI Toolkit
 
 You have access to PowerShell commands via the cli tool.

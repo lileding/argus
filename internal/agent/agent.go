@@ -11,6 +11,8 @@ import (
 	"argus/internal/tool"
 )
 
+const maxToolResultBytes = 16 * 1024 // 16KB — prevents a single tool result from blowing up context
+
 // Agent is the core agent loop with harness-based context assembly.
 type Agent struct {
 	model         model.Client
@@ -100,6 +102,7 @@ func (a *Agent) Handle(ctx context.Context, chatID, userMessage string) (string,
 			)
 
 			result := a.executeTool(ctx, tc)
+			result = truncateResult(result, maxToolResultBytes)
 
 			slog.Info("tool result",
 				"tool", tc.Function.Name,
@@ -132,4 +135,12 @@ func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) string {
 	}
 
 	return result
+}
+
+// truncateResult caps tool output to maxBytes, appending a notice if truncated.
+func truncateResult(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	return s[:maxBytes] + fmt.Sprintf("\n\n... [truncated: output was %d bytes, showing first %d]", len(s), maxBytes)
 }

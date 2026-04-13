@@ -58,7 +58,13 @@ func (a *Agent) buildSystemPrompt() string {
 	sb.WriteString(fmt.Sprintf("Workspace directory: %s\n", a.workspaceDir))
 	sb.WriteString("The read_file and write_file tools operate on paths relative to this workspace. For files outside the workspace, use the cli tool with absolute paths (e.g. `cat /home/user/file.txt`).\n")
 
-	// Skill catalog: all skills' name + description, so LLM knows what's available.
+	// Inject builtin skill prompts directly — these contain critical behavioral rules.
+	builtinPrompts := a.skillIndex.BuiltinPrompts()
+	if builtinPrompts != "" {
+		sb.WriteString(builtinPrompts)
+	}
+
+	// Skill catalog for user-created skills.
 	catalog := a.skillIndex.Catalog()
 	if catalog != "" {
 		sb.WriteString("\n")

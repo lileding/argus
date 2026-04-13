@@ -6,8 +6,9 @@ func builtinSkills() []*SkillEntry {
 	return []*SkillEntry{
 		{
 			Name:        "posix-cli",
-			Description: "Use POSIX command-line tools to process files, text, and data. Covers grep, find, awk, sed, sort, xargs, head, tail, wc, curl, jq, and pipelines. Use when the user asks to search, transform, analyze, or process files and data.",
+			Description: "Use POSIX command-line tools to process files, text, and data.",
 			Tools:       []string{"cli"},
+			Builtin:     true,
 			Prompt: `## POSIX CLI Toolkit
 
 You have access to standard POSIX command-line tools via the cli tool. Use these to efficiently process files, text, and data.

@@ -13,6 +13,7 @@ type SkillEntry struct {
 	Description            string
 	Tools                  []string
 	DisableModelInvocation bool
+	Builtin                bool      // compiled into binary, always injected into system prompt
 	Prompt                 string    // markdown body (after frontmatter)
 	FilePath               string    // absolute path to SKILL.md
 	ModTime                time.Time // for change detection
@@ -56,6 +57,23 @@ func (idx *SkillIndex) All() []*SkillEntry {
 		result = append(result, e)
 	}
 	return result
+}
+
+// BuiltinPrompts returns the full prompts of all builtin skills, to be injected directly
+// into the system prompt (not behind activate_skill).
+func (idx *SkillIndex) BuiltinPrompts() string {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	var sb strings.Builder
+	for _, e := range idx.entries {
+		if e.Builtin && e.Prompt != "" {
+			sb.WriteString("\n")
+			sb.WriteString(e.Prompt)
+			sb.WriteString("\n")
+		}
+	}
+	return sb.String()
 }
 
 // Catalog returns a compact listing of all model-invocable skills for the system prompt.
