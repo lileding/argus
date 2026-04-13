@@ -1,0 +1,30 @@
+server:
+  port: "8080"
+
+feishu:
+  app_id: ""
+  app_secret: ""
+  verification_token: ""
+  encrypt_key: ""
+
+model:
+  base_url: "http://localhost:11434/v1"
+  model_name: "gemma3:27b"
+  api_key: ""
+  max_tokens: 4096
+  timeout: 120s
+
+database:
+  dsn: "postgres://argus:argus@localhost:5432/argus?sslmode=disable"
+
+agent:
+  max_iterations: 10
+  context_window: 20
+  workspace_dir: "./workspace"
+  system_prompt: "你是 Argus，一个私人助理。你有记忆，能使用工具，帮助用户完成各种任务。回答简洁、准确、有帮助。"
+
+docker:
+  image: "argus-sandbox:latest"
+  timeout: 30s
+  memory_limit: "512m"
+  network: "none"
