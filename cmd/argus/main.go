@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 
 	_ "github.com/lib/pq"
 
@@ -17,6 +18,7 @@ import (
 	"argus/internal/feishu"
 	"argus/internal/model"
 	"argus/internal/store"
+	"argus/internal/tool"
 )
 
 func main() {
@@ -41,15 +43,44 @@ func main() {
 	}
 }
 
+// ensureWorkspace creates the workspace directory if it doesn't exist.
+func ensureWorkspace(dir string) string {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		slog.Error("resolve workspace", "err", err)
+		os.Exit(1)
+	}
+	if err := os.MkdirAll(abs, 0755); err != nil {
+		slog.Error("create workspace", "err", err)
+		os.Exit(1)
+	}
+	return abs
+}
+
+// buildRegistry creates and populates the tool registry.
+func buildRegistry(cfg *config.Config, workspaceDir string, db *sql.DB) *tool.Registry {
+	registry := tool.NewRegistry()
+	registry.Register(tool.NewFileTool(workspaceDir))
+	registry.Register(tool.NewCLITool(cfg.Docker, workspaceDir))
+	registry.Register(tool.NewSearchTool())
+	if db != nil {
+		registry.Register(tool.NewDBTool(db))
+	}
+	return registry
+}
+
 func runCLI(cfg *config.Config) {
+	workspaceDir := ensureWorkspace(cfg.Agent.WorkspaceDir)
 	modelClient := model.NewOpenAIClient(cfg.Model)
 	memStore := store.NewMemoryStore()
-	ag := agent.New(modelClient, memStore, cfg.Agent.SystemPrompt, cfg.Agent.ContextWindow)
+	registry := buildRegistry(cfg, workspaceDir, nil)
+	ag := agent.New(modelClient, memStore, registry, cfg.Agent.SystemPrompt, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
 
 	chatID := "cli:local"
 	ctx := context.Background()
 
 	fmt.Println("Argus CLI mode. Type messages, Ctrl+C to quit.")
+	fmt.Printf("Workspace: %s\n", workspaceDir)
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Print("> ")
 	for scanner.Scan() {
@@ -70,6 +101,7 @@ func runCLI(cfg *config.Config) {
 
 func runServer(cfg *config.Config) {
 	ctx := context.Background()
+	workspaceDir := ensureWorkspace(cfg.Agent.WorkspaceDir)
 
 	// Connect to PostgreSQL.
 	db, err := sql.Open("postgres", cfg.Database.DSN)
@@ -86,7 +118,8 @@ func runServer(cfg *config.Config) {
 	}
 
 	modelClient := model.NewOpenAIClient(cfg.Model)
-	ag := agent.New(modelClient, pgStore, cfg.Agent.SystemPrompt, cfg.Agent.ContextWindow)
+	registry := buildRegistry(cfg, workspaceDir, db)
+	ag := agent.New(modelClient, pgStore, registry, cfg.Agent.SystemPrompt, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
 
 	feishuClient := feishu.NewClient(cfg.Feishu)
 
@@ -108,7 +141,7 @@ func runServer(cfg *config.Config) {
 	mux.Handle("/webhook/feishu", handler)
 
 	addr := ":" + cfg.Server.Port
-	slog.Info("starting server", "addr", addr)
+	slog.Info("starting server", "addr", addr, "workspace", workspaceDir)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		slog.Error("server error", "err", err)
 		os.Exit(1)
