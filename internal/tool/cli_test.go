@@ -9,18 +9,18 @@ import (
 	"testing"
 	"time"
 
-	"argus/internal/config"
+	"argus/internal/sandbox"
 )
 
-// localCLI creates a CLITool in local mode for testing.
+// localCLI creates a CLITool backed by a local sandbox for testing.
 func localCLI(t *testing.T) (*CLITool, string) {
 	t.Helper()
 	dir := t.TempDir()
-	cfg := config.DockerConfig{
-		Image:   "local",
-		Timeout: 10 * time.Second,
+	sb := &sandbox.Local{
+		WorkspaceDir: dir,
+		Timeout:      10 * time.Second,
 	}
-	return NewCLITool(cfg, dir), dir
+	return NewCLITool(sb), dir
 }
 
 func call(t *testing.T, cli *CLITool, command string) string {
@@ -209,11 +209,11 @@ func TestCLI_Date(t *testing.T) {
 // --- Test: command timeout ---
 func TestCLI_Timeout(t *testing.T) {
 	dir := t.TempDir()
-	cfg := config.DockerConfig{
-		Image:   "local",
-		Timeout: 1 * time.Second,
+	sb := &sandbox.Local{
+		WorkspaceDir: dir,
+		Timeout:      1 * time.Second,
 	}
-	cli := NewCLITool(cfg, dir)
+	cli := NewCLITool(sb)
 
 	_, err := cli.Execute(context.Background(), `{"command":"sleep 10"}`)
 	if err == nil {

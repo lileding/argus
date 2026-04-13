@@ -13,9 +13,9 @@ type Config struct {
 	Feishu   FeishuConfig   `yaml:"feishu"`
 	Model    ModelConfig    `yaml:"model"`
 	Database DatabaseConfig `yaml:"database"`
-	Agent    AgentConfig    `yaml:"agent"`
-	Docker   DockerConfig   `yaml:"docker"`
-	Cron     CronConfig     `yaml:"cron"`
+	Agent   AgentConfig   `yaml:"agent"`
+	Sandbox SandboxConfig `yaml:"sandbox"`
+	Cron    CronConfig    `yaml:"cron"`
 }
 
 type CronConfig struct {
@@ -62,11 +62,12 @@ type AgentConfig struct {
 	SkillRescan   time.Duration `yaml:"skill_rescan"`
 }
 
-type DockerConfig struct {
-	Image       string        `yaml:"image"`
+type SandboxConfig struct {
+	Type        string        `yaml:"type"`         // "local" or "docker"
+	Image       string        `yaml:"image"`        // docker image name
 	Timeout     time.Duration `yaml:"timeout"`
-	MemoryLimit string        `yaml:"memory_limit"`
-	Network     string        `yaml:"network"`
+	MemoryLimit string        `yaml:"memory_limit"` // docker only
+	Network     string        `yaml:"network"`      // docker only
 }
 
 func Load(path string) (*Config, error) {
@@ -120,17 +121,20 @@ func (c *Config) applyDefaults() {
 	if c.Agent.SkillRescan == 0 {
 		c.Agent.SkillRescan = 30 * time.Second
 	}
-	if c.Docker.Image == "" {
-		c.Docker.Image = "argus-sandbox:latest"
+	if c.Sandbox.Type == "" {
+		c.Sandbox.Type = "local"
 	}
-	if c.Docker.Timeout == 0 {
-		c.Docker.Timeout = 30 * time.Second
+	if c.Sandbox.Image == "" {
+		c.Sandbox.Image = "argus-sandbox"
 	}
-	if c.Docker.MemoryLimit == "" {
-		c.Docker.MemoryLimit = "512m"
+	if c.Sandbox.Timeout == 0 {
+		c.Sandbox.Timeout = 30 * time.Second
 	}
-	if c.Docker.Network == "" {
-		c.Docker.Network = "none"
+	if c.Sandbox.MemoryLimit == "" {
+		c.Sandbox.MemoryLimit = "512m"
+	}
+	if c.Sandbox.Network == "" {
+		c.Sandbox.Network = "none"
 	}
 }
 

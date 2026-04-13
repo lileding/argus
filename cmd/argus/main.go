@@ -18,6 +18,7 @@ import (
 	"argus/internal/cron"
 	"argus/internal/feishu"
 	"argus/internal/model"
+	"argus/internal/sandbox"
 	"argus/internal/skill"
 	"argus/internal/store"
 	"argus/internal/tool"
@@ -77,11 +78,30 @@ func setupSkills(cfg *config.Config) *skill.FileLoader {
 	return loader
 }
 
+// buildSandbox creates the appropriate sandbox based on config.
+func buildSandbox(cfg *config.Config) sandbox.Sandbox {
+	switch cfg.Sandbox.Type {
+	case "docker":
+		return &sandbox.Docker{
+			Image:        cfg.Sandbox.Image,
+			WorkspaceDir: cfg.Agent.WorkspaceDir,
+			Network:      cfg.Sandbox.Network,
+			MemoryLimit:  cfg.Sandbox.MemoryLimit,
+			Timeout:      cfg.Sandbox.Timeout,
+		}
+	default: // "local"
+		return &sandbox.Local{
+			WorkspaceDir: cfg.Agent.WorkspaceDir,
+			Timeout:      cfg.Sandbox.Timeout,
+		}
+	}
+}
+
 // buildToolRegistry creates the tool registry with all available tools.
-func buildToolRegistry(cfg *config.Config, loader *skill.FileLoader, db *sql.DB) *tool.Registry {
+func buildToolRegistry(cfg *config.Config, sb sandbox.Sandbox, loader *skill.FileLoader, db *sql.DB) *tool.Registry {
 	registry := tool.NewRegistry()
 	registry.Register(tool.NewFileTool(cfg.Agent.WorkspaceDir))
-	registry.Register(tool.NewCLITool(cfg.Docker, cfg.Agent.WorkspaceDir))
+	registry.Register(tool.NewCLITool(sb))
 	registry.Register(tool.NewSearchTool())
 
 	skillsDir := filepath.Join(cfg.Agent.WorkspaceDir, cfg.Agent.SkillsDir)
@@ -102,7 +122,8 @@ func runCLI(cfg *config.Config) {
 
 	modelClient := model.NewOpenAIClient(cfg.Model)
 	memStore := store.NewMemoryStore()
-	toolReg := buildToolRegistry(cfg, loader, nil)
+	sb := buildSandbox(cfg)
+	toolReg := buildToolRegistry(cfg, sb, loader, nil)
 	ag := agent.New(modelClient, memStore, toolReg, loader.Index(), cfg.Agent.SystemPrompt, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
 
 	chatID := "cli:local"
@@ -149,7 +170,8 @@ func runServer(cfg *config.Config) {
 	}
 
 	modelClient := model.NewOpenAIClient(cfg.Model)
-	toolReg := buildToolRegistry(cfg, loader, db)
+	sb := buildSandbox(cfg)
+	toolReg := buildToolRegistry(cfg, sb, loader, db)
 	ag := agent.New(modelClient, pgStore, toolReg, loader.Index(), cfg.Agent.SystemPrompt, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
 
 	feishuClient := feishu.NewClient(cfg.Feishu)

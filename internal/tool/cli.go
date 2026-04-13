@@ -4,30 +4,24 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
-	"path/filepath"
-	"strings"
-	"time"
 
-	"argus/internal/config"
+	"argus/internal/sandbox"
 )
 
-// CLITool executes shell commands. In Docker mode (default), commands run inside
-// a sandboxed container. In local mode (Image == "local"), commands run directly
-// on the host, restricted to the workspace directory.
+// CLITool executes shell commands via a sandbox.
+// The tool defines WHAT to run; the sandbox decides WHERE to run it.
 type CLITool struct {
-	cfg          config.DockerConfig
-	workspaceDir string
+	sandbox sandbox.Sandbox
 }
 
-func NewCLITool(cfg config.DockerConfig, workspaceDir string) *CLITool {
-	return &CLITool{cfg: cfg, workspaceDir: workspaceDir}
+func NewCLITool(sb sandbox.Sandbox) *CLITool {
+	return &CLITool{sandbox: sb}
 }
 
 func (t *CLITool) Name() string { return "cli" }
 
 func (t *CLITool) Description() string {
-	return "Execute a shell command. The workspace directory is available at /workspace (Docker) or directly (local mode). Use this for running scripts, data processing, or any computation."
+	return "Execute a shell command in the sandbox environment. The workspace directory is available for file operations. Use this for running scripts, data processing, or any computation."
 }
 
 func (t *CLITool) Parameters() json.RawMessage {
@@ -52,67 +46,5 @@ func (t *CLITool) Execute(ctx context.Context, arguments string) (string, error)
 		return "", fmt.Errorf("parse arguments: %w", err)
 	}
 
-	timeout := t.cfg.Timeout
-	if timeout == 0 {
-		timeout = 30 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	// Local mode: run directly on host.
-	if t.cfg.Image == "local" {
-		return t.executeLocal(ctx, args)
-	}
-
-	// Docker mode: run inside container.
-	return t.executeDocker(ctx, args)
-}
-
-func (t *CLITool) executeLocal(ctx context.Context, args cliArgs) (string, error) {
-	workDir := t.workspaceDir
-	if args.WorkingDir != "" {
-		workDir = filepath.Join(t.workspaceDir, filepath.Clean(args.WorkingDir))
-	}
-
-	cmd := exec.CommandContext(ctx, "sh", "-c", args.Command)
-	cmd.Dir = workDir
-	output, err := cmd.CombinedOutput()
-
-	result := strings.TrimSpace(string(output))
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("command timed out")
-		}
-		return fmt.Sprintf("exit code: %v\noutput:\n%s", err, result), nil
-	}
-	return result, nil
-}
-
-func (t *CLITool) executeDocker(ctx context.Context, args cliArgs) (string, error) {
-	if args.WorkingDir == "" {
-		args.WorkingDir = "/workspace"
-	}
-
-	dockerArgs := []string{
-		"run", "--rm",
-		"--network", t.cfg.Network,
-		"--memory", t.cfg.MemoryLimit,
-		"--cpus", "1",
-		"-v", t.workspaceDir + ":/workspace",
-		"-w", args.WorkingDir,
-		t.cfg.Image,
-		"sh", "-c", args.Command,
-	}
-
-	cmd := exec.CommandContext(ctx, "docker", dockerArgs...)
-	output, err := cmd.CombinedOutput()
-
-	result := strings.TrimSpace(string(output))
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("command timed out")
-		}
-		return fmt.Sprintf("exit code: %v\noutput:\n%s", err, result), nil
-	}
-	return result, nil
+	return t.sandbox.Exec(ctx, args.Command, args.WorkingDir)
 }
