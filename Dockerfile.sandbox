@@ -1,0 +1,18 @@
+FROM alpine:3.20
+
+RUN apk add --no-cache \
+    # POSIX essentials
+    bash coreutils findutils grep sed gawk \
+    # Networking
+    curl wget \
+    # Data processing
+    jq \
+    # Version control
+    git \
+    # Scripting languages
+    python3 py3-pip \
+    nodejs npm \
+    # System
+    ca-certificates tzdata
+
+WORKDIR /workspace

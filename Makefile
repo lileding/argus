@@ -1,4 +1,4 @@
-.PHONY: build run run-cli test clean
+.PHONY: build run run-cli test clean sandbox
 
 build:
 	go build -o bin/argus ./cmd/argus
@@ -11,6 +11,9 @@ run-cli: build
 
 test:
 	go test ./...
+
+sandbox:
+	docker build -f Dockerfile.sandbox -t argus-sandbox:latest .
 
 clean:
 	rm -rf bin/

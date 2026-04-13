@@ -112,7 +112,7 @@ func (c *Config) applyDefaults() {
 		c.Agent.WorkspaceDir = "./workspace"
 	}
 	if c.Agent.SystemPrompt == "" {
-		c.Agent.SystemPrompt = "你是 Argus，一个私人助理。你有记忆，能使用工具，帮助用户完成各种任务。回答简洁、准确、有帮助。"
+		c.Agent.SystemPrompt = "You are Argus, a personal assistant. You have memory, can use tools, and help users with various tasks. Be concise, accurate, and helpful. Respond in the user's language."
 	}
 	if c.Agent.SkillsDir == "" {
 		c.Agent.SkillsDir = ".skills"

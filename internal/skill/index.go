@@ -80,6 +80,6 @@ func (idx *SkillIndex) Catalog() string {
 		}
 		sb.WriteString(fmt.Sprintf("- **%s**: %s\n", e.Name, desc))
 	}
-	sb.WriteString("\n当用户的请求与某个 skill 相关时，使用 activate_skill 工具加载该 skill 的完整指令。\n")
+	sb.WriteString("\nWhen the user's request relates to a skill, use the activate_skill tool to load its full instructions.\n")
 	return sb.String()
 }

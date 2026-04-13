@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"argus/internal/model"
 	"argus/internal/store"
@@ -50,17 +51,20 @@ func (a *Agent) buildSystemPrompt() string {
 
 	sb.WriteString(a.basePrompt)
 
+	// Inject current time so the model always knows the correct date and time.
+	sb.WriteString(fmt.Sprintf("\n\nCurrent time: %s\n", time.Now().Format("2006-01-02 15:04:05 (Monday)")))
+
 	// Skill catalog: all skills' name + description, so LLM knows what's available.
 	catalog := a.skillIndex.Catalog()
 	if catalog != "" {
-		sb.WriteString("\n\n")
+		sb.WriteString("\n")
 		sb.WriteString(catalog)
 	}
 
 	// Skill accumulation instructions.
 	sb.WriteString("\n\n## Skill Accumulation\n\n")
-	sb.WriteString("当你成功完成一个新类型的任务，且这种任务可能会反复出现时，使用 save_skill 工具将你的方法沉淀为可复用的 skill。")
-	sb.WriteString("好的 skill 应包含：触发条件、处理步骤、使用哪些工具。不要为一次性任务创建 skill。\n")
+	sb.WriteString("When you successfully complete a new type of recurring task, use the save_skill tool to capture your approach as a reusable skill. ")
+	sb.WriteString("A good skill should include: trigger conditions, step-by-step instructions, and which tools to use. Do not create skills for one-off tasks.\n")
 
 	return sb.String()
 }
