@@ -62,14 +62,11 @@ func main() {
 	}
 }
 
-// setupSkills initializes the skill loader: ensures seeds, loads all, starts background rescan.
+// setupSkills initializes the skill loader: loads builtins + user skills, starts background rescan.
 func setupSkills(cfg *config.Config) *skill.FileLoader {
 	skillsDir := filepath.Join(cfg.Agent.WorkspaceDir, cfg.Agent.SkillsDir)
 	loader := skill.NewFileLoader(skillsDir, cfg.Agent.SkillRescan)
 
-	if err := loader.EnsureSeeds(); err != nil {
-		slog.Warn("seed skills failed", "err", err)
-	}
 	if err := loader.LoadAll(); err != nil {
 		slog.Warn("load skills failed", "err", err)
 	}

@@ -74,7 +74,53 @@ Instructions here.
 	}
 }
 
-func TestFileLoader_LoadAll(t *testing.T) {
+func TestFileLoader_LoadAll_IncludesBuiltins(t *testing.T) {
+	dir := t.TempDir()
+	loader := NewFileLoader(dir, time.Hour)
+	if err := loader.LoadAll(); err != nil {
+		t.Fatalf("LoadAll failed: %v", err)
+	}
+
+	// Built-in skills should be present even with empty skills dir.
+	builtins := BuiltinSkills()
+	if len(builtins) == 0 {
+		t.Skip("no built-in skills on this platform")
+	}
+
+	for _, b := range builtins {
+		if _, ok := loader.Index().Get(b.Name); !ok {
+			t.Errorf("built-in skill %q not in index", b.Name)
+		}
+	}
+}
+
+func TestFileLoader_UserOverridesBuiltin(t *testing.T) {
+	dir := t.TempDir()
+	builtins := BuiltinSkills()
+	if len(builtins) == 0 {
+		t.Skip("no built-in skills on this platform")
+	}
+
+	// Create a user skill with the same name as a builtin.
+	name := builtins[0].Name
+	skillDir := filepath.Join(dir, name)
+	os.MkdirAll(skillDir, 0755)
+	content := "---\nname: " + name + "\ndescription: \"User override\"\n---\n\nCustom instructions.\n"
+	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(content), 0644)
+
+	loader := NewFileLoader(dir, time.Hour)
+	loader.LoadAll()
+
+	entry, ok := loader.Index().Get(name)
+	if !ok {
+		t.Fatalf("skill %q not found", name)
+	}
+	if entry.Description != "User override" {
+		t.Errorf("expected user override, got description=%q", entry.Description)
+	}
+}
+
+func TestFileLoader_LoadAll_UserSkills(t *testing.T) {
 	dir := t.TempDir()
 
 	for _, name := range []string{"alpha", "beta"} {
@@ -85,33 +131,12 @@ func TestFileLoader_LoadAll(t *testing.T) {
 	}
 
 	loader := NewFileLoader(dir, time.Hour)
-	if err := loader.LoadAll(); err != nil {
-		t.Fatalf("LoadAll failed: %v", err)
-	}
+	loader.LoadAll()
 
-	all := loader.Index().All()
-	if len(all) != 2 {
-		t.Fatalf("expected 2 skills, got %d", len(all))
-	}
-}
-
-func TestEnsureSeeds(t *testing.T) {
-	dir := t.TempDir()
-	skillsDir := filepath.Join(dir, ".skills")
-
-	loader := NewFileLoader(skillsDir, time.Hour)
-	if err := loader.EnsureSeeds(); err != nil {
-		t.Fatalf("EnsureSeeds failed: %v", err)
-	}
-
-	path := filepath.Join(skillsDir, "coding", "SKILL.md")
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		t.Error("seed skill coding/SKILL.md not created")
-	}
-
-	// Second call should not overwrite (dir is not empty).
-	if err := loader.EnsureSeeds(); err != nil {
-		t.Fatalf("second EnsureSeeds failed: %v", err)
+	for _, name := range []string{"alpha", "beta"} {
+		if _, ok := loader.Index().Get(name); !ok {
+			t.Errorf("user skill %q not loaded", name)
+		}
 	}
 }
 
