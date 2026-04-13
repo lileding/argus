@@ -40,9 +40,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	slog.Debug("webhook received", "body", string(body))
+
 	var envelope EventEnvelope
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		slog.Error("parse envelope", "err", err)
+		slog.Error("parse envelope", "err", err, "body", string(body))
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}

@@ -211,6 +211,9 @@ func runServer(cfg *config.Config) {
 	defer scheduler.Stop()
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
 	mux.Handle("/webhook/feishu", handler)
 
 	addr := ":" + cfg.Server.Port
