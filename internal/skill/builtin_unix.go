@@ -12,10 +12,18 @@ func builtinSkills() []*SkillEntry {
 
 You have access to standard POSIX command-line tools via the cli tool. Use these to efficiently process files, text, and data.
 
+### IMPORTANT: Command Selection Rules
+- NEVER use ` + "`ls -R`" + ` — it is extremely slow on large directories and will timeout. Use ` + "`find`" + ` instead.
+- To locate a file, ALWAYS use ` + "`find <dir> -maxdepth <N> -name '<pattern>'`" + ` first. Start with the most specific directory and increase scope only if needed.
+- To read file content, use ` + "`cat <absolute_path>`" + ` directly once you know the path. Don't waste iterations listing directories.
+- Avoid exploratory commands on the home directory (` + "`ls ~/`" + `, ` + "`ls -R ~/`" + `, ` + "`du ~/`" + `). They are slow and produce too much output.
+- When a command might produce large output, always pipe to ` + "`head -50`" + ` or ` + "`wc -l`" + ` first.
+
 ### File Discovery
-- ` + "`find . -name '*.py'`" + ` — find files by pattern
+- ` + "`find /path -maxdepth 3 -name '*.py'`" + ` — find files by pattern (always limit depth first)
+- ` + "`find /path -maxdepth 2 -name '*keyword*' -type f`" + ` — find files containing keyword in name
 - ` + "`find . -type f -mtime -1`" + ` — files modified in last 24h
-- ` + "`ls -la`" + ` — list with details
+- ` + "`ls -la`" + ` — list current directory only (never recursive)
 
 ### Text Search
 - ` + "`grep -r 'pattern' .`" + ` — recursive search
@@ -52,13 +60,19 @@ Chain commands with | for complex operations:
 ### JSON Processing (jq)
 - ` + "`jq '.' file.json`" + ` — pretty print
 - ` + "`jq '.items[] | .name' file.json`" + ` — extract nested field
-- ` + "`jq '[.[] | select(.status == \"active\")]'`" + ` — filter array
+- ` + "`jq '.[] | select(.active)' file.json`" + ` — filter array
+
+### Scripting
+- ` + "`python3 -c 'import json; ...'`" + ` — inline Python for complex data processing
+- ` + "`bash -c 'for f in *.txt; do echo $f; done'`" + ` — inline bash loops
 
 ### Best Practices
-- Always pipe to head when output might be large
-- Use wc -l to check size before processing
-- Prefer grep -l over grep when you only need filenames
-- Use set -e in multi-line scripts to fail fast`,
+- ALWAYS use find with -maxdepth to locate files. NEVER ls -R.
+- Pipe to head when output might be large.
+- Use wc -l to check size before processing large files.
+- Prefer grep -l over grep when you only need filenames.
+- Use absolute paths once you've found a file, don't re-search.
+- Use set -e in multi-line scripts to fail fast.`,
 		},
 	}
 }
