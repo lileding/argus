@@ -28,7 +28,7 @@ func (s *Local) Exec(ctx context.Context, command string, workDir string) (strin
 		dir = filepath.Join(s.WorkspaceDir, filepath.Clean(workDir))
 	}
 
-	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	cmd := exec.CommandContext(ctx, "bash", "-c", command)
 	cmd.Dir = dir
 	output, err := cmd.CombinedOutput()
 

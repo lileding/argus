@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -53,8 +54,9 @@ func (a *Agent) buildSystemPrompt() string {
 
 	// Inject environment info.
 	sb.WriteString(fmt.Sprintf("\n\nCurrent time: %s\n", time.Now().Format("2006-01-02 15:04:05 (Monday)")))
+	sb.WriteString(fmt.Sprintf("Home directory: %s\n", os.Getenv("HOME")))
 	sb.WriteString(fmt.Sprintf("Workspace directory: %s\n", a.workspaceDir))
-	sb.WriteString("The read_file and write_file tools operate on paths relative to this workspace. Use the cli tool for files outside the workspace.\n")
+	sb.WriteString("The read_file and write_file tools operate on paths relative to this workspace. For files outside the workspace, use the cli tool with absolute paths (e.g. `cat /home/user/file.txt`).\n")
 
 	// Skill catalog: all skills' name + description, so LLM knows what's available.
 	catalog := a.skillIndex.Catalog()
