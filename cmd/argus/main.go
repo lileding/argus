@@ -100,7 +100,8 @@ func buildSandbox(cfg *config.Config) sandbox.Sandbox {
 // buildToolRegistry creates the tool registry with all available tools.
 func buildToolRegistry(cfg *config.Config, sb sandbox.Sandbox, loader *skill.FileLoader, db *sql.DB) *tool.Registry {
 	registry := tool.NewRegistry()
-	registry.Register(tool.NewFileTool(cfg.Agent.WorkspaceDir))
+	registry.Register(tool.NewReadFileTool(cfg.Agent.WorkspaceDir))
+	registry.Register(tool.NewWriteFileTool(cfg.Agent.WorkspaceDir))
 	registry.Register(tool.NewCLITool(sb))
 	registry.Register(tool.NewSearchTool())
 

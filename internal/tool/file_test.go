@@ -7,11 +7,10 @@ import (
 	"testing"
 )
 
-func TestFileTool_PathEscape(t *testing.T) {
+func TestReadFile_PathEscape(t *testing.T) {
 	dir := t.TempDir()
-	ft := NewFileTool(dir)
+	rt := NewReadFileTool(dir)
 
-	// These should all fail.
 	badPaths := []string{
 		"../etc/passwd",
 		"../../etc/passwd",
@@ -20,22 +19,32 @@ func TestFileTool_PathEscape(t *testing.T) {
 	}
 
 	for _, p := range badPaths {
-		args := `{"action":"read","path":"` + p + `"}`
-		_, err := ft.Execute(context.Background(), args)
+		args := `{"path":"` + p + `"}`
+		_, err := rt.Execute(context.Background(), args)
 		if err == nil {
 			t.Errorf("expected error for path %q, got nil", p)
 		}
 	}
 }
 
-func TestFileTool_ReadWrite(t *testing.T) {
+func TestWriteFile_PathEscape(t *testing.T) {
 	dir := t.TempDir()
-	ft := NewFileTool(dir)
+	wt := NewWriteFileTool(dir)
+
+	_, err := wt.Execute(context.Background(), `{"path":"../escape.txt","content":"bad"}`)
+	if err == nil {
+		t.Error("expected error for path escape")
+	}
+}
+
+func TestReadWriteFile(t *testing.T) {
+	dir := t.TempDir()
+	wt := NewWriteFileTool(dir)
+	rt := NewReadFileTool(dir)
 	ctx := context.Background()
 
 	// Write a file.
-	writeArgs := `{"action":"write","path":"test.txt","content":"hello world"}`
-	result, err := ft.Execute(ctx, writeArgs)
+	result, err := wt.Execute(ctx, `{"path":"test.txt","content":"hello world"}`)
 	if err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -44,8 +53,7 @@ func TestFileTool_ReadWrite(t *testing.T) {
 	}
 
 	// Read it back.
-	readArgs := `{"action":"read","path":"test.txt"}`
-	result, err = ft.Execute(ctx, readArgs)
+	result, err = rt.Execute(ctx, `{"path":"test.txt"}`)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -53,9 +61,24 @@ func TestFileTool_ReadWrite(t *testing.T) {
 		t.Fatalf("expected 'hello world', got %q", result)
 	}
 
-	// Verify the file is actually in the workspace.
+	// Verify on disk.
 	data, _ := os.ReadFile(filepath.Join(dir, "test.txt"))
 	if string(data) != "hello world" {
 		t.Fatalf("file content mismatch: %q", data)
+	}
+}
+
+func TestWriteFile_CreatesSubdirs(t *testing.T) {
+	dir := t.TempDir()
+	wt := NewWriteFileTool(dir)
+
+	_, err := wt.Execute(context.Background(), `{"path":"sub/dir/file.txt","content":"nested"}`)
+	if err != nil {
+		t.Fatalf("write nested: %v", err)
+	}
+
+	data, _ := os.ReadFile(filepath.Join(dir, "sub", "dir", "file.txt"))
+	if string(data) != "nested" {
+		t.Fatalf("expected 'nested', got %q", data)
 	}
 }
