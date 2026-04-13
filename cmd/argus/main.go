@@ -154,23 +154,40 @@ func runServer(cfg *config.Config) {
 	loader := setupSkills(cfg)
 	defer loader.Stop()
 
-	db, err := sql.Open("postgres", cfg.Database.DSN)
-	if err != nil {
-		slog.Error("connect db", "err", err)
-		os.Exit(1)
+	// Database is optional — use memory store if DSN is empty or connection fails.
+	var st store.Store
+	var db *sql.DB
+	if cfg.Database.DSN != "" {
+		var err error
+		db, err = sql.Open("postgres", cfg.Database.DSN)
+		if err == nil {
+			err = db.PingContext(ctx)
+		}
+		if err == nil {
+			pgStore := store.NewPostgresStore(db)
+			if err := pgStore.Migrate(ctx); err != nil {
+				slog.Error("migrate db", "err", err)
+				os.Exit(1)
+			}
+			st = pgStore
+			slog.Info("using PostgreSQL store")
+		} else {
+			slog.Warn("database unavailable, using memory store", "err", err)
+			db = nil
+		}
 	}
-	defer db.Close()
-
-	pgStore := store.NewPostgresStore(db)
-	if err := pgStore.Migrate(ctx); err != nil {
-		slog.Error("migrate db", "err", err)
-		os.Exit(1)
+	if st == nil {
+		st = store.NewMemoryStore()
+		slog.Info("using memory store (messages will not persist across restarts)")
+	}
+	if db != nil {
+		defer db.Close()
 	}
 
 	modelClient := model.NewOpenAIClient(cfg.Model)
 	sb := buildSandbox(cfg)
 	toolReg := buildToolRegistry(cfg, sb, loader, db)
-	ag := agent.New(modelClient, pgStore, toolReg, loader.Index(), cfg.Agent.SystemPrompt, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
+	ag := agent.New(modelClient, st, toolReg, loader.Index(), cfg.Agent.SystemPrompt, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
 
 	feishuClient := feishu.NewClient(cfg.Feishu)
 
