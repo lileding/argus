@@ -93,9 +93,15 @@ func (a *Agent) Handle(ctx context.Context, chatID, userMessage string) (string,
 
 		// Execute each tool call and append results.
 		for _, tc := range resp.ToolCalls {
+			slog.Info("tool call",
+				"tool", tc.Function.Name,
+				"call_id", tc.ID,
+				"arguments", tc.Function.Arguments,
+			)
+
 			result := a.executeTool(ctx, tc)
 
-			slog.Info("tool executed",
+			slog.Info("tool result",
 				"tool", tc.Function.Name,
 				"call_id", tc.ID,
 				"result_len", len(result),
