@@ -2,14 +2,21 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"database/sql"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 
+	_ "github.com/lib/pq"
+
+	"argus/internal/agent"
 	"argus/internal/config"
 	"argus/internal/feishu"
+	"argus/internal/model"
+	"argus/internal/store"
 )
 
 func main() {
@@ -35,7 +42,14 @@ func main() {
 }
 
 func runCLI(cfg *config.Config) {
-	fmt.Println("Argus CLI mode (echo). Type messages, Ctrl+C to quit.")
+	modelClient := model.NewOpenAIClient(cfg.Model)
+	memStore := store.NewMemoryStore()
+	ag := agent.New(modelClient, memStore, cfg.Agent.SystemPrompt, cfg.Agent.ContextWindow)
+
+	chatID := "cli:local"
+	ctx := context.Background()
+
+	fmt.Println("Argus CLI mode. Type messages, Ctrl+C to quit.")
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Print("> ")
 	for scanner.Scan() {
@@ -44,23 +58,51 @@ func runCLI(cfg *config.Config) {
 			fmt.Print("> ")
 			continue
 		}
-		// Phase 1: echo mode.
-		fmt.Printf("Argus: %s\n> ", text)
+
+		reply, err := ag.Handle(ctx, chatID, text)
+		if err != nil {
+			fmt.Printf("Error: %v\n> ", err)
+			continue
+		}
+		fmt.Printf("Argus: %s\n> ", reply)
 	}
 }
 
 func runServer(cfg *config.Config) {
-	client := feishu.NewClient(cfg.Feishu)
+	ctx := context.Background()
 
-	// Phase 1: echo handler — replies with the same text.
+	// Connect to PostgreSQL.
+	db, err := sql.Open("postgres", cfg.Database.DSN)
+	if err != nil {
+		slog.Error("connect db", "err", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+
+	pgStore := store.NewPostgresStore(db)
+	if err := pgStore.Migrate(ctx); err != nil {
+		slog.Error("migrate db", "err", err)
+		os.Exit(1)
+	}
+
+	modelClient := model.NewOpenAIClient(cfg.Model)
+	ag := agent.New(modelClient, pgStore, cfg.Agent.SystemPrompt, cfg.Agent.ContextWindow)
+
+	feishuClient := feishu.NewClient(cfg.Feishu)
+
 	onMsg := func(chatID, text, messageID string) {
 		slog.Info("handling message", "chat_id", chatID, "text", text)
-		if err := client.Reply(messageID, text); err != nil {
+		reply, err := ag.Handle(ctx, chatID, text)
+		if err != nil {
+			slog.Error("agent handle failed", "err", err, "chat_id", chatID)
+			reply = fmt.Sprintf("抱歉，处理消息时出错：%v", err)
+		}
+		if err := feishuClient.Reply(messageID, reply); err != nil {
 			slog.Error("reply failed", "err", err, "message_id", messageID)
 		}
 	}
 
-	handler := feishu.NewHandler(client, cfg.Feishu, onMsg)
+	handler := feishu.NewHandler(feishuClient, cfg.Feishu, onMsg)
 
 	mux := http.NewServeMux()
 	mux.Handle("/webhook/feishu", handler)
