@@ -6,6 +6,7 @@ import (
 	"log/slog"
 
 	"argus/internal/model"
+	"argus/internal/skill"
 	"argus/internal/store"
 	"argus/internal/tool"
 )
@@ -14,21 +15,27 @@ import (
 type Agent struct {
 	model         model.Client
 	store         store.Store
-	registry      *tool.Registry
+	toolRegistry  *tool.Registry
+	skillRegistry *skill.Registry
 	systemPrompt  string
 	contextWindow int
 	maxIterations int
 }
 
-func New(modelClient model.Client, st store.Store, registry *tool.Registry, systemPrompt string, contextWindow, maxIterations int) *Agent {
+func New(modelClient model.Client, st store.Store, toolReg *tool.Registry, skillReg *skill.Registry, systemPrompt string, contextWindow, maxIterations int) *Agent {
 	if maxIterations == 0 {
 		maxIterations = 10
+	}
+	fullPrompt := systemPrompt
+	if skillReg != nil {
+		fullPrompt += skillReg.CombinedSystemPrompt()
 	}
 	return &Agent{
 		model:         modelClient,
 		store:         st,
-		registry:      registry,
-		systemPrompt:  systemPrompt,
+		toolRegistry:  toolReg,
+		skillRegistry: skillReg,
+		systemPrompt:  fullPrompt,
 		contextWindow: contextWindow,
 		maxIterations: maxIterations,
 	}
@@ -53,8 +60,8 @@ func (a *Agent) Handle(ctx context.Context, chatID, userMessage string) (string,
 
 	// Get tool definitions.
 	var toolDefs []model.ToolDef
-	if a.registry != nil && a.registry.Len() > 0 {
-		toolDefs = a.registry.AllToolDefs()
+	if a.toolRegistry != nil && a.toolRegistry.Len() > 0 {
+		toolDefs = a.toolRegistry.AllToolDefs()
 	}
 
 	// Agent tool loop.
@@ -114,7 +121,7 @@ func (a *Agent) Handle(ctx context.Context, chatID, userMessage string) (string,
 // executeTool runs a tool and returns the result as a string.
 // Errors are returned as the result string so the model can see them.
 func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) string {
-	t, ok := a.registry.Get(tc.Function.Name)
+	t, ok := a.toolRegistry.Get(tc.Function.Name)
 	if !ok {
 		return fmt.Sprintf("error: unknown tool %q", tc.Function.Name)
 	}

@@ -17,6 +17,7 @@ import (
 	"argus/internal/config"
 	"argus/internal/feishu"
 	"argus/internal/model"
+	"argus/internal/skill"
 	"argus/internal/store"
 	"argus/internal/tool"
 )
@@ -43,7 +44,6 @@ func main() {
 	}
 }
 
-// ensureWorkspace creates the workspace directory if it doesn't exist.
 func ensureWorkspace(dir string) string {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
@@ -57,8 +57,7 @@ func ensureWorkspace(dir string) string {
 	return abs
 }
 
-// buildRegistry creates and populates the tool registry.
-func buildRegistry(cfg *config.Config, workspaceDir string, db *sql.DB) *tool.Registry {
+func buildToolRegistry(cfg *config.Config, workspaceDir string, db *sql.DB) *tool.Registry {
 	registry := tool.NewRegistry()
 	registry.Register(tool.NewFileTool(workspaceDir))
 	registry.Register(tool.NewCLITool(cfg.Docker, workspaceDir))
@@ -69,12 +68,20 @@ func buildRegistry(cfg *config.Config, workspaceDir string, db *sql.DB) *tool.Re
 	return registry
 }
 
+func buildSkillRegistry() *skill.Registry {
+	registry := skill.NewRegistry()
+	registry.Register(skill.NewCodingSkill())
+	registry.Register(skill.NewCalorieSkill())
+	return registry
+}
+
 func runCLI(cfg *config.Config) {
 	workspaceDir := ensureWorkspace(cfg.Agent.WorkspaceDir)
 	modelClient := model.NewOpenAIClient(cfg.Model)
 	memStore := store.NewMemoryStore()
-	registry := buildRegistry(cfg, workspaceDir, nil)
-	ag := agent.New(modelClient, memStore, registry, cfg.Agent.SystemPrompt, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
+	toolReg := buildToolRegistry(cfg, workspaceDir, nil)
+	skillReg := buildSkillRegistry()
+	ag := agent.New(modelClient, memStore, toolReg, skillReg, cfg.Agent.SystemPrompt, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
 
 	chatID := "cli:local"
 	ctx := context.Background()
@@ -103,7 +110,6 @@ func runServer(cfg *config.Config) {
 	ctx := context.Background()
 	workspaceDir := ensureWorkspace(cfg.Agent.WorkspaceDir)
 
-	// Connect to PostgreSQL.
 	db, err := sql.Open("postgres", cfg.Database.DSN)
 	if err != nil {
 		slog.Error("connect db", "err", err)
@@ -118,8 +124,9 @@ func runServer(cfg *config.Config) {
 	}
 
 	modelClient := model.NewOpenAIClient(cfg.Model)
-	registry := buildRegistry(cfg, workspaceDir, db)
-	ag := agent.New(modelClient, pgStore, registry, cfg.Agent.SystemPrompt, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
+	toolReg := buildToolRegistry(cfg, workspaceDir, db)
+	skillReg := buildSkillRegistry()
+	ag := agent.New(modelClient, pgStore, toolReg, skillReg, cfg.Agent.SystemPrompt, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
 
 	feishuClient := feishu.NewClient(cfg.Feishu)
 
