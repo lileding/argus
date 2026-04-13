@@ -41,6 +41,7 @@ type chatRequest struct {
 
 type chatResponse struct {
 	Choices []chatChoice `json:"choices"`
+	Usage   Usage        `json:"usage"`
 	Error   *apiError    `json:"error,omitempty"`
 }
 
@@ -118,6 +119,7 @@ func (c *OpenAIClient) Chat(ctx context.Context, messages []Message, tools []Too
 		Content:      choice.Message.Content,
 		ToolCalls:    choice.Message.ToolCalls,
 		FinishReason: choice.FinishReason,
+		Usage:        chatResp.Usage,
 	}
 
 	return result, nil

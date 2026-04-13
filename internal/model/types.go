@@ -44,4 +44,11 @@ type Response struct {
 	Content      string
 	ToolCalls    []ToolCall
 	FinishReason string // "stop" or "tool_calls"
+	Usage        Usage
+}
+
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }

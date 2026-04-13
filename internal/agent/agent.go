@@ -70,6 +70,13 @@ func (a *Agent) Handle(ctx context.Context, chatID, userMessage string) (string,
 			return "", fmt.Errorf("model chat (iteration %d): %w", i, err)
 		}
 
+		slog.Info("model response",
+			"iteration", i,
+			"prompt_tokens", resp.Usage.PromptTokens,
+			"completion_tokens", resp.Usage.CompletionTokens,
+			"total_tokens", resp.Usage.TotalTokens,
+		)
+
 		// If no tool calls, we're done.
 		if len(resp.ToolCalls) == 0 || resp.FinishReason == "stop" {
 			reply := resp.Content
