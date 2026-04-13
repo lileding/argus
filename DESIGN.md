@@ -32,31 +32,59 @@
 ```
 飞书消息事件 (webhook)
         ↓
-   消息分类路由
+   Harness 上下文策展
+   (skill 选择 + 历史策展 + prompt 组装)
         ↓
-  ┌─────┴─────┐
-  │           │
-Gemma 4    Claude Code
-(本地)      (cli skill)
-  │
-  └── 工具调用 ──→ 执行工具 ──→ 结果注入 ──→ 继续 loop
+   Gemma 4 (本地 LLM)
         ↓
-    飞书发送回复
+   工具调用 ──→ 执行工具 ──→ 结果注入 ──→ 继续 loop
         ↓
-    写入历史 DB
+   飞书发送回复
+        ↓
+   写入历史 DB
+```
+
+---
+
+## Harness Engineering（上下文策展）
+
+**核心原则：上下文是稀缺有限资源，只放高信号内容。**
+
+LLM 看到的不是原始对话，而是被精心策展的、具有约束性的内容：
+
+```
+用户消息到达
+    ↓
+[1] Skill 选择
+    - 关键词预过滤：description 匹配用户消息
+    - LLM 自选：system prompt 包含全部 skill 目录（name + description）
+    - activate_skill 工具：LLM 按需加载未被预过滤命中的 skill
+    ↓
+[2] System Prompt 组装
+    - 基础 prompt
+    - Skill 目录（全部 skill 的 name + description 摘要）
+    - 已选 skill 的完整指令
+    - 技能积累指引
+    ↓
+[3] 历史策展
+    - 加载近 N 条消息
+    - 只保留 user 消息 + assistant 最终回复
+    - 移除中间 tool_call / tool_result 噪音
+    ↓
+[4] 工具过滤
+    - base 工具 + 选中 skill 所需工具
 ```
 
 ---
 
 ## 模型路由策略
 
+所有消息由 Gemma 4 本地处理。路由通过 tool calling 隐式完成：当需要编程时，Gemma 4 通过 coding skill 调用 cli 工具启动 Claude Code。
+
 | 任务类型 | 模型 |
 |----------|------|
-| 日常对话、闲聊、热量记录、查询 | 本地 Gemma 4（OpenAI API 格式） |
-| 写代码、执行代码任务 | Claude Code（通过 cli skill 调用） |
-
-**路由判断由 Gemma 4 本地完成**，不消耗 Claude API。  
-Claude Code 使用订阅额度，不消耗 API token。
+| 日常对话、闲聊、查询 | 本地 Gemma 4（OpenAI API 格式） |
+| 写代码、执行代码任务 | Claude Code（通过 coding skill + cli 工具） |
 
 ---
 
@@ -64,143 +92,121 @@ Claude Code 使用订阅额度，不消耗 API token。
 
 ```
 1. 收到消息
-2. 构建 context（见记忆架构）
-3. 组装：system prompt + 注入的记忆 + 当前消息 + 可用工具描述
-4. 调用模型
-5. 解析响应：
-   - stop_reason == tool_use → 执行工具 → 注入结果 → 回到步骤 4
-   - stop_reason == end_turn → 发送回复
-6. 将本轮消息 + 回复存入 DB
+2. Harness 策展上下文（skill 选择 + prompt 组装 + 历史过滤 + 工具过滤）
+3. 调用模型
+4. 解析响应：
+   - tool_calls → 执行工具 → 注入结果 → 回到步骤 3
+   - stop → 发送回复
+5. 将用户消息 + 回复存入 DB
 ```
-
----
-
-## 记忆架构
-
-**原则：不传递原始上下文，全量存储，按需召回注入。**
-
-原始上下文线性增长，很快撞 context window，且充满噪音。正确方式：
-
-```
-所有消息全量写入 DB（永久保存）
-            ↓
-每次请求时构建注入内容：
-  1. 近期原文   — 最近 N 条消息，保留细节
-  2. 短期摘要   — 最近 1-2 小时的对话摘要
-  3. 长期记忆   — 周期性生成的用户画像和重要事项摘要
-  4. 语义召回   — pgvector 对当前消息做余弦相似度检索，拉取相关历史片段
-            ↓
-注入 context 大小稳定可控，同时"记得住一切"
-```
-
-**摘要生成策略：**
-- 短期摘要：每次对话结束后异步生成，存 DB
-- 长期记忆：每日定时任务生成，覆盖写入
-
-**MVP 阶段：** 先用 fixed window（最近 20 条）跑通，记忆架构作为后续第一个优化项。
-
----
-
-## 工具集（四个核心工具）
-
-### 1. `file` — 文件读写
-```
-read_file(path) → content
-write_file(path, content)
-```
-用途：持久化非结构化内容、报告、笔记
-
-### 2. `cli` — Docker 内执行命令
-```
-run_cli(command, working_dir?) → stdout, stderr, exit_code
-```
-- 在 Docker 容器内执行，天然隔离
-- 覆盖：运行 Python 脚本、抓取数据、任何计算任务
-- Claude Code 也通过此工具启动：`claude --no-interactive -p "任务描述"`
-
-### 3. `search` — 网页搜索
-```
-search_web(query) → results[]
-```
-用途：实时信息、新闻、知识查询
-
-### 4. `db` — 结构化数据库
-```
-db_query(sql) → rows
-db_exec(sql, params)
-```
-用途：热量记录、会话历史、任何结构化状态
 
 ---
 
 ## Skills 机制
 
-Skills 是**可插拔的能力描述**，通过注入工具描述和 system prompt 片段实现。每个 skill 明确自己用哪些工具、怎么用。
+Skills 遵循 [Agent Skills 开放标准](https://agentskills.io)（Claude Code 同款 SKILL.md 格式），是**文件驱动的可插拔能力**。
 
-当前规划的 skills：
-- **热量记录 skill**：自然语言 → 解析食物热量 → 写 db
-- **股票分析 skill**：Claude Code 写抓取脚本 → cli 执行 → 返回结果
-- **coding skill**：调用 `cli` 启动 Claude Code，全自动无人值守
+### Skill 文件格式
 
-Skills 后期按需扩展，核心 loop 不变。
+每个 skill 是一个目录，包含 `SKILL.md` 入口文件：
+
+```
+workspace/.skills/
+  coding/
+    SKILL.md
+  calorie/
+    SKILL.md
+    setup.sql
+  stock-analysis/
+    SKILL.md
+    scripts/
+      fetch.py
+```
+
+SKILL.md 使用 YAML frontmatter + Markdown body：
+
+```yaml
+---
+name: calorie
+description: "记录日常饮食热量和卡路里消耗。当用户提到吃了什么、喝了什么、问今日热量时使用。"
+tools:
+  - db
+  - db_exec
+---
+
+## 热量记录
+
+当用户提到吃了什么...（完整指令）
+```
+
+### Skill 生命周期
+
+1. **种子 Skill**：首次启动时自动复制内建 seed（如 coding）
+2. **动态创建**：agent 通过 `save_skill` 工具在对话中创建新 skill
+3. **自动加载**：启动时扫描 `.skills/` 目录，后台定期重新扫描
+4. **按需激活**：keyword 预过滤 + LLM 自选（`activate_skill` 工具）
+
+### 技能积累
+
+成功完成新类型任务后，agent 将经验沉淀为 SKILL.md 文件。这是 Harness Engineering 的核心——通过不断积累 skills，agent 的能力持续增长。
 
 ---
 
-## 数据模型（PostgreSQL + pgvector）
+## 工具集
 
-```sql
-CREATE EXTENSION IF NOT EXISTS vector;
-```
+### 核心工具（始终可用）
+| 工具 | 用途 |
+|------|------|
+| `file` | 工作区文件读写（路径严格限定） |
+| `save_skill` | 创建/更新 SKILL.md 文件 |
+| `activate_skill` | 按名称加载 skill 完整指令 |
+
+### 按需工具（由 skill 声明）
+| 工具 | 用途 |
+|------|------|
+| `cli` | Docker 沙箱内执行命令 |
+| `search` | 网页搜索 |
+| `db` | 只读 SQL 查询 |
+| `db_exec` | 可写 SQL（INSERT/UPDATE/CREATE TABLE） |
+
+---
+
+## 记忆架构
+
+**MVP 阶段：** fixed window + 历史策展（只保留 user/assistant 最终回复，过滤 tool 噪音）。
+
+**后续优化：**
+- 短期摘要：对话结束后异步生成
+- 长期记忆：每日定时生成用户画像
+- 语义召回：pgvector 余弦相似度检索
+
+---
+
+## 数据模型（PostgreSQL）
 
 ### messages 表
 ```sql
 CREATE TABLE messages (
     id          BIGSERIAL PRIMARY KEY,
     chat_id     TEXT NOT NULL,
-    role        TEXT NOT NULL,        -- user / assistant / tool
+    role        TEXT NOT NULL,
     content     TEXT NOT NULL,
     tool_name   TEXT,
     tool_call_id TEXT,
-    embedding   vector(768),          -- 消息向量，用于语义召回
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
-CREATE INDEX ON messages USING ivfflat (embedding vector_cosine_ops);
 CREATE INDEX ON messages (chat_id, created_at);
 ```
 
-### summaries 表
-```sql
-CREATE TABLE summaries (
-    id          BIGSERIAL PRIMARY KEY,
-    chat_id     TEXT NOT NULL,
-    type        TEXT NOT NULL,        -- short_term / long_term
-    content     TEXT NOT NULL,
-    covers_from TIMESTAMPTZ NOT NULL,
-    covers_to   TIMESTAMPTZ NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-```
-
-### food_log 表
-```sql
-CREATE TABLE food_log (
-    id          BIGSERIAL PRIMARY KEY,
-    chat_id     TEXT NOT NULL,
-    description TEXT NOT NULL,
-    calories    INTEGER,
-    meal_type   TEXT,                 -- breakfast / lunch / dinner / snack
-    logged_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-```
+其他业务表（如 food_log）由 agent 通过 `db_exec` 工具动态创建，不作为核心 schema。
 
 ---
 
 ## 定时任务
 
 独立 goroutine 跑 cron，不依赖用户触发：
-- 每日定时：触发股票分析 skill，推送总结到飞书
-- 后续按需扩展
+- 通过配置文件定义定时任务（prompt + 目标 chat_id）
+- 定时执行 agent.Handle()，结果通过飞书主动推送
 
 ---
 
@@ -211,30 +217,19 @@ CREATE TABLE food_log (
 | 语言 | Go |
 | IM | 飞书 Bot API |
 | 主模型 | 本地 Gemma 4（OpenAI API 格式，LM Studio / Ollama） |
-| 代码任务 | Claude Code（cli 调用） |
-| 数据库 | PostgreSQL + pgvector |
+| 代码任务 | Claude Code（通过 coding skill + cli 工具） |
+| 数据库 | PostgreSQL |
 | 沙箱 | Docker |
+| Skills | SKILL.md 文件（Agent Skills 开放标准） |
 | 部署 | 单二进制 daemon |
-
----
-
-## 开发顺序
-
-1. **飞书 webhook 收发消息跑通**（echo bot 验证）
-2. **基本 agent loop**：Gemma 4 + fixed window 历史
-3. **四个工具最简实现**
-4. **Claude Code skill**
-5. **热量记录 skill**
-6. **定时推送**
-7. **记忆架构升级**：fixed window → 摘要 + 语义召回
-8. **用起来，发现真需求，迭代**
 
 ---
 
 ## 约束与原则
 
 - 没有"会话"概念，只有时间线
+- 上下文是稀缺资源，只放高信号内容（Harness Engineering）
 - 工具设计正交，不重叠
-- MVP 先跑通，过度设计延后
-- 核心 loop 稳定后 skills 才扩展
+- Skills 由 agent 动态创建和积累，不硬编码
+- 核心 loop 稳定后 skills 自然增长
 - 本地模型处理日常，Claude Code 处理编程，API 消耗趋近于零

@@ -54,10 +54,12 @@ type DatabaseConfig struct {
 }
 
 type AgentConfig struct {
-	MaxIterations int    `yaml:"max_iterations"`
-	ContextWindow int    `yaml:"context_window"`
-	SystemPrompt  string `yaml:"system_prompt"`
-	WorkspaceDir  string `yaml:"workspace_dir"`
+	MaxIterations int           `yaml:"max_iterations"`
+	ContextWindow int           `yaml:"context_window"`
+	SystemPrompt  string        `yaml:"system_prompt"`
+	WorkspaceDir  string        `yaml:"workspace_dir"`
+	SkillsDir     string        `yaml:"skills_dir"`
+	SkillRescan   time.Duration `yaml:"skill_rescan"`
 }
 
 type DockerConfig struct {
@@ -111,6 +113,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Agent.SystemPrompt == "" {
 		c.Agent.SystemPrompt = "你是 Argus，一个私人助理。你有记忆，能使用工具，帮助用户完成各种任务。回答简洁、准确、有帮助。"
+	}
+	if c.Agent.SkillsDir == "" {
+		c.Agent.SkillsDir = ".skills"
+	}
+	if c.Agent.SkillRescan == 0 {
+		c.Agent.SkillRescan = 30 * time.Second
 	}
 	if c.Docker.Image == "" {
 		c.Docker.Image = "argus-sandbox:latest"

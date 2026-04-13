@@ -20,7 +20,8 @@ database:
 agent:
   max_iterations: 10
   context_window: 20
-  workspace_dir: "./workspace"
+  skills_dir: ".skills"
+  skill_rescan: 30s
   system_prompt: "你是 Argus，一个私人助理。你有记忆，能使用工具，帮助用户完成各种任务。回答简洁、准确、有帮助。"
 
 docker:
@@ -36,4 +37,4 @@ cron:
   #   hour: 9
   #   minute: 0
   #   chat_id: "p2p:ou_xxxxxxxx"
-  #   prompt: "请分析今日A股市场走势，重点关注科技板块，给出简要总结。"
+  #   prompt: "请分析今日A股市场走势，给出简要总结。"

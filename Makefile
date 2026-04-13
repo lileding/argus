@@ -4,10 +4,10 @@ build:
 	go build -o bin/argus ./cmd/argus
 
 run: build
-	./bin/argus --mode server --config config.yaml
+	./bin/argus --mode server --workspace ./workspace
 
 run-cli: build
-	./bin/argus --mode cli --config config.yaml
+	./bin/argus --mode cli --workspace ./workspace
 
 test:
 	go test ./...

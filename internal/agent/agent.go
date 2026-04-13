@@ -11,31 +11,27 @@ import (
 	"argus/internal/tool"
 )
 
-// Agent is the core agent loop that processes messages using an LLM with tools.
+// Agent is the core agent loop with harness-based context assembly.
 type Agent struct {
-	model         model.Client
-	store         store.Store
-	toolRegistry  *tool.Registry
-	skillRegistry *skill.Registry
-	systemPrompt  string
+	model        model.Client
+	store        store.Store
+	toolRegistry *tool.Registry
+	skillIndex   *skill.SkillIndex
+	basePrompt   string
 	contextWindow int
 	maxIterations int
 }
 
-func New(modelClient model.Client, st store.Store, toolReg *tool.Registry, skillReg *skill.Registry, systemPrompt string, contextWindow, maxIterations int) *Agent {
+func New(modelClient model.Client, st store.Store, toolReg *tool.Registry, skillIdx *skill.SkillIndex, basePrompt string, contextWindow, maxIterations int) *Agent {
 	if maxIterations == 0 {
 		maxIterations = 10
-	}
-	fullPrompt := systemPrompt
-	if skillReg != nil {
-		fullPrompt += skillReg.CombinedSystemPrompt()
 	}
 	return &Agent{
 		model:         modelClient,
 		store:         st,
 		toolRegistry:  toolReg,
-		skillRegistry: skillReg,
-		systemPrompt:  fullPrompt,
+		skillIndex:    skillIdx,
+		basePrompt:    basePrompt,
 		contextWindow: contextWindow,
 		maxIterations: maxIterations,
 	}
@@ -43,6 +39,9 @@ func New(modelClient model.Client, st store.Store, toolReg *tool.Registry, skill
 
 // Handle processes a user message and returns the assistant's reply.
 func (a *Agent) Handle(ctx context.Context, chatID, userMessage string) (string, error) {
+	// Inject chatID into context for tools (e.g. save_skill, db_exec).
+	ctx = tool.WithChatID(ctx, chatID)
+
 	// Save user message.
 	if err := a.store.SaveMessage(ctx, &store.StoredMessage{
 		ChatID:  chatID,
@@ -52,21 +51,15 @@ func (a *Agent) Handle(ctx context.Context, chatID, userMessage string) (string,
 		return "", fmt.Errorf("save user message: %w", err)
 	}
 
-	// Build context with recent history.
-	messages, err := a.buildContext(ctx, chatID, userMessage)
+	// Assemble context via harness: skill selection + prompt assembly + history curation.
+	messages, toolDefs, err := a.assembleContext(ctx, chatID, userMessage)
 	if err != nil {
-		return "", fmt.Errorf("build context: %w", err)
-	}
-
-	// Get tool definitions.
-	var toolDefs []model.ToolDef
-	if a.toolRegistry != nil && a.toolRegistry.Len() > 0 {
-		toolDefs = a.toolRegistry.AllToolDefs()
+		return "", fmt.Errorf("assemble context: %w", err)
 	}
 
 	// Agent tool loop.
 	for i := 0; i < a.maxIterations; i++ {
-		slog.Info("calling model", "chat_id", chatID, "iteration", i, "messages", len(messages))
+		slog.Info("calling model", "chat_id", chatID, "iteration", i, "messages", len(messages), "tools", len(toolDefs))
 
 		resp, err := a.model.Chat(ctx, messages, toolDefs)
 		if err != nil {
@@ -90,12 +83,11 @@ func (a *Agent) Handle(ctx context.Context, chatID, userMessage string) (string,
 		}
 
 		// Append assistant message with tool calls.
-		assistantMsg := model.Message{
+		messages = append(messages, model.Message{
 			Role:      model.RoleAssistant,
 			Content:   resp.Content,
 			ToolCalls: resp.ToolCalls,
-		}
-		messages = append(messages, assistantMsg)
+		})
 
 		// Execute each tool call and append results.
 		for _, tc := range resp.ToolCalls {

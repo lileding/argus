@@ -25,14 +25,30 @@ import (
 
 func main() {
 	mode := flag.String("mode", "server", "run mode: server or cli")
-	configPath := flag.String("config", "config.yaml", "path to config file")
+	workspace := flag.String("workspace", ".", "workspace directory (contains config.yaml and .skills/)")
 	flag.Parse()
 
-	cfg, err := config.Load(*configPath)
+	// Resolve workspace to absolute path.
+	absWorkspace, err := filepath.Abs(*workspace)
 	if err != nil {
-		slog.Error("load config", "err", err)
+		slog.Error("resolve workspace", "err", err)
 		os.Exit(1)
 	}
+	if err := os.MkdirAll(absWorkspace, 0755); err != nil {
+		slog.Error("create workspace", "err", err)
+		os.Exit(1)
+	}
+
+	// Config is always workspace/config.yaml.
+	configPath := filepath.Join(absWorkspace, "config.yaml")
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		slog.Error("load config", "path", configPath, "err", err)
+		os.Exit(1)
+	}
+
+	// Override workspace dir to absolute path.
+	cfg.Agent.WorkspaceDir = absWorkspace
 
 	switch *mode {
 	case "cli":
@@ -45,50 +61,56 @@ func main() {
 	}
 }
 
-func ensureWorkspace(dir string) string {
-	abs, err := filepath.Abs(dir)
-	if err != nil {
-		slog.Error("resolve workspace", "err", err)
-		os.Exit(1)
+// setupSkills initializes the skill loader: ensures seeds, loads all, starts background rescan.
+func setupSkills(cfg *config.Config) *skill.FileLoader {
+	skillsDir := filepath.Join(cfg.Agent.WorkspaceDir, cfg.Agent.SkillsDir)
+	loader := skill.NewFileLoader(skillsDir, cfg.Agent.SkillRescan)
+
+	if err := loader.EnsureSeeds(); err != nil {
+		slog.Warn("seed skills failed", "err", err)
 	}
-	if err := os.MkdirAll(abs, 0755); err != nil {
-		slog.Error("create workspace", "err", err)
-		os.Exit(1)
+	if err := loader.LoadAll(); err != nil {
+		slog.Warn("load skills failed", "err", err)
 	}
-	return abs
+
+	loader.Start()
+	return loader
 }
 
-func buildToolRegistry(cfg *config.Config, workspaceDir string, db *sql.DB) *tool.Registry {
+// buildToolRegistry creates the tool registry with all available tools.
+func buildToolRegistry(cfg *config.Config, loader *skill.FileLoader, db *sql.DB) *tool.Registry {
 	registry := tool.NewRegistry()
-	registry.Register(tool.NewFileTool(workspaceDir))
-	registry.Register(tool.NewCLITool(cfg.Docker, workspaceDir))
+	registry.Register(tool.NewFileTool(cfg.Agent.WorkspaceDir))
+	registry.Register(tool.NewCLITool(cfg.Docker, cfg.Agent.WorkspaceDir))
 	registry.Register(tool.NewSearchTool())
+
+	skillsDir := filepath.Join(cfg.Agent.WorkspaceDir, cfg.Agent.SkillsDir)
+	registry.Register(tool.NewSaveSkillTool(skillsDir, loader.Rebuild))
+	registry.Register(tool.NewActivateSkillTool(loader.Index()))
+
 	if db != nil {
 		registry.Register(tool.NewDBTool(db))
+		registry.Register(tool.NewDBExecTool(db))
 	}
-	return registry
-}
 
-func buildSkillRegistry() *skill.Registry {
-	registry := skill.NewRegistry()
-	registry.Register(skill.NewCodingSkill())
-	registry.Register(skill.NewCalorieSkill())
 	return registry
 }
 
 func runCLI(cfg *config.Config) {
-	workspaceDir := ensureWorkspace(cfg.Agent.WorkspaceDir)
+	loader := setupSkills(cfg)
+	defer loader.Stop()
+
 	modelClient := model.NewOpenAIClient(cfg.Model)
 	memStore := store.NewMemoryStore()
-	toolReg := buildToolRegistry(cfg, workspaceDir, nil)
-	skillReg := buildSkillRegistry()
-	ag := agent.New(modelClient, memStore, toolReg, skillReg, cfg.Agent.SystemPrompt, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
+	toolReg := buildToolRegistry(cfg, loader, nil)
+	ag := agent.New(modelClient, memStore, toolReg, loader.Index(), cfg.Agent.SystemPrompt, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
 
 	chatID := "cli:local"
 	ctx := context.Background()
 
 	fmt.Println("Argus CLI mode. Type messages, Ctrl+C to quit.")
-	fmt.Printf("Workspace: %s\n", workspaceDir)
+	fmt.Printf("Workspace: %s\n", cfg.Agent.WorkspaceDir)
+	fmt.Printf("Skills: %d loaded\n", len(loader.Index().All()))
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Print("> ")
 	for scanner.Scan() {
@@ -109,7 +131,9 @@ func runCLI(cfg *config.Config) {
 
 func runServer(cfg *config.Config) {
 	ctx := context.Background()
-	workspaceDir := ensureWorkspace(cfg.Agent.WorkspaceDir)
+
+	loader := setupSkills(cfg)
+	defer loader.Stop()
 
 	db, err := sql.Open("postgres", cfg.Database.DSN)
 	if err != nil {
@@ -125,9 +149,8 @@ func runServer(cfg *config.Config) {
 	}
 
 	modelClient := model.NewOpenAIClient(cfg.Model)
-	toolReg := buildToolRegistry(cfg, workspaceDir, db)
-	skillReg := buildSkillRegistry()
-	ag := agent.New(modelClient, pgStore, toolReg, skillReg, cfg.Agent.SystemPrompt, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
+	toolReg := buildToolRegistry(cfg, loader, db)
+	ag := agent.New(modelClient, pgStore, toolReg, loader.Index(), cfg.Agent.SystemPrompt, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
 
 	feishuClient := feishu.NewClient(cfg.Feishu)
 
@@ -145,7 +168,7 @@ func runServer(cfg *config.Config) {
 
 	handler := feishu.NewHandler(feishuClient, cfg.Feishu, onMsg)
 
-	// Start cron scheduler for scheduled tasks.
+	// Cron scheduler.
 	scheduler := setupCron(cfg, ag, feishuClient, ctx)
 	scheduler.Start()
 	defer scheduler.Stop()
@@ -154,7 +177,7 @@ func runServer(cfg *config.Config) {
 	mux.Handle("/webhook/feishu", handler)
 
 	addr := ":" + cfg.Server.Port
-	slog.Info("starting server", "addr", addr, "workspace", workspaceDir)
+	slog.Info("starting server", "addr", addr, "workspace", cfg.Agent.WorkspaceDir)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		slog.Error("server error", "err", err)
 		os.Exit(1)
@@ -165,7 +188,7 @@ func setupCron(cfg *config.Config, ag *agent.Agent, feishuClient *feishu.Client,
 	scheduler := cron.NewScheduler()
 
 	for _, job := range cfg.Cron.Jobs {
-		job := job // capture loop variable
+		job := job
 		scheduler.AddDaily(job.Name, job.Hour, job.Minute, func() {
 			slog.Info("cron job running", "job", job.Name, "chat_id", job.ChatID)
 
@@ -175,7 +198,6 @@ func setupCron(cfg *config.Config, ag *agent.Agent, feishuClient *feishu.Client,
 				return
 			}
 
-			// Determine receive_id_type from chat_id format.
 			receiveIDType, receiveID := parseCronChatID(job.ChatID)
 			if err := feishuClient.SendMessage(receiveIDType, receiveID, reply); err != nil {
 				slog.Error("cron job send failed", "job", job.Name, "err", err)
@@ -186,8 +208,6 @@ func setupCron(cfg *config.Config, ag *agent.Agent, feishuClient *feishu.Client,
 	return scheduler
 }
 
-// parseCronChatID extracts the receive_id_type and actual ID from a chat_id.
-// Format: "p2p:open_id_xxx" or "group:chat_id_xxx"
 func parseCronChatID(chatID string) (receiveIDType, receiveID string) {
 	if len(chatID) > 4 && chatID[:4] == "p2p:" {
 		return "open_id", chatID[4:]
@@ -195,6 +215,5 @@ func parseCronChatID(chatID string) (receiveIDType, receiveID string) {
 	if len(chatID) > 6 && chatID[:6] == "group:" {
 		return "chat_id", chatID[6:]
 	}
-	// Fallback: treat as chat_id directly.
 	return "chat_id", chatID
 }

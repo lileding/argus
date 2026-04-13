@@ -31,3 +31,14 @@ func (r *Registry) AllToolDefs() []model.ToolDef {
 func (r *Registry) Len() int {
 	return len(r.tools)
 }
+
+// ToolDefsForNames returns tool definitions only for the named tools.
+func (r *Registry) ToolDefsForNames(names map[string]bool) []model.ToolDef {
+	var defs []model.ToolDef
+	for name, t := range r.tools {
+		if names[name] {
+			defs = append(defs, ToModelToolDef(t))
+		}
+	}
+	return defs
+}
