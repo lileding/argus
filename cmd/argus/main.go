@@ -15,6 +15,7 @@ import (
 
 	"argus/internal/agent"
 	"argus/internal/config"
+	"argus/internal/cron"
 	"argus/internal/feishu"
 	"argus/internal/model"
 	"argus/internal/skill"
@@ -144,6 +145,11 @@ func runServer(cfg *config.Config) {
 
 	handler := feishu.NewHandler(feishuClient, cfg.Feishu, onMsg)
 
+	// Start cron scheduler for scheduled tasks.
+	scheduler := setupCron(cfg, ag, feishuClient, ctx)
+	scheduler.Start()
+	defer scheduler.Stop()
+
 	mux := http.NewServeMux()
 	mux.Handle("/webhook/feishu", handler)
 
@@ -153,4 +159,42 @@ func runServer(cfg *config.Config) {
 		slog.Error("server error", "err", err)
 		os.Exit(1)
 	}
+}
+
+func setupCron(cfg *config.Config, ag *agent.Agent, feishuClient *feishu.Client, ctx context.Context) *cron.Scheduler {
+	scheduler := cron.NewScheduler()
+
+	for _, job := range cfg.Cron.Jobs {
+		job := job // capture loop variable
+		scheduler.AddDaily(job.Name, job.Hour, job.Minute, func() {
+			slog.Info("cron job running", "job", job.Name, "chat_id", job.ChatID)
+
+			reply, err := ag.Handle(ctx, job.ChatID, job.Prompt)
+			if err != nil {
+				slog.Error("cron job agent failed", "job", job.Name, "err", err)
+				return
+			}
+
+			// Determine receive_id_type from chat_id format.
+			receiveIDType, receiveID := parseCronChatID(job.ChatID)
+			if err := feishuClient.SendMessage(receiveIDType, receiveID, reply); err != nil {
+				slog.Error("cron job send failed", "job", job.Name, "err", err)
+			}
+		})
+	}
+
+	return scheduler
+}
+
+// parseCronChatID extracts the receive_id_type and actual ID from a chat_id.
+// Format: "p2p:open_id_xxx" or "group:chat_id_xxx"
+func parseCronChatID(chatID string) (receiveIDType, receiveID string) {
+	if len(chatID) > 4 && chatID[:4] == "p2p:" {
+		return "open_id", chatID[4:]
+	}
+	if len(chatID) > 6 && chatID[:6] == "group:" {
+		return "chat_id", chatID[6:]
+	}
+	// Fallback: treat as chat_id directly.
+	return "chat_id", chatID
 }

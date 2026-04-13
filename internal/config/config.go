@@ -15,6 +15,19 @@ type Config struct {
 	Database DatabaseConfig `yaml:"database"`
 	Agent    AgentConfig    `yaml:"agent"`
 	Docker   DockerConfig   `yaml:"docker"`
+	Cron     CronConfig     `yaml:"cron"`
+}
+
+type CronConfig struct {
+	Jobs []CronJobConfig `yaml:"jobs"`
+}
+
+type CronJobConfig struct {
+	Name    string `yaml:"name"`
+	Hour    int    `yaml:"hour"`
+	Minute  int    `yaml:"minute"`
+	ChatID  string `yaml:"chat_id"` // target chat to send results
+	Prompt  string `yaml:"prompt"`  // prompt to send to the agent
 }
 
 type ServerConfig struct {

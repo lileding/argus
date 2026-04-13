@@ -28,3 +28,12 @@ docker:
   timeout: 30s
   memory_limit: "512m"
   network: "none"
+
+cron:
+  jobs: []
+  # Example:
+  # - name: "daily-stock-analysis"
+  #   hour: 9
+  #   minute: 0
+  #   chat_id: "p2p:ou_xxxxxxxx"
+  #   prompt: "请分析今日A股市场走势，重点关注科技板块，给出简要总结。"
