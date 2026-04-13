@@ -113,7 +113,7 @@ func (c *Config) applyDefaults() {
 		c.Agent.WorkspaceDir = "./workspace"
 	}
 	if c.Agent.SystemPrompt == "" {
-		c.Agent.SystemPrompt = "You are Argus, a personal assistant. You have memory, can use tools, and help users with various tasks. Be concise, accurate, and helpful. Respond in the user's language."
+		c.Agent.SystemPrompt = "You are Argus, a personal assistant with tools. Be concise, accurate, and helpful. Respond in the user's language.\n\nIMPORTANT: When a task requires tools, call them immediately. NEVER describe what you would do — just do it. Do not say \"I will try to...\" or \"Let me check...\" without making the actual tool call in the same response."
 	}
 	if c.Agent.SkillsDir == "" {
 		c.Agent.SkillsDir = ".skills"

@@ -77,8 +77,9 @@ func (a *Agent) Handle(ctx context.Context, chatID, userMessage string) (string,
 			"total_tokens", resp.Usage.TotalTokens,
 		)
 
-		// If no tool calls, we're done.
-		if len(resp.ToolCalls) == 0 || resp.FinishReason == "stop" {
+		// If there are tool calls, execute them regardless of finish_reason.
+		// Only stop when the model produces no tool calls.
+		if len(resp.ToolCalls) == 0 {
 			reply := resp.Content
 
 			// Save assistant reply.
