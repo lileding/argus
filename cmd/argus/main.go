@@ -207,7 +207,7 @@ func runServer(cfg *config.Config) {
 		}
 	}
 
-	handler := feishu.NewHandler(feishuClient, cfg.Feishu, cfg.Agent.WorkspaceDir, onMsg)
+	handler := feishu.NewHandler(feishuClient, cfg.Feishu, cfg.Agent.WorkspaceDir, modelClient, onMsg)
 
 	// Cron scheduler.
 	scheduler := setupCron(cfg, ag, feishuClient, ctx)

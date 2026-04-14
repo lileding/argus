@@ -124,3 +124,54 @@ func (c *OpenAIClient) Chat(ctx context.Context, messages []Message, tools []Too
 
 	return result, nil
 }
+
+// Transcribe sends an audio file to the /v1/audio/transcriptions endpoint.
+func (c *OpenAIClient) Transcribe(ctx context.Context, audioData []byte, filename string) (string, error) {
+	// Build multipart form.
+	boundary := "----ArgusAudioBoundary"
+	var buf bytes.Buffer
+	buf.WriteString("--" + boundary + "\r\n")
+	buf.WriteString("Content-Disposition: form-data; name=\"model\"\r\n\r\n")
+	buf.WriteString(c.modelName + "\r\n")
+	buf.WriteString("--" + boundary + "\r\n")
+	buf.WriteString(fmt.Sprintf("Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n", filename))
+	buf.WriteString("Content-Type: application/octet-stream\r\n\r\n")
+	buf.Write(audioData)
+	buf.WriteString("\r\n--" + boundary + "--\r\n")
+
+	url := c.baseURL + "/audio/transcriptions"
+	req, err := http.NewRequestWithContext(ctx, "POST", url, &buf)
+	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("transcribe request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("transcribe error: status=%d body=%s", resp.StatusCode, respBody)
+	}
+
+	// Response is {"text": "transcribed text"} in OpenAI format.
+	var result struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		// If not JSON, return raw text.
+		return string(respBody), nil
+	}
+
+	return result.Text, nil
+}

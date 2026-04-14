@@ -1,6 +1,7 @@
 package feishu
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -19,22 +20,28 @@ import (
 // MessageHandler is called to process an incoming message.
 type MessageHandler func(chatID string, msg model.Message, messageID string)
 
+// Transcriber can transcribe audio files to text.
+type Transcriber interface {
+	Transcribe(ctx context.Context, audioData []byte, filename string) (string, error)
+}
+
 // Handler handles Feishu webhook events.
 type Handler struct {
 	client       *Client
+	transcriber  Transcriber
 	dedup        *Dedup
 	cfg          config.FeishuConfig
 	workspaceDir string
 	onMsg        MessageHandler
 }
 
-func NewHandler(client *Client, cfg config.FeishuConfig, workspaceDir string, onMsg MessageHandler) *Handler {
-	// Ensure .files directory exists.
+func NewHandler(client *Client, cfg config.FeishuConfig, workspaceDir string, transcriber Transcriber, onMsg MessageHandler) *Handler {
 	filesDir := filepath.Join(workspaceDir, ".files")
 	os.MkdirAll(filesDir, 0755)
 
 	return &Handler{
 		client:       client,
+		transcriber:  transcriber,
 		dedup:        NewDedup(5 * time.Minute),
 		cfg:          cfg,
 		workspaceDir: workspaceDir,
@@ -214,18 +221,26 @@ func (h *Handler) buildAudioMessage(event MessageEvent) (model.Message, error) {
 
 	slog.Info("media saved", "type", "audio", "path", filePath, "duration_ms", content.Duration)
 
-	// Audio can't be passed directly via OpenAI-compatible API (only image_url is supported).
-	// The file is saved to workspace — tell the model to transcribe it via cli tool.
+	// Read the saved file for transcription.
 	absPath := filepath.Join(h.workspaceDir, filePath)
-	text := fmt.Sprintf(
-		"The user sent a %d-second voice message saved at %s. "+
-			"Transcribe it using the cli tool, e.g.: `whisper '%s' --output_format txt --language auto` "+
-			"or `ffmpeg -i '%s' -f wav - | python3 -c \"import sys,speech_recognition as sr; r=sr.Recognizer(); audio=sr.AudioFile(sys.stdin); ...\"`. "+
-			"Then respond to what the user said.",
-		content.Duration/1000, filePath, absPath, absPath,
-	)
+	audioData, err2 := os.ReadFile(absPath)
+	if err2 != nil {
+		return model.NewTextMessage(model.RoleUser, "[Voice message saved but could not be read for transcription]"), nil
+	}
 
-	return model.NewTextMessage(model.RoleUser, text), nil
+	// Transcribe using the model's /v1/audio/transcriptions endpoint.
+	transcript, err2 := h.transcriber.Transcribe(context.Background(), audioData, filepath.Base(absPath))
+	if err2 != nil {
+		slog.Warn("transcription failed", "err", err2)
+		return model.NewTextMessage(model.RoleUser,
+			fmt.Sprintf("[User sent a %d-second voice message (saved at %s) but transcription failed: %v]",
+				content.Duration/1000, filePath, err2)), nil
+	}
+
+	slog.Info("audio transcribed", "text", transcript)
+
+	return model.NewTextMessage(model.RoleUser,
+		fmt.Sprintf("[Voice message, %ds, saved at %s]\n%s", content.Duration/1000, filePath, transcript)), nil
 }
 
 // downloadAndSaveMedia downloads a media file from Feishu, saves it to workspace/.files/,
