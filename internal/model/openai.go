@@ -13,20 +13,22 @@ import (
 
 // OpenAIClient implements the Client interface using an OpenAI-compatible API.
 type OpenAIClient struct {
-	baseURL   string
-	apiKey    string
-	modelName string
-	maxTokens int
-	client    *http.Client
+	baseURL            string
+	apiKey             string
+	modelName          string
+	transcriptionModel string
+	maxTokens          int
+	client             *http.Client
 }
 
 func NewOpenAIClient(cfg config.ModelConfig) *OpenAIClient {
 	return &OpenAIClient{
-		baseURL:   cfg.BaseURL,
-		apiKey:    cfg.APIKey,
-		modelName: cfg.ModelName,
-		maxTokens: cfg.MaxTokens,
-		client:    &http.Client{Timeout: cfg.Timeout},
+		baseURL:            cfg.BaseURL,
+		apiKey:             cfg.APIKey,
+		modelName:          cfg.ModelName,
+		transcriptionModel: cfg.TranscriptionModel,
+		maxTokens:          cfg.MaxTokens,
+		client:             &http.Client{Timeout: cfg.Timeout},
 	}
 }
 
@@ -132,7 +134,7 @@ func (c *OpenAIClient) Transcribe(ctx context.Context, audioData []byte, filenam
 	var buf bytes.Buffer
 	buf.WriteString("--" + boundary + "\r\n")
 	buf.WriteString("Content-Disposition: form-data; name=\"model\"\r\n\r\n")
-	buf.WriteString(c.modelName + "\r\n")
+	buf.WriteString(c.transcriptionModel + "\r\n")
 	buf.WriteString("--" + boundary + "\r\n")
 	buf.WriteString(fmt.Sprintf("Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n", filename))
 	buf.WriteString("Content-Type: application/octet-stream\r\n\r\n")

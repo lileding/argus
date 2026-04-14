@@ -42,11 +42,12 @@ type FeishuConfig struct {
 }
 
 type ModelConfig struct {
-	BaseURL   string        `yaml:"base_url"`
-	ModelName string        `yaml:"model_name"`
-	APIKey    string        `yaml:"api_key"`
-	MaxTokens int           `yaml:"max_tokens"`
-	Timeout   time.Duration `yaml:"timeout"`
+	BaseURL            string        `yaml:"base_url"`
+	ModelName          string        `yaml:"model_name"`
+	APIKey             string        `yaml:"api_key"`
+	MaxTokens          int           `yaml:"max_tokens"`
+	Timeout            time.Duration `yaml:"timeout"`
+	TranscriptionModel string        `yaml:"transcription_model"`
 }
 
 type DatabaseConfig struct {
