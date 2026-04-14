@@ -2,8 +2,12 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
+	"net/http"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -26,7 +30,7 @@ func (a *Agent) assembleContext(ctx context.Context, chatID string, userMsg mode
 	if err != nil {
 		return nil, nil, fmt.Errorf("load recent messages: %w", err)
 	}
-	curated := curateHistory(recent)
+	curated := a.curateHistory(recent)
 
 	// Assemble messages.
 	messages := make([]model.Message, 0, len(curated)+2)
@@ -80,19 +84,41 @@ func (a *Agent) buildSystemPrompt() string {
 	return sb.String()
 }
 
+// fileRefRe matches file references like "(saved at .files/xxx.png)" or "(saved at .files/xxx.opus)"
+var fileRefRe = regexp.MustCompile(`\.files/[^\s),]+\.(?:png|jpg|jpeg|gif|webp)`)
+
 // curateHistory filters message history to keep only high-signal content:
 // user messages and assistant final replies. Removes tool_call/tool_result noise.
-func curateHistory(messages []store.StoredMessage) []model.Message {
+// For user messages referencing images in .files/, re-loads them as multimodal content.
+func (a *Agent) curateHistory(messages []store.StoredMessage) []model.Message {
 	var curated []model.Message
 	for _, m := range messages {
 		switch m.Role {
 		case "user":
+			// Check if this message references image files — re-inject them.
+			imageRefs := fileRefRe.FindAllString(m.Content, -1)
+			if len(imageRefs) > 0 {
+				var dataURLs []string
+				for _, ref := range imageRefs {
+					absPath := filepath.Join(a.workspaceDir, ref)
+					data, err := os.ReadFile(absPath)
+					if err != nil {
+						continue
+					}
+					contentType := http.DetectContentType(data)
+					dataURL := fmt.Sprintf("data:%s;base64,%s", contentType, base64.StdEncoding.EncodeToString(data))
+					dataURLs = append(dataURLs, dataURL)
+				}
+				if len(dataURLs) > 0 {
+					curated = append(curated, model.NewMultimodalMessage(model.RoleUser, m.Content, dataURLs...))
+					continue
+				}
+			}
 			curated = append(curated, model.Message{
 				Role:    model.RoleUser,
 				Content: m.Content,
 			})
 		case "assistant":
-			// Only keep final replies (has content, no tool call ID).
 			if m.Content != "" && m.ToolCallID == nil {
 				curated = append(curated, model.Message{
 					Role:    model.RoleAssistant,
