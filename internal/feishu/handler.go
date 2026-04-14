@@ -206,7 +206,7 @@ func (h *Handler) buildAudioMessage(event MessageEvent) (model.Message, error) {
 		return model.Message{}, fmt.Errorf("parse audio content: %w", err)
 	}
 
-	filePath, dataURL, err := h.downloadAndSaveMedia(event.Message.MessageID, content.FileKey, "file", ".opus")
+	filePath, _, err := h.downloadAndSaveMedia(event.Message.MessageID, content.FileKey, "file", ".opus")
 	if err != nil {
 		slog.Warn("audio download failed", "err", err)
 		return model.NewTextMessage(model.RoleUser, "[User sent a voice message that could not be downloaded]"), nil
@@ -214,13 +214,18 @@ func (h *Handler) buildAudioMessage(event MessageEvent) (model.Message, error) {
 
 	slog.Info("media saved", "type", "audio", "path", filePath, "duration_ms", content.Duration)
 
-	// Pass audio directly to model as multimodal content (Gemma 4 is natively multimodal).
-	parts := []model.ContentPart{
-		{Type: "text", Text: fmt.Sprintf("The user sent a %d-second voice message (saved at %s). Listen and respond.", content.Duration/1000, filePath)},
-		{Type: "input_audio", Text: dataURL},
-	}
+	// Audio can't be passed directly via OpenAI-compatible API (only image_url is supported).
+	// The file is saved to workspace — tell the model to transcribe it via cli tool.
+	absPath := filepath.Join(h.workspaceDir, filePath)
+	text := fmt.Sprintf(
+		"The user sent a %d-second voice message saved at %s. "+
+			"Transcribe it using the cli tool, e.g.: `whisper '%s' --output_format txt --language auto` "+
+			"or `ffmpeg -i '%s' -f wav - | python3 -c \"import sys,speech_recognition as sr; r=sr.Recognizer(); audio=sr.AudioFile(sys.stdin); ...\"`. "+
+			"Then respond to what the user said.",
+		content.Duration/1000, filePath, absPath, absPath,
+	)
 
-	return model.Message{Role: model.RoleUser, Content: parts}, nil
+	return model.NewTextMessage(model.RoleUser, text), nil
 }
 
 // downloadAndSaveMedia downloads a media file from Feishu, saves it to workspace/.files/,
