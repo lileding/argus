@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -190,20 +191,38 @@ func (h *Handler) buildAudioMessage(event MessageEvent) (model.Message, error) {
 		return model.Message{}, fmt.Errorf("parse audio content: %w", err)
 	}
 
-	audioData, err := h.client.DownloadMessageResource(event.Message.MessageID, content.FileKey, "audio")
+	// Feishu message resource API uses type "file" for audio resources.
+	audioData, err := h.client.DownloadMessageResource(event.Message.MessageID, content.FileKey, "file")
 	if err != nil {
 		return model.NewTextMessage(model.RoleUser, "[User sent a voice message that could not be downloaded]"), nil
 	}
 
-	slog.Info("audio downloaded", "size", len(audioData))
-	dataURL := "data:audio/opus;base64," + base64.StdEncoding.EncodeToString(audioData)
-
-	parts := []model.ContentPart{
-		{Type: "text", Text: "The user sent a voice message. Transcribe and respond to it."},
-		{Type: "input_audio", Text: dataURL},
+	// Check for error JSON response.
+	if len(audioData) < 1000 && len(audioData) > 0 && audioData[0] == '{' {
+		slog.Warn("audio download returned error", "body", string(audioData))
+		return model.NewTextMessage(model.RoleUser, "[User sent a voice message that could not be downloaded]"), nil
 	}
 
-	return model.Message{Role: model.RoleUser, Content: parts}, nil
+	slog.Info("audio downloaded", "size", len(audioData), "duration_ms", content.Duration)
+
+	// Save audio to workspace for the model to process via cli tool.
+	// Most local LLMs don't support direct audio input, so we tell the model
+	// to use cli tools (e.g. whisper, ffmpeg) to transcribe it.
+	audioPath := fmt.Sprintf("/tmp/argus_audio_%s.opus", content.FileKey[:8])
+	if err := writeFile(audioPath, audioData); err != nil {
+		slog.Warn("failed to save audio", "err", err)
+		return model.NewTextMessage(model.RoleUser, "[User sent a voice message that could not be saved]"), nil
+	}
+
+	text := fmt.Sprintf(
+		"The user sent a %d-second voice message saved at %s. "+
+			"Use the cli tool to transcribe it. Try: `whisper %s --language auto` or "+
+			"`python3 -c \"import speech_recognition as sr; ...\"` or any available speech-to-text tool. "+
+			"If no transcription tool is available, inform the user.",
+		content.Duration/1000, audioPath, audioPath,
+	)
+
+	return model.NewTextMessage(model.RoleUser, text), nil
 }
 
 // downloadImageAsDataURL downloads an image from Feishu and returns a base64 data URL.
@@ -303,6 +322,10 @@ func joinText(title, body string) string {
 		return title
 	}
 	return body
+}
+
+func writeFile(path string, data []byte) error {
+	return os.WriteFile(path, data, 0644)
 }
 
 func deriveChatID(chatType, userOpenID, feishuChatID string) string {
