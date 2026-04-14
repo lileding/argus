@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -20,19 +21,29 @@ type MessageHandler func(chatID string, msg model.Message, messageID string)
 
 // Handler handles Feishu webhook events.
 type Handler struct {
-	client *Client
-	dedup  *Dedup
-	cfg    config.FeishuConfig
-	onMsg  MessageHandler
+	client       *Client
+	dedup        *Dedup
+	cfg          config.FeishuConfig
+	workspaceDir string
+	onMsg        MessageHandler
 }
 
-func NewHandler(client *Client, cfg config.FeishuConfig, onMsg MessageHandler) *Handler {
+func NewHandler(client *Client, cfg config.FeishuConfig, workspaceDir string, onMsg MessageHandler) *Handler {
+	// Ensure .files directory exists.
+	filesDir := filepath.Join(workspaceDir, ".files")
+	os.MkdirAll(filesDir, 0755)
+
 	return &Handler{
-		client: client,
-		dedup:  NewDedup(5 * time.Minute),
-		cfg:    cfg,
-		onMsg:  onMsg,
+		client:       client,
+		dedup:        NewDedup(5 * time.Minute),
+		cfg:          cfg,
+		workspaceDir: workspaceDir,
+		onMsg:        onMsg,
 	}
+}
+
+func (h *Handler) filesDir() string {
+	return filepath.Join(h.workspaceDir, ".files")
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -132,19 +143,20 @@ func (h *Handler) buildImageMessage(event MessageEvent) (model.Message, error) {
 		return model.Message{}, fmt.Errorf("parse image content: %w", err)
 	}
 
-	dataURL, err := h.downloadImageAsDataURL(event.Message.MessageID, content.ImageKey)
+	filePath, dataURL, err := h.downloadAndSaveMedia(event.Message.MessageID, content.ImageKey, "image", ".png")
 	if err != nil {
-		slog.Warn("image download failed, sending as text", "err", err)
+		slog.Warn("image download failed", "err", err)
 		return model.NewTextMessage(model.RoleUser, "[User sent an image that could not be downloaded]"), nil
 	}
 
-	return model.NewMultimodalMessage(model.RoleUser, "The user sent this image. Describe or analyze it as needed.", dataURL), nil
+	slog.Info("media saved", "type", "image", "path", filePath)
+	return model.NewMultimodalMessage(model.RoleUser,
+		fmt.Sprintf("The user sent an image (saved at %s). Describe or analyze it as needed.", filePath),
+		dataURL,
+	), nil
 }
 
-// buildPostMessage handles Feishu rich text "post" messages (text + images combined).
 func (h *Handler) buildPostMessage(event MessageEvent) (model.Message, error) {
-	// Feishu post content: {"title":"...", "content":[[{"tag":"text","text":"..."},{"tag":"img","image_key":"..."}]]}
-	// Or with language key: {"zh_cn": {"title":"...", "content":[...]}}
 	var raw json.RawMessage
 	if err := json.Unmarshal([]byte(event.Message.Content), &raw); err != nil {
 		return model.Message{}, fmt.Errorf("parse post content: %w", err)
@@ -153,26 +165,29 @@ func (h *Handler) buildPostMessage(event MessageEvent) (model.Message, error) {
 	text, imageKeys := extractPostContent(raw)
 
 	if len(imageKeys) == 0 {
-		// Text-only post.
 		if text == "" {
 			text = "[Empty post message]"
 		}
 		return model.NewTextMessage(model.RoleUser, text), nil
 	}
 
-	// Download images and build multimodal message.
 	var dataURLs []string
+	var savedPaths []string
 	for _, key := range imageKeys {
-		dataURL, err := h.downloadImageAsDataURL(event.Message.MessageID, key)
+		filePath, dataURL, err := h.downloadAndSaveMedia(event.Message.MessageID, key, "image", ".png")
 		if err != nil {
 			slog.Warn("post image download failed", "image_key", key, "err", err)
 			continue
 		}
 		dataURLs = append(dataURLs, dataURL)
+		savedPaths = append(savedPaths, filePath)
 	}
 
 	if text == "" {
-		text = "The user sent this image. Describe or analyze it as needed."
+		text = "The user sent images. Describe or analyze them as needed."
+	}
+	if len(savedPaths) > 0 {
+		text += fmt.Sprintf(" (images saved at: %s)", strings.Join(savedPaths, ", "))
 	}
 
 	if len(dataURLs) == 0 {
@@ -191,64 +206,56 @@ func (h *Handler) buildAudioMessage(event MessageEvent) (model.Message, error) {
 		return model.Message{}, fmt.Errorf("parse audio content: %w", err)
 	}
 
-	// Feishu message resource API uses type "file" for audio resources.
-	audioData, err := h.client.DownloadMessageResource(event.Message.MessageID, content.FileKey, "file")
+	filePath, dataURL, err := h.downloadAndSaveMedia(event.Message.MessageID, content.FileKey, "file", ".opus")
 	if err != nil {
+		slog.Warn("audio download failed", "err", err)
 		return model.NewTextMessage(model.RoleUser, "[User sent a voice message that could not be downloaded]"), nil
+	}
+
+	slog.Info("media saved", "type", "audio", "path", filePath, "duration_ms", content.Duration)
+
+	// Pass audio directly to model as multimodal content (Gemma 4 is natively multimodal).
+	parts := []model.ContentPart{
+		{Type: "text", Text: fmt.Sprintf("The user sent a %d-second voice message (saved at %s). Listen and respond.", content.Duration/1000, filePath)},
+		{Type: "input_audio", Text: dataURL},
+	}
+
+	return model.Message{Role: model.RoleUser, Content: parts}, nil
+}
+
+// downloadAndSaveMedia downloads a media file from Feishu, saves it to workspace/.files/,
+// and returns the file path and base64 data URL.
+func (h *Handler) downloadAndSaveMedia(messageID, fileKey, resourceType, ext string) (filePath, dataURL string, err error) {
+	data, err := h.client.DownloadMessageResource(messageID, fileKey, resourceType)
+	if err != nil {
+		return "", "", err
+	}
+
+	if len(data) == 0 {
+		return "", "", fmt.Errorf("empty response")
 	}
 
 	// Check for error JSON response.
-	if len(audioData) < 1000 && len(audioData) > 0 && audioData[0] == '{' {
-		slog.Warn("audio download returned error", "body", string(audioData))
-		return model.NewTextMessage(model.RoleUser, "[User sent a voice message that could not be downloaded]"), nil
+	if len(data) < 1000 && data[0] == '{' {
+		return "", "", fmt.Errorf("API error: %s", string(data))
 	}
 
-	slog.Info("audio downloaded", "size", len(audioData), "duration_ms", content.Duration)
-
-	// Save audio to workspace for the model to process via cli tool.
-	// Most local LLMs don't support direct audio input, so we tell the model
-	// to use cli tools (e.g. whisper, ffmpeg) to transcribe it.
-	audioPath := fmt.Sprintf("/tmp/argus_audio_%s.opus", content.FileKey[:8])
-	if err := writeFile(audioPath, audioData); err != nil {
-		slog.Warn("failed to save audio", "err", err)
-		return model.NewTextMessage(model.RoleUser, "[User sent a voice message that could not be saved]"), nil
+	// Save to workspace/.files/
+	filename := fileKey + ext
+	filePath = filepath.Join(h.filesDir(), filename)
+	if err := os.WriteFile(filePath, data, 0644); err != nil {
+		return "", "", fmt.Errorf("save file: %w", err)
 	}
 
-	text := fmt.Sprintf(
-		"The user sent a %d-second voice message saved at %s. "+
-			"Use the cli tool to transcribe it. Try: `whisper %s --language auto` or "+
-			"`python3 -c \"import speech_recognition as sr; ...\"` or any available speech-to-text tool. "+
-			"If no transcription tool is available, inform the user.",
-		content.Duration/1000, audioPath, audioPath,
-	)
+	// Build data URL.
+	contentType := http.DetectContentType(data)
+	dataURL = fmt.Sprintf("data:%s;base64,%s", contentType, base64.StdEncoding.EncodeToString(data))
 
-	return model.NewTextMessage(model.RoleUser, text), nil
-}
+	slog.Info("media downloaded", "size", len(data), "path", filePath)
 
-// downloadImageAsDataURL downloads an image from Feishu and returns a base64 data URL.
-// Uses the message resource API which requires message_id + image_key.
-func (h *Handler) downloadImageAsDataURL(messageID, imageKey string) (string, error) {
-	imageData, err := h.client.DownloadMessageResource(messageID, imageKey, "image")
-	if err != nil {
-		return "", err
-	}
-
-	if len(imageData) == 0 {
-		return "", fmt.Errorf("empty image data")
-	}
-
-	// Check if the response is an error JSON instead of image bytes.
-	if len(imageData) < 1000 && imageData[0] == '{' {
-		return "", fmt.Errorf("image download returned error: %s", string(imageData))
-	}
-
-	slog.Info("image downloaded", "size", len(imageData), "image_key", imageKey)
-
-	// Detect content type from magic bytes.
-	contentType := http.DetectContentType(imageData)
-	dataURL := fmt.Sprintf("data:%s;base64,%s", contentType, base64.StdEncoding.EncodeToString(imageData))
-
-	return dataURL, nil
+	// Return path relative to workspace for the model to reference.
+	relPath, _ := filepath.Rel(h.workspaceDir, filePath)
+	return relPath, dataURL, nil
 }
 
 // extractPostContent extracts text and image keys from a Feishu post message.
@@ -278,7 +285,6 @@ func extractPostContent(raw json.RawMessage) (text string, imageKeys []string) {
 	return "", nil
 }
 
-// parsePostContentArray parses [[{"tag":"text","text":"..."},{"tag":"img","image_key":"..."}]]
 func parsePostContentArray(raw json.RawMessage) (text string, imageKeys []string) {
 	var lines [][]struct {
 		Tag      string `json:"tag"`
@@ -322,10 +328,6 @@ func joinText(title, body string) string {
 		return title
 	}
 	return body
-}
-
-func writeFile(path string, data []byte) error {
-	return os.WriteFile(path, data, 0644)
 }
 
 func deriveChatID(chatType, userOpenID, feishuChatID string) string {
