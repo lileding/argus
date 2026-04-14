@@ -129,6 +129,8 @@ func (h *Handler) buildMessage(event MessageEvent) (model.Message, error) {
 		return h.buildPostMessage(event)
 	case "audio":
 		return h.buildAudioMessage(event)
+	case "file":
+		return h.buildFileMessage(event)
 	default:
 		return model.Message{}, fmt.Errorf("unsupported message type: %s", event.Message.MessageType)
 	}
@@ -245,6 +247,35 @@ func (h *Handler) buildAudioMessage(event MessageEvent) (model.Message, error) {
 
 // downloadAndSaveMedia downloads a media file from Feishu, saves it to workspace/.files/,
 // and returns the file path and base64 data URL.
+func (h *Handler) buildFileMessage(event MessageEvent) (model.Message, error) {
+	var content struct {
+		FileKey  string `json:"file_key"`
+		FileName string `json:"file_name"`
+	}
+	if err := json.Unmarshal([]byte(event.Message.Content), &content); err != nil {
+		return model.Message{}, fmt.Errorf("parse file content: %w", err)
+	}
+
+	// Download file.
+	ext := filepath.Ext(content.FileName)
+	if ext == "" {
+		ext = ".bin"
+	}
+	filePath, _, err := h.downloadAndSaveMedia(event.Message.MessageID, content.FileKey, "file", ext)
+	if err != nil {
+		slog.Warn("file download failed", "err", err)
+		return model.NewTextMessage(model.RoleUser,
+			fmt.Sprintf("[User sent a file '%s' that could not be downloaded]", content.FileName)), nil
+	}
+
+	slog.Info("media saved", "type", "file", "path", filePath, "name", content.FileName)
+
+	absPath := filepath.Join(h.workspaceDir, filePath)
+	return model.NewTextMessage(model.RoleUser,
+		fmt.Sprintf("The user sent a file '%s' (saved at %s, absolute path: %s). Read and process it as needed. For PDFs use `pdftotext '%s' -` via the cli tool.",
+			content.FileName, filePath, absPath, absPath)), nil
+}
+
 func (h *Handler) downloadAndSaveMedia(messageID, fileKey, resourceType, ext string) (filePath, dataURL string, err error) {
 	data, err := h.client.DownloadMessageResource(messageID, fileKey, resourceType)
 	if err != nil {
