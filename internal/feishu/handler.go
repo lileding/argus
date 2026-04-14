@@ -131,7 +131,7 @@ func (h *Handler) buildImageMessage(event MessageEvent) (model.Message, error) {
 		return model.Message{}, fmt.Errorf("parse image content: %w", err)
 	}
 
-	dataURL, err := h.downloadImageAsDataURL(content.ImageKey)
+	dataURL, err := h.downloadImageAsDataURL(event.Message.MessageID, content.ImageKey)
 	if err != nil {
 		slog.Warn("image download failed, sending as text", "err", err)
 		return model.NewTextMessage(model.RoleUser, "[User sent an image that could not be downloaded]"), nil
@@ -162,7 +162,7 @@ func (h *Handler) buildPostMessage(event MessageEvent) (model.Message, error) {
 	// Download images and build multimodal message.
 	var dataURLs []string
 	for _, key := range imageKeys {
-		dataURL, err := h.downloadImageAsDataURL(key)
+		dataURL, err := h.downloadImageAsDataURL(event.Message.MessageID, key)
 		if err != nil {
 			slog.Warn("post image download failed", "image_key", key, "err", err)
 			continue
@@ -207,8 +207,9 @@ func (h *Handler) buildAudioMessage(event MessageEvent) (model.Message, error) {
 }
 
 // downloadImageAsDataURL downloads an image from Feishu and returns a base64 data URL.
-func (h *Handler) downloadImageAsDataURL(imageKey string) (string, error) {
-	imageData, err := h.client.DownloadImage(imageKey)
+// Uses the message resource API which requires message_id + image_key.
+func (h *Handler) downloadImageAsDataURL(messageID, imageKey string) (string, error) {
+	imageData, err := h.client.DownloadMessageResource(messageID, imageKey, "image")
 	if err != nil {
 		return "", err
 	}
