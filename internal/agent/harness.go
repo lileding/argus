@@ -17,7 +17,7 @@ import (
 // The LLM sees the skill catalog (name + description) in the system prompt and
 // uses activate_skill to load full instructions when needed. No code-level
 // pre-filtering — the LLM is the best judge of intent.
-func (a *Agent) assembleContext(ctx context.Context, chatID, userMessage string) ([]model.Message, []model.ToolDef, error) {
+func (a *Agent) assembleContext(ctx context.Context, chatID string, userMsg model.Message) ([]model.Message, []model.ToolDef, error) {
 	// Build system prompt with skill catalog.
 	systemPrompt := a.buildSystemPrompt()
 
@@ -35,10 +35,10 @@ func (a *Agent) assembleContext(ctx context.Context, chatID, userMessage string)
 		Content: systemPrompt,
 	})
 	messages = append(messages, curated...)
-	messages = append(messages, model.Message{
-		Role:    model.RoleUser,
-		Content: userMessage,
-	})
+
+	// Append user message (may be multimodal).
+	userMsg.Role = model.RoleUser
+	messages = append(messages, userMsg)
 
 	// All tools available — LLM decides which to use.
 	toolDefs := a.toolRegistry.AllToolDefs()

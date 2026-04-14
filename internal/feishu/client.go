@@ -14,10 +14,12 @@ import (
 )
 
 const (
-	tokenURL      = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
-	replyURL      = "https://open.feishu.cn/open-apis/im/v1/messages/%s/reply"
-	sendMsgURL    = "https://open.feishu.cn/open-apis/im/v1/messages"
-	uploadImgURL  = "https://open.feishu.cn/open-apis/im/v1/images"
+	tokenURL       = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+	replyURL       = "https://open.feishu.cn/open-apis/im/v1/messages/%s/reply"
+	sendMsgURL     = "https://open.feishu.cn/open-apis/im/v1/messages"
+	uploadImgURL   = "https://open.feishu.cn/open-apis/im/v1/images"
+	downloadImgURL = "https://open.feishu.cn/open-apis/im/v1/images/%s"
+	msgResourceURL = "https://open.feishu.cn/open-apis/im/v1/messages/%s/resources/%s?type=%s"
 )
 
 // Client is a Feishu API client that handles token management and message sending.
@@ -187,6 +189,53 @@ func (c *Client) UploadImage(imageData []byte) (string, error) {
 	}
 
 	return result.Data.ImageKey, nil
+}
+
+// DownloadImage downloads an image by image_key and returns raw bytes.
+func (c *Client) DownloadImage(imageKey string) ([]byte, error) {
+	token, err := c.getToken()
+	if err != nil {
+		return nil, fmt.Errorf("get token: %w", err)
+	}
+
+	url := fmt.Sprintf(downloadImgURL, imageKey)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("download image: %w", err)
+	}
+	defer resp.Body.Close()
+
+	return io.ReadAll(resp.Body)
+}
+
+// DownloadMessageResource downloads a file/audio/video resource from a message.
+// resourceType is "image", "file", or "audio".
+func (c *Client) DownloadMessageResource(messageID, fileKey, resourceType string) ([]byte, error) {
+	token, err := c.getToken()
+	if err != nil {
+		return nil, fmt.Errorf("get token: %w", err)
+	}
+
+	url := fmt.Sprintf(msgResourceURL, messageID, fileKey, resourceType)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("download resource: %w", err)
+	}
+	defer resp.Body.Close()
+
+	return io.ReadAll(resp.Body)
 }
 
 func (c *Client) getToken() (string, error) {

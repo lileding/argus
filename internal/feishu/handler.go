@@ -1,6 +1,7 @@
 package feishu
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,18 +10,20 @@ import (
 	"time"
 
 	"argus/internal/config"
+	"argus/internal/model"
 )
 
 // MessageHandler is called to process an incoming message.
-// chatID is the derived chat identifier, text is the message content, messageID is used for replies.
-type MessageHandler func(chatID, text, messageID string)
+// chatID identifies the conversation, msg is the user message (may be multimodal),
+// messageID is used for replies.
+type MessageHandler func(chatID string, msg model.Message, messageID string)
 
 // Handler handles Feishu webhook events.
 type Handler struct {
-	client  *Client
-	dedup   *Dedup
-	cfg     config.FeishuConfig
-	onMsg   MessageHandler
+	client *Client
+	dedup  *Dedup
+	cfg    config.FeishuConfig
+	onMsg  MessageHandler
 }
 
 func NewHandler(client *Client, cfg config.FeishuConfig, onMsg MessageHandler) *Handler {
@@ -81,32 +84,97 @@ func (h *Handler) processEvent(envelope EventEnvelope) {
 		return
 	}
 
-	// Only handle text messages for now.
-	if msgEvent.Message.MessageType != "text" {
-		return
-	}
-
-	var content TextContent
-	if err := json.Unmarshal([]byte(msgEvent.Message.Content), &content); err != nil {
-		slog.Error("parse message content", "err", err)
-		return
-	}
-
 	// Derive chat_id.
 	chatID := deriveChatID(msgEvent.Message.ChatType, msgEvent.Sender.SenderID.OpenID, msgEvent.Message.ChatID)
 
-	// In group chats, only respond to @mentions (check if mentions exist).
+	// In group chats, only respond to @mentions.
 	if msgEvent.Message.ChatType == "group" && len(msgEvent.Message.Mentions) == 0 {
+		return
+	}
+
+	// Build model message based on message type.
+	msg, err := h.buildMessage(msgEvent)
+	if err != nil {
+		slog.Warn("unsupported message", "type", msgEvent.Message.MessageType, "err", err)
 		return
 	}
 
 	slog.Info("message received",
 		"chat_id", chatID,
 		"chat_type", msgEvent.Message.ChatType,
-		"text", content.Text,
+		"msg_type", msgEvent.Message.MessageType,
 	)
 
-	h.onMsg(chatID, content.Text, msgEvent.Message.MessageID)
+	h.onMsg(chatID, msg, msgEvent.Message.MessageID)
+}
+
+// buildMessage converts a Feishu message event into a model.Message.
+func (h *Handler) buildMessage(event MessageEvent) (model.Message, error) {
+	switch event.Message.MessageType {
+	case "text":
+		return h.buildTextMessage(event)
+	case "image":
+		return h.buildImageMessage(event)
+	case "audio":
+		return h.buildAudioMessage(event)
+	default:
+		return model.Message{}, fmt.Errorf("unsupported message type: %s", event.Message.MessageType)
+	}
+}
+
+func (h *Handler) buildTextMessage(event MessageEvent) (model.Message, error) {
+	var content TextContent
+	if err := json.Unmarshal([]byte(event.Message.Content), &content); err != nil {
+		return model.Message{}, fmt.Errorf("parse text content: %w", err)
+	}
+	return model.NewTextMessage(model.RoleUser, content.Text), nil
+}
+
+func (h *Handler) buildImageMessage(event MessageEvent) (model.Message, error) {
+	var content struct {
+		ImageKey string `json:"image_key"`
+	}
+	if err := json.Unmarshal([]byte(event.Message.Content), &content); err != nil {
+		return model.Message{}, fmt.Errorf("parse image content: %w", err)
+	}
+
+	// Download image from Feishu.
+	imageData, err := h.client.DownloadImage(content.ImageKey)
+	if err != nil {
+		return model.Message{}, fmt.Errorf("download image: %w", err)
+	}
+
+	// Convert to data URL for OpenAI vision format.
+	dataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(imageData)
+
+	return model.NewMultimodalMessage(model.RoleUser, "The user sent this image. Describe or analyze it as needed.", dataURL), nil
+}
+
+func (h *Handler) buildAudioMessage(event MessageEvent) (model.Message, error) {
+	var content struct {
+		FileKey  string `json:"file_key"`
+		Duration int    `json:"duration"` // milliseconds
+	}
+	if err := json.Unmarshal([]byte(event.Message.Content), &content); err != nil {
+		return model.Message{}, fmt.Errorf("parse audio content: %w", err)
+	}
+
+	// Download audio from Feishu.
+	audioData, err := h.client.DownloadMessageResource(event.Message.MessageID, content.FileKey, "audio")
+	if err != nil {
+		return model.Message{}, fmt.Errorf("download audio: %w", err)
+	}
+
+	// Convert to base64 data URL. Feishu audio is typically opus format.
+	dataURL := "data:audio/opus;base64," + base64.StdEncoding.EncodeToString(audioData)
+
+	// Build multimodal message with audio.
+	parts := []model.ContentPart{
+		{Type: "text", Text: "The user sent a voice message. Transcribe and respond to it."},
+		{Type: "input_audio", Text: dataURL},
+	}
+
+	return model.Message{Role: model.RoleUser, Content: parts}, nil
 }
 
 func deriveChatID(chatType, userOpenID, feishuChatID string) string {

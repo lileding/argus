@@ -11,11 +11,67 @@ const (
 	RoleTool      Role = "tool"
 )
 
+// Message represents a chat message. Content can be:
+//   - string: plain text message
+//   - []ContentPart: multimodal message (text + images, OpenAI vision format)
 type Message struct {
-	Role       Role       `json:"role"`
-	Content    string     `json:"content,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Role       Role        `json:"role"`
+	Content    interface{} `json:"content,omitempty"`
+	ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`
+	ToolCallID string      `json:"tool_call_id,omitempty"`
+}
+
+// ContentPart is a part of a multimodal message (OpenAI vision API format).
+type ContentPart struct {
+	Type     string    `json:"type"`               // "text" or "image_url"
+	Text     string    `json:"text,omitempty"`      // for type "text"
+	ImageURL *ImageURL `json:"image_url,omitempty"` // for type "image_url"
+}
+
+type ImageURL struct {
+	URL string `json:"url"` // can be a URL or "data:image/png;base64,..."
+}
+
+// TextContent returns the text content of a message, regardless of content type.
+func (m Message) TextContent() string {
+	switch v := m.Content.(type) {
+	case string:
+		return v
+	case []ContentPart:
+		for _, p := range v {
+			if p.Type == "text" {
+				return p.Text
+			}
+		}
+	case []interface{}:
+		for _, item := range v {
+			if mp, ok := item.(map[string]interface{}); ok {
+				if mp["type"] == "text" {
+					if text, ok := mp["text"].(string); ok {
+						return text
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// NewTextMessage creates a simple text message.
+func NewTextMessage(role Role, text string) Message {
+	return Message{Role: role, Content: text}
+}
+
+// NewMultimodalMessage creates a message with text and images.
+func NewMultimodalMessage(role Role, text string, imageDataURLs ...string) Message {
+	parts := []ContentPart{{Type: "text", Text: text}}
+	for _, url := range imageDataURLs {
+		parts = append(parts, ContentPart{
+			Type:     "image_url",
+			ImageURL: &ImageURL{URL: url},
+		})
+	}
+	return Message{Role: role, Content: parts}
 }
 
 type ToolCall struct {

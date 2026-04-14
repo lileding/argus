@@ -142,7 +142,7 @@ func runCLI(cfg *config.Config) {
 			continue
 		}
 
-		reply, err := ag.Handle(ctx, chatID, text)
+		reply, err := ag.Handle(ctx, chatID, model.NewTextMessage(model.RoleUser, text))
 		if err != nil {
 			fmt.Printf("Error: %v\n> ", err)
 			continue
@@ -194,9 +194,9 @@ func runServer(cfg *config.Config) {
 
 	feishuClient := feishu.NewClient(cfg.Feishu)
 
-	onMsg := func(chatID, text, messageID string) {
-		slog.Info("handling message", "chat_id", chatID, "text", text)
-		reply, err := ag.Handle(ctx, chatID, text)
+	onMsg := func(chatID string, msg model.Message, messageID string) {
+		slog.Info("handling message", "chat_id", chatID, "msg_text", msg.TextContent())
+		reply, err := ag.Handle(ctx, chatID, msg)
 		if err != nil {
 			slog.Error("agent handle failed", "err", err, "chat_id", chatID)
 			reply = fmt.Sprintf("Error: %v", err)
@@ -236,7 +236,7 @@ func setupCron(cfg *config.Config, ag *agent.Agent, feishuClient *feishu.Client,
 		scheduler.AddDaily(job.Name, job.Hour, job.Minute, func() {
 			slog.Info("cron job running", "job", job.Name, "chat_id", job.ChatID)
 
-			reply, err := ag.Handle(ctx, job.ChatID, job.Prompt)
+			reply, err := ag.Handle(ctx, job.ChatID, model.NewTextMessage(model.RoleUser, job.Prompt))
 			if err != nil {
 				slog.Error("cron job agent failed", "job", job.Name, "err", err)
 				return

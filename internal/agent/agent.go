@@ -42,21 +42,22 @@ func New(modelClient model.Client, st store.Store, toolReg *tool.Registry, skill
 }
 
 // Handle processes a user message and returns the assistant's reply.
-func (a *Agent) Handle(ctx context.Context, chatID, userMessage string) (string, error) {
+// userMsg can have Content as string (text) or []ContentPart (multimodal).
+func (a *Agent) Handle(ctx context.Context, chatID string, userMsg model.Message) (string, error) {
 	// Inject chatID into context for tools (e.g. save_skill, db_exec).
 	ctx = tool.WithChatID(ctx, chatID)
 
-	// Save user message.
+	// Save user message (store text content only).
 	if err := a.store.SaveMessage(ctx, &store.StoredMessage{
 		ChatID:  chatID,
 		Role:    string(model.RoleUser),
-		Content: userMessage,
+		Content: userMsg.TextContent(),
 	}); err != nil {
 		return "", fmt.Errorf("save user message: %w", err)
 	}
 
 	// Assemble context via harness: skill selection + prompt assembly + history curation.
-	messages, toolDefs, err := a.assembleContext(ctx, chatID, userMessage)
+	messages, toolDefs, err := a.assembleContext(ctx, chatID, userMsg)
 	if err != nil {
 		return "", fmt.Errorf("assemble context: %w", err)
 	}
