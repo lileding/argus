@@ -1,4 +1,4 @@
-.PHONY: build run run-cli test clean sandbox
+.PHONY: build run run-cli test clean sandbox up down
 
 build:
 	go build -o bin/argus ./cmd/argus
@@ -14,6 +14,12 @@ test:
 
 sandbox:
 	docker build -f Dockerfile.sandbox -t argus-sandbox:latest .
+
+up:
+	docker compose up -d postgres
+
+down:
+	docker compose down
 
 clean:
 	rm -rf bin/

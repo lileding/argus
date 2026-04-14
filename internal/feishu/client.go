@@ -14,9 +14,10 @@ import (
 )
 
 const (
-	tokenURL   = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
-	replyURL   = "https://open.feishu.cn/open-apis/im/v1/messages/%s/reply"
-	sendMsgURL = "https://open.feishu.cn/open-apis/im/v1/messages"
+	tokenURL      = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+	replyURL      = "https://open.feishu.cn/open-apis/im/v1/messages/%s/reply"
+	sendMsgURL    = "https://open.feishu.cn/open-apis/im/v1/messages"
+	uploadImgURL  = "https://open.feishu.cn/open-apis/im/v1/images"
 )
 
 // Client is a Feishu API client that handles token management and message sending.
@@ -102,6 +103,90 @@ func (c *Client) SendMessage(receiveIDType, receiveID, text string) error {
 	}
 
 	return nil
+}
+
+// ReplyRich sends a reply with arbitrary msg_type and pre-encoded content JSON.
+func (c *Client) ReplyRich(messageID, msgType, contentJSON string) error {
+	token, err := c.getToken()
+	if err != nil {
+		return fmt.Errorf("get token: %w", err)
+	}
+
+	body := map[string]string{
+		"content":  contentJSON,
+		"msg_type": msgType,
+	}
+	data, _ := json.Marshal(body)
+
+	url := fmt.Sprintf(replyURL, messageID)
+	req, err := http.NewRequest("POST", url, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("send reply: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("reply rich failed: status=%d body=%s", resp.StatusCode, respBody)
+	}
+
+	return nil
+}
+
+// UploadImage uploads an image to Feishu and returns the image_key.
+func (c *Client) UploadImage(imageData []byte) (string, error) {
+	token, err := c.getToken()
+	if err != nil {
+		return "", fmt.Errorf("get token: %w", err)
+	}
+
+	// Multipart form: image_type=message, image=<binary>
+	var buf bytes.Buffer
+	boundary := "----ArgusImageBoundary"
+	buf.WriteString("--" + boundary + "\r\n")
+	buf.WriteString("Content-Disposition: form-data; name=\"image_type\"\r\n\r\n")
+	buf.WriteString("message\r\n")
+	buf.WriteString("--" + boundary + "\r\n")
+	buf.WriteString("Content-Disposition: form-data; name=\"image\"; filename=\"image.png\"\r\n")
+	buf.WriteString("Content-Type: image/png\r\n\r\n")
+	buf.Write(imageData)
+	buf.WriteString("\r\n--" + boundary + "--\r\n")
+
+	req, err := http.NewRequest("POST", uploadImgURL, &buf)
+	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("upload image: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Code int `json:"code"`
+		Data struct {
+			ImageKey string `json:"image_key"`
+		} `json:"data"`
+		Msg string `json:"msg"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("decode upload response: %w", err)
+	}
+	if result.Code != 0 {
+		return "", fmt.Errorf("upload image error: code=%d msg=%s", result.Code, result.Msg)
+	}
+
+	return result.Data.ImageKey, nil
 }
 
 func (c *Client) getToken() (string, error) {

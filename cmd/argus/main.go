@@ -18,6 +18,7 @@ import (
 	"argus/internal/cron"
 	"argus/internal/feishu"
 	"argus/internal/model"
+	"argus/internal/render"
 	"argus/internal/sandbox"
 	"argus/internal/skill"
 	"argus/internal/store"
@@ -101,6 +102,8 @@ func buildToolRegistry(cfg *config.Config, sb sandbox.Sandbox, loader *skill.Fil
 	registry.Register(tool.NewWriteFileTool(cfg.Agent.WorkspaceDir))
 	registry.Register(tool.NewCLITool(sb))
 	registry.Register(tool.NewSearchTool())
+	registry.Register(tool.NewFetchTool())
+	registry.Register(tool.NewCurrentTimeTool())
 
 	skillsDir := filepath.Join(cfg.Agent.WorkspaceDir, cfg.Agent.SkillsDir)
 	registry.Register(tool.NewSaveSkillTool(skillsDir, loader.Rebuild))
@@ -196,9 +199,10 @@ func runServer(cfg *config.Config) {
 		reply, err := ag.Handle(ctx, chatID, text)
 		if err != nil {
 			slog.Error("agent handle failed", "err", err, "chat_id", chatID)
-			reply = fmt.Sprintf("抱歉，处理消息时出错：%v", err)
+			reply = fmt.Sprintf("Error: %v", err)
 		}
-		if err := feishuClient.Reply(messageID, reply); err != nil {
+		msgType, content := render.ForFeishu(reply)
+		if err := feishuClient.ReplyRich(messageID, msgType, content); err != nil {
 			slog.Error("reply failed", "err", err, "message_id", messageID)
 		}
 	}

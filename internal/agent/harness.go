@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
 	"argus/internal/model"
 	"argus/internal/store"
@@ -52,11 +51,11 @@ func (a *Agent) buildSystemPrompt() string {
 
 	sb.WriteString(a.basePrompt)
 
-	// Inject environment info.
-	sb.WriteString(fmt.Sprintf("\n\nCurrent time: %s\n", time.Now().Format("2006-01-02 15:04:05 (Monday)")))
-	sb.WriteString(fmt.Sprintf("Home directory: %s\n", os.Getenv("HOME")))
+	// Inject environment info (no time — model uses current_time tool when needed).
+	sb.WriteString(fmt.Sprintf("\n\nHome directory: %s\n", os.Getenv("HOME")))
 	sb.WriteString(fmt.Sprintf("Workspace directory: %s\n", a.workspaceDir))
 	sb.WriteString("The read_file and write_file tools operate on paths relative to this workspace. For files outside the workspace, use the cli tool with absolute paths (e.g. `cat /home/user/file.txt`).\n")
+	sb.WriteString("Use the current_time tool when you need to know the date, time, or resolve relative time references.\n")
 
 	// Inject builtin skill prompts directly — these contain critical behavioral rules.
 	builtinPrompts := a.skillIndex.BuiltinPrompts()
