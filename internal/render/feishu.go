@@ -30,9 +30,9 @@ func hasMarkdown(s string) bool {
 }
 
 // Feishu post types.
-type postContent struct {
-	Post map[string]postBody `json:"post"`
-}
+// The content JSON for msg_type "post" is {"zh_cn": {"title": ..., "content": ...}}
+// (no outer "post" wrapper — the API msg_type already indicates it).
+type postContent map[string]postBody
 
 type postBody struct {
 	Title   string      `json:"title"`
@@ -116,11 +116,9 @@ func markdownToPost(md string) string {
 	}
 
 	post := postContent{
-		Post: map[string]postBody{
-			"zh_cn": {
-				Title:   title,
-				Content: content,
-			},
+		"zh_cn": {
+			Title:   title,
+			Content: content,
 		},
 	}
 

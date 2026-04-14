@@ -30,7 +30,7 @@ func TestForFeishu_Markdown(t *testing.T) {
 		t.Fatalf("invalid JSON: %v", err)
 	}
 
-	body := post.Post["zh_cn"]
+	body := post["zh_cn"]
 	if body.Title != "Title" {
 		t.Errorf("title = %q, want 'Title'", body.Title)
 	}
@@ -48,7 +48,7 @@ func TestForFeishu_CodeBlock(t *testing.T) {
 
 	var post postContent
 	json.Unmarshal([]byte(content), &post)
-	body := post.Post["zh_cn"]
+	body := post["zh_cn"]
 
 	// Should have code block as a text element somewhere.
 	found := false
