@@ -47,19 +47,20 @@ func (a *Agent) Handle(ctx context.Context, chatID string, userMsg model.Message
 	// Inject chatID into context for tools (e.g. save_skill, db_exec).
 	ctx = tool.WithChatID(ctx, chatID)
 
-	// Save user message (store text content only).
+	// Assemble context BEFORE saving — otherwise the current message appears twice
+	// (once from history, once appended as the current message).
+	messages, toolDefs, err := a.assembleContext(ctx, chatID, userMsg)
+	if err != nil {
+		return "", fmt.Errorf("assemble context: %w", err)
+	}
+
+	// Save user message after context assembly.
 	if err := a.store.SaveMessage(ctx, &store.StoredMessage{
 		ChatID:  chatID,
 		Role:    string(model.RoleUser),
 		Content: userMsg.TextContent(),
 	}); err != nil {
 		return "", fmt.Errorf("save user message: %w", err)
-	}
-
-	// Assemble context via harness: skill selection + prompt assembly + history curation.
-	messages, toolDefs, err := a.assembleContext(ctx, chatID, userMsg)
-	if err != nil {
-		return "", fmt.Errorf("assemble context: %w", err)
 	}
 
 	// Agent tool loop.
