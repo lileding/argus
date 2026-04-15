@@ -1,12 +1,16 @@
 package render
 
+/*
+#cgo CFLAGS: -I${SRCDIR}/../../third_party/ratex/include
+#cgo LDFLAGS: -L${SRCDIR}/../../third_party/ratex/target/release -lratex_bridge -lm -ldl -framework Security -framework CoreFoundation
+#include "ratex_bridge.h"
+#include <stdlib.h>
+*/
+import "C"
 import (
-	"bytes"
 	"fmt"
 	"regexp"
-
-	"github.com/go-latex/latex/drawtex/drawimg"
-	"github.com/go-latex/latex/mtex"
+	"unsafe"
 )
 
 var (
@@ -37,28 +41,32 @@ func DetectLatex(text string) []LatexBlock {
 	return blocks
 }
 
-// RenderLatexPNG renders a LaTeX math expression to PNG bytes using pure Go (go-latex).
-// Returns nil, error if the expression uses unsupported LaTeX features.
-func RenderLatexPNG(latex string, fontSize float64) (pngBytes []byte, err error) {
-	// go-latex panics on unsupported AST nodes (e.g. Sup, Sub).
-	// Recover gracefully instead of crashing the process.
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("latex render panic: %v", r)
-			pngBytes = nil
-		}
-	}()
-
+// RenderLatexPNG renders a LaTeX math expression to PNG bytes using RaTeX (Rust, via CGo).
+// 99.5% KaTeX syntax coverage.
+func RenderLatexPNG(latex string, fontSize float64) ([]byte, error) {
 	if fontSize == 0 {
 		fontSize = 24
 	}
 
-	var buf bytes.Buffer
-	renderer := drawimg.NewRenderer(&buf)
+	cLatex := C.CString(latex)
+	defer C.free(unsafe.Pointer(cLatex))
 
-	if err := mtex.Render(renderer, latex, fontSize, 150, nil); err != nil {
-		return nil, err
+	displayMode := C.int(0)
+
+	result := C.ratex_render_png(cLatex, C.float(fontSize), displayMode)
+
+	if result.error != nil {
+		errMsg := C.GoString(result.error)
+		C.ratex_free_string(result.error)
+		return nil, fmt.Errorf("ratex: %s", errMsg)
 	}
 
-	return buf.Bytes(), nil
+	if result.data == nil || result.len == 0 {
+		return nil, fmt.Errorf("ratex: empty result")
+	}
+
+	pngData := C.GoBytes(unsafe.Pointer(result.data), C.int(result.len))
+	C.ratex_free_png(result.data, result.len)
+
+	return pngData, nil
 }
