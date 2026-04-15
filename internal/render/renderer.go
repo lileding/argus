@@ -36,13 +36,6 @@ func (r *Renderer) replaceLatexWithImages(text string) string {
 	}
 
 	for _, block := range blocks {
-		// Feishu post format: img elements must occupy their own paragraph.
-		// Only render display math ($$...$$) as images — they naturally get their own block.
-		// Inline math ($...$) stays as text since it can't be inlined with text in Feishu.
-		if !block.Display {
-			continue
-		}
-
 		pngData, err := RenderLatexPNG(block.Expr, block.Display)
 		if err != nil {
 			slog.Debug("latex render failed, keeping raw text", "expr", block.Expr, "err", err)

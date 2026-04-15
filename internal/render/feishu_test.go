@@ -20,46 +20,37 @@ func TestForFeishu_PlainText(t *testing.T) {
 func TestForFeishu_Markdown(t *testing.T) {
 	md := "# Title\n\nHello **world** and [link](https://example.com)\n\n- item one\n- item two"
 	msgType, content := ForFeishu(md)
-	if msgType != "post" {
-		t.Errorf("expected post, got %s", msgType)
+	if msgType != "interactive" {
+		t.Errorf("expected interactive, got %s", msgType)
 	}
 
-	// Verify it's valid JSON.
-	var post postContent
-	if err := json.Unmarshal([]byte(content), &post); err != nil {
+	var card map[string]interface{}
+	if err := json.Unmarshal([]byte(content), &card); err != nil {
 		t.Fatalf("invalid JSON: %v", err)
 	}
 
-	body := post["zh_cn"]
-	if body.Title != "Title" {
-		t.Errorf("title = %q, want 'Title'", body.Title)
-	}
-	if len(body.Content) < 3 {
-		t.Fatalf("expected at least 3 content lines, got %d", len(body.Content))
+	if card["schema"] != "2.0" {
+		t.Errorf("expected schema 2.0, got %v", card["schema"])
 	}
 }
 
-func TestForFeishu_CodeBlock(t *testing.T) {
-	md := "Here is code:\n\n```\nfmt.Println(\"hello\")\n```\n\nDone."
+func TestForFeishu_ImageMarker(t *testing.T) {
+	md := "Here is a formula [[IMG:img_key_123]] in text"
 	msgType, content := ForFeishu(md)
-	if msgType != "post" {
-		t.Errorf("expected post, got %s", msgType)
+	if msgType != "interactive" {
+		t.Errorf("expected interactive, got %s", msgType)
 	}
 
-	var post postContent
-	json.Unmarshal([]byte(content), &post)
-	body := post["zh_cn"]
+	var card map[string]interface{}
+	json.Unmarshal([]byte(content), &card)
 
-	// Should have code block as a text element somewhere.
-	found := false
-	for _, line := range body.Content {
-		for _, elem := range line {
-			if elem.Text == "fmt.Println(\"hello\")" {
-				found = true
-			}
-		}
-	}
-	if !found {
-		t.Error("code block content not found in post")
+	// The [[IMG:key]] should be converted to ![](key) in the markdown content.
+	body := card["body"].(map[string]interface{})
+	elements := body["elements"].([]interface{})
+	elem := elements[0].(map[string]interface{})
+	mdContent := elem["content"].(string)
+
+	if mdContent != "Here is a formula ![](img_key_123) in text" {
+		t.Errorf("image marker not converted: %q", mdContent)
 	}
 }
