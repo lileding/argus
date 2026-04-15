@@ -15,6 +15,7 @@ import (
 
 	"argus/internal/config"
 	"argus/internal/model"
+	"argus/internal/store"
 )
 
 // MessageHandler is called to process an incoming message.
@@ -30,18 +31,24 @@ type Corrector interface {
 	Chat(ctx context.Context, messages []model.Message, tools []model.ToolDef) (*model.Response, error)
 }
 
+// DocRegisterer can register documents for RAG indexing.
+type DocRegisterer interface {
+	SaveDocument(ctx context.Context, doc *store.Document) error
+}
+
 // Handler handles Feishu webhook events.
 type Handler struct {
 	client       *Client
 	transcriber  Transcriber
 	corrector    Corrector
+	docStore     DocRegisterer // nil if not available
 	dedup        *Dedup
 	cfg          config.FeishuConfig
 	workspaceDir string
 	onMsg        MessageHandler
 }
 
-func NewHandler(client *Client, cfg config.FeishuConfig, workspaceDir string, transcriber Transcriber, corrector Corrector, onMsg MessageHandler) *Handler {
+func NewHandler(client *Client, cfg config.FeishuConfig, workspaceDir string, transcriber Transcriber, corrector Corrector, docStore DocRegisterer, onMsg MessageHandler) *Handler {
 	filesDir := filepath.Join(workspaceDir, ".files")
 	os.MkdirAll(filesDir, 0755)
 
@@ -49,6 +56,7 @@ func NewHandler(client *Client, cfg config.FeishuConfig, workspaceDir string, tr
 		client:       client,
 		transcriber:  transcriber,
 		corrector:    corrector,
+		docStore:     docStore,
 		dedup:        NewDedup(5 * time.Minute),
 		cfg:          cfg,
 		workspaceDir: workspaceDir,
@@ -322,6 +330,16 @@ func (h *Handler) buildFileMessage(event MessageEvent) (model.Message, error) {
 	slog.Info("media saved", "type", "file", "path", filePath, "name", content.FileName)
 
 	absPath := filepath.Join(h.workspaceDir, filePath)
+
+	// Register document for RAG indexing if store is available.
+	if h.docStore != nil {
+		h.docStore.SaveDocument(context.Background(), &store.Document{
+			Filename: content.FileName,
+			FilePath: absPath,
+			Status:   "pending",
+		})
+	}
+
 	return model.NewTextMessage(model.RoleUser,
 		fmt.Sprintf("The user sent a file '%s' (saved at %s, absolute path: %s). Read and process it as needed. For PDFs use `pdftotext '%s' -` via the cli tool.",
 			content.FileName, filePath, absPath, absPath)), nil

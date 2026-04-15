@@ -10,12 +10,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	_ "github.com/lib/pq"
 
 	"argus/internal/agent"
 	"argus/internal/config"
 	"argus/internal/cron"
+	"argus/internal/docindex"
 	"argus/internal/embedding"
 	"argus/internal/feishu"
 	"argus/internal/model"
@@ -240,7 +242,18 @@ func runServer(cfg *config.Config) {
 		}
 	}
 
-	handler := feishu.NewHandler(feishuClient, cfg.Feishu, cfg.Agent.WorkspaceDir, modelClient, modelClient, onMsg)
+	// Document store for RAG indexing (nil if not available).
+	var docReg feishu.DocRegisterer
+	if ds, ok := st.(store.DocumentStore); ok {
+		docReg = ds
+
+		// Start document ingester.
+		ingester := docindex.NewIngester(ds, sb, 5*time.Second)
+		ingester.Start()
+		defer ingester.Stop()
+	}
+
+	handler := feishu.NewHandler(feishuClient, cfg.Feishu, cfg.Agent.WorkspaceDir, modelClient, modelClient, docReg, onMsg)
 
 	// Cron scheduler.
 	scheduler := setupCron(cfg, ag, feishuClient, ctx)
