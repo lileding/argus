@@ -83,6 +83,22 @@ func (a *Agent) HandleStream(ctx context.Context, chatID string, userMsg model.M
 			return
 		}
 
+		// Pre-search: if user message has explicit search intent, proactively search
+		// before the model decides (compensates for models that skip tool calls).
+		userText := userMsg.TextContent()
+		if searchResult := a.preSearch(ctx, userText); searchResult != "" {
+			// Inject search result as a system hint at the end of messages.
+			messages = append(messages[:len(messages)-1], // remove user msg temporarily
+				model.Message{
+					Role:    model.RoleSystem,
+					Content: "## Pre-fetched Search Results\n\nThe user asked to search. Here are results:\n\n" + searchResult + "\n\nUse these results to answer the user's question. If more searches are needed, use the search tool.",
+				},
+				messages[len(messages)-1], // put user msg back at end
+			)
+			ch <- Event{Type: EventToolCall, Payload: ToolCallPayload{Name: "search", Arguments: userText}}
+			ch <- Event{Type: EventToolResult, Payload: ToolResultPayload{Name: "search", Result: truncateResult(searchResult, 200)}}
+		}
+
 		// Agent tool loop.
 		recentCalls := make(map[string]int)
 		for i := 0; i < a.maxIterations; i++ {
@@ -181,6 +197,66 @@ func (a *Agent) Handle(ctx context.Context, chatID string, userMsg model.Message
 		return "", lastErr
 	}
 	return reply, nil
+}
+
+// preSearch checks if the user message contains explicit search intent and
+// proactively runs a search. Returns search results or empty string.
+// This compensates for local models that sometimes skip tool calls despite
+// being told to search.
+func (a *Agent) preSearch(ctx context.Context, text string) string {
+	lower := strings.ToLower(text)
+
+	// Detect explicit search intent (Chinese and English).
+	searchTriggers := []string{
+		"搜索", "搜一下", "查一下", "查询", "网上找", "互联网", "上网",
+		"search", "look up", "google", "find online",
+	}
+
+	hasIntent := false
+	for _, trigger := range searchTriggers {
+		if strings.Contains(lower, trigger) {
+			hasIntent = true
+			break
+		}
+	}
+
+	if !hasIntent {
+		return ""
+	}
+
+	// Extract a search query from the user message.
+	// Use the search tool directly.
+	searchTool, ok := a.toolRegistry.Get("search")
+	if !ok {
+		return ""
+	}
+
+	// Build a search query — use the full user text as query.
+	query := text
+	// Remove common prefixes.
+	for _, prefix := range []string{
+		"搜索网络给我", "搜索网络", "搜索一下", "搜索", "搜一下",
+		"查一下", "查询", "网上找", "帮我搜索", "帮我查",
+		"search for ", "search ", "look up ", "google ",
+	} {
+		if idx := strings.Index(lower, prefix); idx >= 0 {
+			query = text[idx+len(prefix):]
+			break
+		}
+	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		query = text
+	}
+
+	slog.Info("pre-search triggered", "query", query)
+	result, err := searchTool.Execute(ctx, `{"query":"`+strings.ReplaceAll(query, `"`, `\"`)+`"}`)
+	if err != nil {
+		slog.Warn("pre-search failed", "err", err)
+		return ""
+	}
+
+	return result
 }
 
 func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) string {
