@@ -273,7 +273,7 @@ func runServer(cfg *config.Config) {
 	handler := feishu.NewHandler(feishuClient, cfg.Feishu, cfg.Agent.WorkspaceDir, modelClient, modelClient, docReg, onMsg)
 
 	// Cron scheduler.
-	scheduler := setupCron(cfg, ag, feishuClient, ctx)
+	scheduler := setupCron(cfg, ag, feishuClient, renderer, ctx)
 	scheduler.Start()
 	defer scheduler.Stop()
 
@@ -291,7 +291,7 @@ func runServer(cfg *config.Config) {
 	}
 }
 
-func setupCron(cfg *config.Config, ag *agent.Agent, feishuClient *feishu.Client, ctx context.Context) *cron.Scheduler {
+func setupCron(cfg *config.Config, ag *agent.Agent, feishuClient *feishu.Client, renderer *render.Renderer, ctx context.Context) *cron.Scheduler {
 	scheduler := cron.NewScheduler()
 
 	for _, job := range cfg.Cron.Jobs {
@@ -307,8 +307,9 @@ func setupCron(cfg *config.Config, ag *agent.Agent, feishuClient *feishu.Client,
 				return
 			}
 
+			msgType, content := renderer.RenderForFeishu(reply)
 			receiveIDType, receiveID := parseCronChatID(job.ChatID)
-			if err := feishuClient.SendMessage(receiveIDType, receiveID, reply); err != nil {
+			if err := feishuClient.SendMessageRich(receiveIDType, receiveID, msgType, content); err != nil {
 				slog.Error("cron job send failed", "job", job.Name, "err", err)
 			}
 		})

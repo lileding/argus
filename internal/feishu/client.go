@@ -35,78 +35,6 @@ func NewClient(cfg config.FeishuConfig) *Client {
 	return &Client{cfg: cfg}
 }
 
-// Reply sends a text reply to a specific message.
-func (c *Client) Reply(messageID, text string) error {
-	token, err := c.getToken()
-	if err != nil {
-		return fmt.Errorf("get token: %w", err)
-	}
-
-	body := map[string]string{
-		"content":  fmt.Sprintf(`{"text":%q}`, text),
-		"msg_type": "text",
-	}
-	data, _ := json.Marshal(body)
-
-	url := fmt.Sprintf(replyURL, messageID)
-	req, err := http.NewRequest("POST", url, bytes.NewReader(data))
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("send reply: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("reply failed: status=%d body=%s", resp.StatusCode, respBody)
-	}
-
-	return nil
-}
-
-// SendMessage proactively sends a text message to a chat.
-// receiveIDType is "chat_id" for group chats or "open_id" for private chats.
-func (c *Client) SendMessage(receiveIDType, receiveID, text string) error {
-	token, err := c.getToken()
-	if err != nil {
-		return fmt.Errorf("get token: %w", err)
-	}
-
-	body := map[string]string{
-		"receive_id": receiveID,
-		"content":    fmt.Sprintf(`{"text":%q}`, text),
-		"msg_type":   "text",
-	}
-	data, _ := json.Marshal(body)
-
-	url := sendMsgURL + "?receive_id_type=" + receiveIDType
-	req, err := http.NewRequest("POST", url, bytes.NewReader(data))
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("send message: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("send message failed: status=%d body=%s", resp.StatusCode, respBody)
-	}
-
-	return nil
-}
-
 // ReplyRich sends a reply with arbitrary msg_type and pre-encoded content JSON.
 func (c *Client) ReplyRich(messageID, msgType, contentJSON string) error {
 	token, err := c.getToken()
@@ -137,6 +65,42 @@ func (c *Client) ReplyRich(messageID, msgType, contentJSON string) error {
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("reply rich failed: status=%d body=%s", resp.StatusCode, respBody)
+	}
+
+	return nil
+}
+
+// SendMessageRich proactively sends a message with arbitrary msg_type and content.
+func (c *Client) SendMessageRich(receiveIDType, receiveID, msgType, contentJSON string) error {
+	token, err := c.getToken()
+	if err != nil {
+		return fmt.Errorf("get token: %w", err)
+	}
+
+	body := map[string]string{
+		"receive_id": receiveID,
+		"content":    contentJSON,
+		"msg_type":   msgType,
+	}
+	data, _ := json.Marshal(body)
+
+	url := sendMsgURL + "?receive_id_type=" + receiveIDType
+	req, err := http.NewRequest("POST", url, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("send message: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("send message failed: status=%d body=%s", resp.StatusCode, respBody)
 	}
 
 	return nil
