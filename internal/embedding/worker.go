@@ -110,7 +110,18 @@ func (w *Worker) embedMessages(ctx context.Context) {
 
 	vectors, err := w.client.Embed(ctx, texts)
 	if err != nil {
-		slog.Warn("embed messages batch", "err", err, "count", len(texts))
+		// Batch failed — fallback to one-by-one to isolate the bad message.
+		slog.Warn("embed messages batch failed, trying individually", "err", err, "count", len(texts))
+		for i, m := range msgs {
+			vec, err := w.client.Embed(ctx, []string{texts[i]})
+			if err != nil {
+				slog.Warn("embed single message failed", "id", m.ID, "err", err)
+				continue
+			}
+			if len(vec) > 0 && vec[0] != nil {
+				w.semantic.SetMessageEmbedding(ctx, m.ID, vec[0])
+			}
+		}
 		return
 	}
 
@@ -143,7 +154,17 @@ func (w *Worker) embedChunks(ctx context.Context) {
 
 	vectors, err := w.client.Embed(ctx, texts)
 	if err != nil {
-		slog.Warn("embed chunks batch", "err", err, "count", len(texts))
+		slog.Warn("embed chunks batch failed, trying individually", "err", err, "count", len(texts))
+		for i, c := range chunks {
+			vec, err := w.client.Embed(ctx, []string{texts[i]})
+			if err != nil {
+				slog.Warn("embed single chunk failed", "id", c.ID, "err", err)
+				continue
+			}
+			if len(vec) > 0 && vec[0] != nil {
+				w.docs.SetChunkEmbedding(ctx, c.ID, vec[0])
+			}
+		}
 		return
 	}
 

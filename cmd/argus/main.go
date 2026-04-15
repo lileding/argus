@@ -185,6 +185,22 @@ func runServer(cfg *config.Config) {
 			}
 			st = pgStore
 			slog.Info("using PostgreSQL store")
+
+			// Run startup repair to fix inconsistencies from previous crashes.
+			if rs, ok := st.(store.RepairableStore); ok {
+				if n, err := rs.RepairStuckDocuments(ctx); err == nil && n > 0 {
+					slog.Info("repaired stuck documents", "count", n)
+				}
+				if n, err := rs.RepairOrphanChunks(ctx); err == nil && n > 0 {
+					slog.Info("cleaned orphan chunks", "count", n)
+				}
+				if n, err := rs.CountUnembeddedMessages(ctx); err == nil && n > 0 {
+					slog.Info("messages pending embedding", "count", n)
+				}
+				if msgs, err := rs.FailedTranscriptions(ctx); err == nil && len(msgs) > 0 {
+					slog.Warn("found messages with failed transcriptions", "count", len(msgs))
+				}
+			}
 		} else {
 			slog.Warn("database unavailable, using memory store", "err", err)
 			db = nil

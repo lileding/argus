@@ -371,3 +371,67 @@ func (s *PostgresStore) SetChunkEmbedding(ctx context.Context, chunkID int64, em
 	_, err := s.db.ExecContext(ctx, `UPDATE chunks SET embedding = $1 WHERE id = $2`, vec, chunkID)
 	return err
 }
+
+// --- RepairableStore ---
+
+// RepairStuckDocuments resets documents stuck in "processing" back to "pending"
+// so the ingester can retry them. This happens when the program crashes mid-ingestion.
+func (s *PostgresStore) RepairStuckDocuments(ctx context.Context) (int, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE documents SET status = 'pending', error_msg = 'reset: was stuck in processing'
+		WHERE status = 'processing'
+	`)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := result.RowsAffected()
+	return int(n), nil
+}
+
+// RepairOrphanChunks deletes chunks belonging to documents that are not "ready",
+// so they can be re-ingested cleanly.
+func (s *PostgresStore) RepairOrphanChunks(ctx context.Context) (int, error) {
+	result, err := s.db.ExecContext(ctx, `
+		DELETE FROM chunks WHERE document_id IN (
+			SELECT id FROM documents WHERE status != 'ready'
+		)
+	`)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := result.RowsAffected()
+	return int(n), nil
+}
+
+// CountUnembeddedMessages returns the number of messages still needing embedding.
+func (s *PostgresStore) CountUnembeddedMessages(ctx context.Context) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM messages WHERE embedding IS NULL AND role IN ('user', 'assistant') AND content != ''
+	`).Scan(&count)
+	return count, err
+}
+
+// FailedTranscriptions returns audio messages where transcription failed.
+func (s *PostgresStore) FailedTranscriptions(ctx context.Context) ([]StoredMessage, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, chat_id, content, file_paths
+		FROM messages
+		WHERE msg_type = 'audio' AND content LIKE '%transcription failed%'
+		ORDER BY created_at
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var msgs []StoredMessage
+	for rows.Next() {
+		var m StoredMessage
+		if err := rows.Scan(&m.ID, &m.ChatID, &m.Content, pq.Array(&m.FilePaths)); err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs, nil
+}
