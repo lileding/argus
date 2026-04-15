@@ -36,20 +36,20 @@ func (r *Renderer) replaceLatexWithImages(text string) string {
 	}
 
 	for _, block := range blocks {
-		fontSize := 24.0
+		fontSize := 14.0
 		if block.Display {
-			fontSize = 28.0
+			fontSize = 18.0
 		}
 
-		pngData, err := RenderLatexPNG(block.Expr, fontSize)
+		pngData, err := RenderLatexPNG(block.Expr, fontSize, block.Display)
 		if err != nil {
-			slog.Debug("latex render failed", "expr", block.Expr, "err", err)
+			slog.Debug("latex render failed, keeping raw text", "expr", block.Expr, "err", err)
 			continue
 		}
 
 		imageKey, err := r.uploader.UploadImage(pngData)
 		if err != nil {
-			slog.Debug("latex upload failed", "expr", block.Expr, "err", err)
+			slog.Debug("latex upload failed, keeping raw text", "expr", block.Expr, "err", err)
 			continue
 		}
 

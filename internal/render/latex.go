@@ -43,17 +43,20 @@ func DetectLatex(text string) []LatexBlock {
 
 // RenderLatexPNG renders a LaTeX math expression to PNG bytes using RaTeX (Rust, via CGo).
 // 99.5% KaTeX syntax coverage.
-func RenderLatexPNG(latex string, fontSize float64) ([]byte, error) {
+func RenderLatexPNG(latex string, fontSize float64, displayMode bool) ([]byte, error) {
 	if fontSize == 0 {
-		fontSize = 24
+		fontSize = 16
 	}
 
 	cLatex := C.CString(latex)
 	defer C.free(unsafe.Pointer(cLatex))
 
-	displayMode := C.int(0)
+	cDisplay := C.int(0)
+	if displayMode {
+		cDisplay = 1
+	}
 
-	result := C.ratex_render_png(cLatex, C.float(fontSize), displayMode)
+	result := C.ratex_render_png(cLatex, C.float(fontSize), cDisplay)
 
 	if result.error != nil {
 		errMsg := C.GoString(result.error)
