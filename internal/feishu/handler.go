@@ -249,8 +249,8 @@ func (h *Handler) buildAudioMessage(event MessageEvent) (model.Message, error) {
 	transcript := result.Text
 	slog.Info("audio transcribed", "text", transcript, "confidence", result.Confidence)
 
-	// If confidence is low (avg_logprob < -0.5), ask the main model to correct errors.
-	if result.Confidence < -0.5 && h.corrector != nil {
+	// Always run LLM correction: fix misheard words and add punctuation.
+	if h.corrector != nil {
 		corrected := h.correctTranscription(transcript)
 		if corrected != "" {
 			slog.Info("transcription corrected", "original", transcript, "corrected", corrected)
@@ -267,9 +267,13 @@ func (h *Handler) buildAudioMessage(event MessageEvent) (model.Message, error) {
 // correctTranscription uses the main LLM to fix transcription errors.
 func (h *Handler) correctTranscription(raw string) string {
 	messages := []model.Message{
-		{Role: model.RoleSystem, Content: "You are a transcription corrector. Fix errors in the following speech-to-text output. " +
-			"The speaker uses mixed Chinese and English with technical terms from technology, finance, and arts. " +
-			"Fix obvious misheard words, names, and terms. Return ONLY the corrected text, nothing else."},
+		{Role: model.RoleSystem, Content: "You are a transcription post-processor. Your task:\n" +
+			"1. Add proper punctuation (commas, periods, question marks, etc.)\n" +
+			"2. Fix misheard words, especially technical terms and proper nouns\n" +
+			"3. The speaker uses mixed Chinese and English\n" +
+			"4. Common domains: technology (API, Kubernetes, Docker, GPU, LLM, MLX, Maxwell, Transformer), " +
+			"finance (ETF, hedge fund, derivatives), arts (sonata, Chopin, Scriabin, Grieg, Dvořák)\n" +
+			"5. Return ONLY the corrected text with punctuation. No explanations, no quotes."},
 		{Role: model.RoleUser, Content: raw},
 	}
 
