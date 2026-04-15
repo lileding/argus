@@ -79,7 +79,9 @@ func RenderLatexPNG(latex string, fontSize float64, displayMode bool) ([]byte, e
 	return postProcess(pngData)
 }
 
-// postProcess makes white pixels transparent and tight-crops to content bounds.
+// postProcess converts the white-background RaTeX PNG into a tight-cropped
+// transparent-background image. Black glyphs on white bg → black glyphs on
+// transparent bg, with proper alpha from the luminance channel.
 func postProcess(pngData []byte) ([]byte, error) {
 	img, err := png.Decode(bytes.NewReader(pngData))
 	if err != nil {
@@ -89,18 +91,25 @@ func postProcess(pngData []byte) ([]byte, error) {
 	bounds := img.Bounds()
 	rgba := image.NewNRGBA(bounds)
 
-	// Pass 1: convert white to transparent, track content bounds.
+	// Convert white-bg rendering to transparent-bg:
+	// The source is black text on white. Use inverse luminance as alpha.
+	// Pure white (background) → alpha 0. Pure black (glyph) → alpha 255.
+	// Gray (anti-alias) → proportional alpha.
 	minX, minY := bounds.Max.X, bounds.Max.Y
 	maxX, maxY := bounds.Min.X, bounds.Min.Y
 
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
 			r, g, b, _ := img.At(x, y).RGBA()
-			if r > 0xF000 && g > 0xF000 && b > 0xF000 {
+			// Luminance in 0-255 range.
+			lum := uint8((r*299 + g*587 + b*114) / 1000 >> 8)
+			alpha := 255 - lum // invert: white=0, black=255
+
+			if alpha < 8 {
+				// Nearly transparent — skip for bounding box.
 				rgba.SetNRGBA(x, y, color.NRGBA{0, 0, 0, 0})
 			} else {
-				rgba.Set(x, y, img.At(x, y))
-				// Track bounding box of non-transparent content.
+				rgba.SetNRGBA(x, y, color.NRGBA{0, 0, 0, alpha})
 				if x < minX { minX = x }
 				if y < minY { minY = y }
 				if x > maxX { maxX = x }
@@ -109,20 +118,12 @@ func postProcess(pngData []byte) ([]byte, error) {
 		}
 	}
 
-	// No content found.
 	if minX > maxX || minY > maxY {
 		return pngData, nil
 	}
 
-	// Pass 2: crop to content bounds with 1px margin.
-	margin := 1
-	cropRect := image.Rect(
-		max(minX-margin, bounds.Min.X),
-		max(minY-margin, bounds.Min.Y),
-		min(maxX+margin+1, bounds.Max.X),
-		min(maxY+margin+1, bounds.Max.Y),
-	)
-
+	// Tight crop with zero margin.
+	cropRect := image.Rect(minX, minY, maxX+1, maxY+1)
 	cropped := rgba.SubImage(cropRect)
 
 	var buf bytes.Buffer
