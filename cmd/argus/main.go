@@ -228,6 +228,7 @@ func runServer(cfg *config.Config) {
 	ag := agent.New(modelClient, st, toolReg, loader.Index(), embedClient, cfg.Agent.SystemPrompt, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
 
 	feishuClient := feishu.NewClient(cfg.Feishu)
+	renderer := render.NewRenderer(feishuClient)
 
 	onMsg := func(chatID string, msg model.Message, messageID string) {
 		slog.Info("handling message", "chat_id", chatID, "msg_text", msg.TextContent())
@@ -236,7 +237,7 @@ func runServer(cfg *config.Config) {
 			slog.Error("agent handle failed", "err", err, "chat_id", chatID)
 			reply = fmt.Sprintf("Error: %v", err)
 		}
-		msgType, content := render.ForFeishu(reply)
+		msgType, content := renderer.RenderForFeishu(reply)
 		if err := feishuClient.ReplyRich(messageID, msgType, content); err != nil {
 			slog.Error("reply failed", "err", err, "message_id", messageID)
 		}

@@ -40,15 +40,17 @@ type postBody struct {
 }
 
 type element struct {
-	Tag   string   `json:"tag"`
-	Text  string   `json:"text,omitempty"`
-	Href  string   `json:"href,omitempty"`
-	Style []string `json:"style,omitempty"`
+	Tag      string   `json:"tag"`
+	Text     string   `json:"text,omitempty"`
+	Href     string   `json:"href,omitempty"`
+	ImageKey string   `json:"image_key,omitempty"`
+	Style    []string `json:"style,omitempty"`
 }
 
 var (
 	linkRe = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
 	boldRe = regexp.MustCompile(`\*\*([^*]+)\*\*`)
+	imgRe  = regexp.MustCompile(`\[\[IMG:([^\]]+)\]\]`)
 )
 
 func markdownToPost(md string) string {
@@ -126,18 +128,19 @@ func markdownToPost(md string) string {
 	return string(data)
 }
 
-// parseInline converts a line with **bold** and [links](url) into Feishu elements.
+// parseInline converts a line with **bold**, [links](url), and [[IMG:key]] into Feishu elements.
 func parseInline(line string) []element {
 	var elems []element
 	remaining := line
 
 	for len(remaining) > 0 {
-		// Find the earliest match of bold or link.
+		// Find the earliest match of bold, link, or image.
 		boldLoc := boldRe.FindStringIndex(remaining)
 		linkLoc := linkRe.FindStringIndex(remaining)
+		imgLoc := imgRe.FindStringIndex(remaining)
 
 		// No more matches.
-		if boldLoc == nil && linkLoc == nil {
+		if boldLoc == nil && linkLoc == nil && imgLoc == nil {
 			if remaining != "" {
 				elems = append(elems, element{Tag: "text", Text: remaining})
 			}
@@ -145,30 +148,41 @@ func parseInline(line string) []element {
 		}
 
 		// Pick the earliest match.
-		var loc []int
-		isBold := false
-		if boldLoc != nil && (linkLoc == nil || boldLoc[0] <= linkLoc[0]) {
-			loc = boldLoc
-			isBold = true
-		} else {
-			loc = linkLoc
+		type match struct {
+			loc  []int
+			kind string
+		}
+		var best match
+		for _, m := range []match{
+			{boldLoc, "bold"}, {linkLoc, "link"}, {imgLoc, "img"},
+		} {
+			if m.loc == nil {
+				continue
+			}
+			if best.loc == nil || m.loc[0] < best.loc[0] {
+				best = m
+			}
 		}
 
 		// Text before the match.
-		if loc[0] > 0 {
-			elems = append(elems, element{Tag: "text", Text: remaining[:loc[0]]})
+		if best.loc[0] > 0 {
+			elems = append(elems, element{Tag: "text", Text: remaining[:best.loc[0]]})
 		}
 
-		matched := remaining[loc[0]:loc[1]]
-		if isBold {
+		matched := remaining[best.loc[0]:best.loc[1]]
+		switch best.kind {
+		case "bold":
 			sub := boldRe.FindStringSubmatch(matched)
 			elems = append(elems, element{Tag: "text", Text: sub[1], Style: []string{"bold"}})
-		} else {
+		case "link":
 			sub := linkRe.FindStringSubmatch(matched)
 			elems = append(elems, element{Tag: "a", Text: sub[1], Href: sub[2]})
+		case "img":
+			sub := imgRe.FindStringSubmatch(matched)
+			elems = append(elems, element{Tag: "img", ImageKey: sub[1]})
 		}
 
-		remaining = remaining[loc[1]:]
+		remaining = remaining[best.loc[1]:]
 	}
 
 	return elems
