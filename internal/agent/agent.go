@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"argus/internal/embedding"
 	"argus/internal/model"
 	"argus/internal/skill"
 	"argus/internal/store"
@@ -19,13 +20,14 @@ type Agent struct {
 	store         store.Store
 	toolRegistry  *tool.Registry
 	skillIndex    *skill.SkillIndex
+	embedder      *embedding.Client // nil if embedding disabled
 	basePrompt    string
 	workspaceDir  string
 	contextWindow int
 	maxIterations int
 }
 
-func New(modelClient model.Client, st store.Store, toolReg *tool.Registry, skillIdx *skill.SkillIndex, basePrompt, workspaceDir string, contextWindow, maxIterations int) *Agent {
+func New(modelClient model.Client, st store.Store, toolReg *tool.Registry, skillIdx *skill.SkillIndex, embedder *embedding.Client, basePrompt, workspaceDir string, contextWindow, maxIterations int) *Agent {
 	if maxIterations == 0 {
 		maxIterations = 10
 	}
@@ -34,6 +36,7 @@ func New(modelClient model.Client, st store.Store, toolReg *tool.Registry, skill
 		store:         st,
 		toolRegistry:  toolReg,
 		skillIndex:    skillIdx,
+		embedder:      embedder,
 		workspaceDir:  workspaceDir,
 		basePrompt:    basePrompt,
 		contextWindow: contextWindow,

@@ -126,7 +126,7 @@ func runCLI(cfg *config.Config) {
 	memStore := store.NewMemoryStore()
 	sb := buildSandbox(cfg)
 	toolReg := buildToolRegistry(cfg, sb, loader, nil)
-	ag := agent.New(modelClient, memStore, toolReg, loader.Index(), cfg.Agent.SystemPrompt, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
+	ag := agent.New(modelClient, memStore, toolReg, loader.Index(), nil, cfg.Agent.SystemPrompt, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
 
 	chatID := "cli:local"
 	ctx := context.Background()
@@ -192,10 +192,13 @@ func runServer(cfg *config.Config) {
 
 	modelClient := model.NewOpenAIClient(cfg.Model)
 
-	// Start embedding worker if enabled and DB is available.
+	// Embedding client (shared by worker and agent for query embedding).
+	var embedClient *embedding.Client
 	if cfg.Embedding.Enabled {
+		embedClient = embedding.NewClient(cfg.Model.BaseURL, cfg.Model.APIKey, cfg.Embedding.ModelName)
+
+		// Start background embedding worker if store supports it.
 		if ss, ok := st.(store.SemanticStore); ok {
-			embedClient := embedding.NewClient(cfg.Model.BaseURL, cfg.Model.APIKey, cfg.Embedding.ModelName)
 			var ps store.PinnedMemoryStore
 			var ds store.DocumentStore
 			if p, ok := st.(store.PinnedMemoryStore); ok {
@@ -214,7 +217,7 @@ func runServer(cfg *config.Config) {
 
 	sb := buildSandbox(cfg)
 	toolReg := buildToolRegistry(cfg, sb, loader, db)
-	ag := agent.New(modelClient, st, toolReg, loader.Index(), cfg.Agent.SystemPrompt, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
+	ag := agent.New(modelClient, st, toolReg, loader.Index(), embedClient, cfg.Agent.SystemPrompt, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
 
 	feishuClient := feishu.NewClient(cfg.Feishu)
 
