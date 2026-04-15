@@ -22,26 +22,33 @@ type MessageHandler func(chatID string, msg model.Message, messageID string)
 
 // Transcriber can transcribe audio files to text.
 type Transcriber interface {
-	Transcribe(ctx context.Context, audioData []byte, filename string) (string, error)
+	Transcribe(ctx context.Context, audioData []byte, filename string) (*model.TranscriptionResult, error)
+}
+
+// Corrector can correct transcription errors using an LLM.
+type Corrector interface {
+	Chat(ctx context.Context, messages []model.Message, tools []model.ToolDef) (*model.Response, error)
 }
 
 // Handler handles Feishu webhook events.
 type Handler struct {
 	client       *Client
 	transcriber  Transcriber
+	corrector    Corrector
 	dedup        *Dedup
 	cfg          config.FeishuConfig
 	workspaceDir string
 	onMsg        MessageHandler
 }
 
-func NewHandler(client *Client, cfg config.FeishuConfig, workspaceDir string, transcriber Transcriber, onMsg MessageHandler) *Handler {
+func NewHandler(client *Client, cfg config.FeishuConfig, workspaceDir string, transcriber Transcriber, corrector Corrector, onMsg MessageHandler) *Handler {
 	filesDir := filepath.Join(workspaceDir, ".files")
 	os.MkdirAll(filesDir, 0755)
 
 	return &Handler{
 		client:       client,
 		transcriber:  transcriber,
+		corrector:    corrector,
 		dedup:        NewDedup(5 * time.Minute),
 		cfg:          cfg,
 		workspaceDir: workspaceDir,
@@ -231,7 +238,7 @@ func (h *Handler) buildAudioMessage(event MessageEvent) (model.Message, error) {
 	}
 
 	// Transcribe using the model's /v1/audio/transcriptions endpoint.
-	transcript, err2 := h.transcriber.Transcribe(context.Background(), audioData, filepath.Base(absPath))
+	result, err2 := h.transcriber.Transcribe(context.Background(), audioData, filepath.Base(absPath))
 	if err2 != nil {
 		slog.Warn("transcription failed", "err", err2)
 		return model.NewTextMessage(model.RoleUser,
@@ -239,7 +246,17 @@ func (h *Handler) buildAudioMessage(event MessageEvent) (model.Message, error) {
 				content.Duration/1000, filePath, err2)), nil
 	}
 
-	slog.Info("audio transcribed", "text", transcript)
+	transcript := result.Text
+	slog.Info("audio transcribed", "text", transcript, "confidence", result.Confidence)
+
+	// If confidence is low (avg_logprob < -0.5), ask the main model to correct errors.
+	if result.Confidence < -0.5 && h.corrector != nil {
+		corrected := h.correctTranscription(transcript)
+		if corrected != "" {
+			slog.Info("transcription corrected", "original", transcript, "corrected", corrected)
+			transcript = corrected
+		}
+	}
 
 	return model.NewTextMessage(model.RoleUser,
 		fmt.Sprintf("[Voice message, %ds, saved at %s]\n%s", content.Duration/1000, filePath, transcript)), nil
@@ -247,6 +264,24 @@ func (h *Handler) buildAudioMessage(event MessageEvent) (model.Message, error) {
 
 // downloadAndSaveMedia downloads a media file from Feishu, saves it to workspace/.files/,
 // and returns the file path and base64 data URL.
+// correctTranscription uses the main LLM to fix transcription errors.
+func (h *Handler) correctTranscription(raw string) string {
+	messages := []model.Message{
+		{Role: model.RoleSystem, Content: "You are a transcription corrector. Fix errors in the following speech-to-text output. " +
+			"The speaker uses mixed Chinese and English with technical terms from technology, finance, and arts. " +
+			"Fix obvious misheard words, names, and terms. Return ONLY the corrected text, nothing else."},
+		{Role: model.RoleUser, Content: raw},
+	}
+
+	resp, err := h.corrector.Chat(context.Background(), messages, nil)
+	if err != nil {
+		slog.Warn("transcription correction failed", "err", err)
+		return ""
+	}
+
+	return resp.Content
+}
+
 func (h *Handler) buildFileMessage(event MessageEvent) (model.Message, error) {
 	var content struct {
 		FileKey  string `json:"file_key"`

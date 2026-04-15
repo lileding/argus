@@ -127,14 +127,36 @@ func (c *OpenAIClient) Chat(ctx context.Context, messages []Message, tools []Too
 	return result, nil
 }
 
+// TranscriptionResult contains the transcribed text and confidence info.
+type TranscriptionResult struct {
+	Text       string
+	Confidence float64 // average log probability (higher = more confident, typically -0.0 to -1.0)
+}
+
 // Transcribe sends an audio file to the /v1/audio/transcriptions endpoint.
-func (c *OpenAIClient) Transcribe(ctx context.Context, audioData []byte, filename string) (string, error) {
-	// Build multipart form.
+// Includes a prompt hint for domain vocabulary and requests verbose output for confidence.
+func (c *OpenAIClient) Transcribe(ctx context.Context, audioData []byte, filename string) (*TranscriptionResult, error) {
 	boundary := "----ArgusAudioBoundary"
 	var buf bytes.Buffer
-	buf.WriteString("--" + boundary + "\r\n")
-	buf.WriteString("Content-Disposition: form-data; name=\"model\"\r\n\r\n")
-	buf.WriteString(c.transcriptionModel + "\r\n")
+
+	// Model.
+	writeFormField(&buf, boundary, "model", c.transcriptionModel)
+
+	// Prompt: domain vocabulary hints for better accuracy.
+	writeFormField(&buf, boundary, "prompt",
+		"This audio may contain mixed Chinese and English. "+
+			"Domain vocabulary includes technology terms (API, Kubernetes, Docker, GPU, LLM, transformer, embedding, MLX, vLLM), "+
+			"finance terms (ETF, PE ratio, hedge fund, derivatives, quantitative), "+
+			"and arts terms (sonata, concerto, fugue, Chopin, Debussy, Rachmaninoff, Scriabin, Grieg, Dvořák, Mahler). "+
+			"Transcribe accurately, preserving code-switching between languages.")
+
+	// Response format: verbose_json for confidence scores.
+	writeFormField(&buf, boundary, "response_format", "verbose_json")
+
+	// Language hint.
+	writeFormField(&buf, boundary, "language", "zh")
+
+	// Audio file.
 	buf.WriteString("--" + boundary + "\r\n")
 	buf.WriteString(fmt.Sprintf("Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n", filename))
 	buf.WriteString("Content-Type: application/octet-stream\r\n\r\n")
@@ -144,7 +166,7 @@ func (c *OpenAIClient) Transcribe(ctx context.Context, audioData []byte, filenam
 	url := c.baseURL + "/audio/transcriptions"
 	req, err := http.NewRequestWithContext(ctx, "POST", url, &buf)
 	if err != nil {
-		return "", fmt.Errorf("create request: %w", err)
+		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
 	if c.apiKey != "" {
@@ -153,27 +175,52 @@ func (c *OpenAIClient) Transcribe(ctx context.Context, audioData []byte, filenam
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("transcribe request: %w", err)
+		return nil, fmt.Errorf("transcribe request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("read response: %w", err)
+		return nil, fmt.Errorf("read response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("transcribe error: status=%d body=%s", resp.StatusCode, respBody)
+		return nil, fmt.Errorf("transcribe error: status=%d body=%s", resp.StatusCode, respBody)
 	}
 
-	// Response is {"text": "transcribed text"} in OpenAI format.
-	var result struct {
-		Text string `json:"text"`
+	// Parse verbose_json response.
+	var verbose struct {
+		Text     string `json:"text"`
+		Segments []struct {
+			AvgLogprob float64 `json:"avg_logprob"`
+		} `json:"segments"`
 	}
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		// If not JSON, return raw text.
-		return string(respBody), nil
+	if err := json.Unmarshal(respBody, &verbose); err != nil {
+		// Fallback: try simple format.
+		var simple struct {
+			Text string `json:"text"`
+		}
+		if err2 := json.Unmarshal(respBody, &simple); err2 != nil {
+			return &TranscriptionResult{Text: string(respBody), Confidence: 0}, nil
+		}
+		return &TranscriptionResult{Text: simple.Text, Confidence: 0}, nil
 	}
 
-	return result.Text, nil
+	// Compute average confidence across segments.
+	var avgConf float64
+	if len(verbose.Segments) > 0 {
+		var sum float64
+		for _, seg := range verbose.Segments {
+			sum += seg.AvgLogprob
+		}
+		avgConf = sum / float64(len(verbose.Segments))
+	}
+
+	return &TranscriptionResult{Text: verbose.Text, Confidence: avgConf}, nil
+}
+
+func writeFormField(buf *bytes.Buffer, boundary, name, value string) {
+	buf.WriteString("--" + boundary + "\r\n")
+	buf.WriteString(fmt.Sprintf("Content-Disposition: form-data; name=\"%s\"\r\n\r\n", name))
+	buf.WriteString(value + "\r\n")
 }
