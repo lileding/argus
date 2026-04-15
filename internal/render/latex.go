@@ -2,6 +2,7 @@ package render
 
 import (
 	"bytes"
+	"fmt"
 	"regexp"
 
 	"github.com/go-latex/latex/drawtex/drawimg"
@@ -37,7 +38,17 @@ func DetectLatex(text string) []LatexBlock {
 }
 
 // RenderLatexPNG renders a LaTeX math expression to PNG bytes using pure Go (go-latex).
-func RenderLatexPNG(latex string, fontSize float64) ([]byte, error) {
+// Returns nil, error if the expression uses unsupported LaTeX features.
+func RenderLatexPNG(latex string, fontSize float64) (pngBytes []byte, err error) {
+	// go-latex panics on unsupported AST nodes (e.g. Sup, Sub).
+	// Recover gracefully instead of crashing the process.
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("latex render panic: %v", r)
+			pngBytes = nil
+		}
+	}()
+
 	if fontSize == 0 {
 		fontSize = 24
 	}
@@ -45,8 +56,7 @@ func RenderLatexPNG(latex string, fontSize float64) ([]byte, error) {
 	var buf bytes.Buffer
 	renderer := drawimg.NewRenderer(&buf)
 
-	err := mtex.Render(renderer, latex, fontSize, 150, nil)
-	if err != nil {
+	if err := mtex.Render(renderer, latex, fontSize, 150, nil); err != nil {
 		return nil, err
 	}
 
