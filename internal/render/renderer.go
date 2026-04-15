@@ -36,6 +36,13 @@ func (r *Renderer) replaceLatexWithImages(text string) string {
 	}
 
 	for _, block := range blocks {
+		// Only render display math ($$...$$) as images.
+		// Inline $...$ stays as text — Feishu displays ![](key) as block-level,
+		// making inline formulas appear as giant blurry images.
+		if !block.Display {
+			continue
+		}
+
 		pngData, err := RenderLatexPNG(block.Expr, block.Display)
 		if err != nil {
 			slog.Debug("latex render failed, keeping raw text", "expr", block.Expr, "err", err)

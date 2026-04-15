@@ -40,15 +40,9 @@ func DetectLatex(text string) []LatexBlock {
 	return blocks
 }
 
-// RenderLatexPNG renders LaTeX to a tight PNG with transparent background.
-// Inline formulas target 30px height (12px × 2.5x retina).
-// Display formulas target 50px height (20px × 2.5x retina).
+// RenderLatexPNG renders a display LaTeX formula to a high-res PNG.
+// Uses fixed font_size=20pt with 2.5x DPI for retina-quality output.
 func RenderLatexPNG(latex string, displayMode bool) ([]byte, error) {
-	targetPx := float64(30) // inline: 12px at 2.5x
-	if displayMode {
-		targetPx = 50 // display: 20px at 2.5x
-	}
-
 	cLatex := C.CString(latex)
 	defer C.free(unsafe.Pointer(cLatex))
 
@@ -57,7 +51,8 @@ func RenderLatexPNG(latex string, displayMode bool) ([]byte, error) {
 		cDisplay = 1
 	}
 
-	result := C.ratex_render_png(cLatex, C.float(targetPx), cDisplay)
+	// font_size=20pt, dpr=2.5 → effective 50px per em, crisp on retina.
+	result := C.ratex_render_png(cLatex, C.float(20), C.float(2.5), cDisplay)
 
 	if result.error != nil {
 		errMsg := C.GoString(result.error)
@@ -76,7 +71,6 @@ func RenderLatexPNG(latex string, displayMode bool) ([]byte, error) {
 }
 
 // whiteToTransparent converts white background to transparent using luminance-to-alpha.
-// No cropping needed — RaTeX output with padding=0 and exact font_size is already tight.
 func whiteToTransparent(pngData []byte) ([]byte, error) {
 	img, err := png.Decode(bytes.NewReader(pngData))
 	if err != nil {
@@ -85,6 +79,9 @@ func whiteToTransparent(pngData []byte) ([]byte, error) {
 
 	bounds := img.Bounds()
 	rgba := image.NewNRGBA(bounds)
+
+	minX, minY := bounds.Max.X, bounds.Max.Y
+	maxX, maxY := bounds.Min.X, bounds.Min.Y
 
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
@@ -95,12 +92,23 @@ func whiteToTransparent(pngData []byte) ([]byte, error) {
 				rgba.SetNRGBA(x, y, color.NRGBA{0, 0, 0, 0})
 			} else {
 				rgba.SetNRGBA(x, y, color.NRGBA{0, 0, 0, alpha})
+				if x < minX { minX = x }
+				if y < minY { minY = y }
+				if x > maxX { maxX = x }
+				if y > maxY { maxY = y }
 			}
 		}
 	}
 
+	if minX > maxX || minY > maxY {
+		return pngData, nil
+	}
+
+	// Tight crop to content.
+	cropped := rgba.SubImage(image.Rect(minX, minY, maxX+1, maxY+1))
+
 	var buf bytes.Buffer
-	if err := png.Encode(&buf, rgba); err != nil {
+	if err := png.Encode(&buf, cropped); err != nil {
 		return pngData, nil
 	}
 	return buf.Bytes(), nil

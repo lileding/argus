@@ -14,13 +14,15 @@ pub struct RatexPngResult {
     pub error: *mut c_char,
 }
 
-/// Render LaTeX to PNG with a target pixel height.
-/// Internally computes font_size from the formula's em dimensions so the
-/// output image height matches target_height_px exactly.
+/// Render LaTeX to PNG.
+/// font_size: in points (e.g. 20.0)
+/// dpr: device pixel ratio for retina (e.g. 2.5)
+/// display_mode: 0=inline, 1=display
 #[no_mangle]
 pub unsafe extern "C" fn ratex_render_png(
     latex: *const c_char,
-    target_height_px: f32,
+    font_size: f32,
+    dpr: f32,
     display_mode: i32,
 ) -> RatexPngResult {
     let latex_str = match CStr::from_ptr(latex).to_str() {
@@ -28,7 +30,7 @@ pub unsafe extern "C" fn ratex_render_png(
         Err(e) => return error_result(&format!("invalid UTF-8: {}", e)),
     };
 
-    match render_inner(latex_str, target_height_px, display_mode != 0) {
+    match render_inner(latex_str, font_size, dpr, display_mode != 0) {
         Ok(png_data) => {
             let mut boxed = png_data.into_boxed_slice();
             let data = boxed.as_mut_ptr();
@@ -67,7 +69,7 @@ fn error_result(msg: &str) -> RatexPngResult {
     }
 }
 
-fn render_inner(latex: &str, target_height_px: f32, display_mode: bool) -> Result<Vec<u8>, String> {
+fn render_inner(latex: &str, font_size: f32, dpr: f32, display_mode: bool) -> Result<Vec<u8>, String> {
     let style = if display_mode { MathStyle::Display } else { MathStyle::Text };
     let layout_opts = LayoutOptions::default().with_style(style);
 
@@ -75,22 +77,11 @@ fn render_inner(latex: &str, target_height_px: f32, display_mode: bool) -> Resul
     let lbox = layout(&ast, &layout_opts);
     let display_list = to_display_list(&lbox);
 
-    // Compute font_size from the formula's em dimensions so the output
-    // image height = target_height_px exactly.
-    let total_em = (display_list.height + display_list.depth) as f32;
-    if total_em <= 0.0 {
-        return Err("formula has zero height".to_string());
-    }
-
-    // font_size such that total_em * font_size = target_height_px
-    // device_pixel_ratio = 1.0 (target is already in physical pixels)
-    let font_size = target_height_px / total_em;
-
     let render_opts = RenderOptions {
         font_size,
         padding: 0.0,
         font_dir: String::new(),
-        device_pixel_ratio: 1.0,
+        device_pixel_ratio: dpr,
     };
 
     render_to_png(&display_list, &render_opts)
