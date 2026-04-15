@@ -8,12 +8,15 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+
+	pgvector "github.com/pgvector/pgvector-go"
+	"github.com/lib/pq"
 )
 
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
-// PostgresStore implements Store using PostgreSQL.
+// PostgresStore implements Store, SemanticStore, PinnedMemoryStore, and DocumentStore.
 type PostgresStore struct {
 	db *sql.DB
 }
@@ -22,8 +25,9 @@ func NewPostgresStore(db *sql.DB) *PostgresStore {
 	return &PostgresStore{db: db}
 }
 
+// --- Migrations ---
+
 func (s *PostgresStore) Migrate(ctx context.Context) error {
-	// Create migrations tracking table.
 	_, err := s.db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version TEXT PRIMARY KEY,
@@ -34,13 +38,11 @@ func (s *PostgresStore) Migrate(ctx context.Context) error {
 		return fmt.Errorf("create migrations table: %w", err)
 	}
 
-	// Read all migration files.
 	entries, err := migrationsFS.ReadDir("migrations")
 	if err != nil {
 		return fmt.Errorf("read migrations dir: %w", err)
 	}
 
-	// Sort by filename.
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].Name() < entries[j].Name()
 	})
@@ -49,20 +51,16 @@ func (s *PostgresStore) Migrate(ctx context.Context) error {
 		if !strings.HasSuffix(entry.Name(), ".sql") {
 			continue
 		}
-
 		version := entry.Name()
 
-		// Check if already applied.
 		var exists bool
-		err := s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)", version).Scan(&exists)
-		if err != nil {
+		if err := s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)", version).Scan(&exists); err != nil {
 			return fmt.Errorf("check migration %s: %w", version, err)
 		}
 		if exists {
 			continue
 		}
 
-		// Read and execute migration.
 		data, err := migrationsFS.ReadFile("migrations/" + entry.Name())
 		if err != nil {
 			return fmt.Errorf("read migration %s: %w", version, err)
@@ -77,12 +75,10 @@ func (s *PostgresStore) Migrate(ctx context.Context) error {
 			tx.Rollback()
 			return fmt.Errorf("execute migration %s: %w", version, err)
 		}
-
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations (version) VALUES ($1)", version); err != nil {
 			tx.Rollback()
 			return fmt.Errorf("record migration %s: %w", version, err)
 		}
-
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("commit migration %s: %w", version, err)
 		}
@@ -93,12 +89,18 @@ func (s *PostgresStore) Migrate(ctx context.Context) error {
 	return nil
 }
 
+// --- Store interface (base) ---
+
 func (s *PostgresStore) SaveMessage(ctx context.Context, msg *StoredMessage) error {
 	err := s.db.QueryRowContext(ctx, `
-		INSERT INTO messages (chat_id, role, content, tool_name, tool_call_id)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO messages (chat_id, role, content, tool_name, tool_call_id,
+			source_im, channel, source_ts, msg_type, file_paths, sender_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		RETURNING id, created_at
-	`, msg.ChatID, msg.Role, msg.Content, msg.ToolName, msg.ToolCallID).Scan(&msg.ID, &msg.CreatedAt)
+	`, msg.ChatID, msg.Role, msg.Content, msg.ToolName, msg.ToolCallID,
+		msg.SourceIM, msg.Channel, msg.SourceTS, msg.MsgType,
+		pq.Array(msg.FilePaths), msg.SenderID,
+	).Scan(&msg.ID, &msg.CreatedAt)
 	if err != nil {
 		return fmt.Errorf("save message: %w", err)
 	}
@@ -107,7 +109,8 @@ func (s *PostgresStore) SaveMessage(ctx context.Context, msg *StoredMessage) err
 
 func (s *PostgresStore) RecentMessages(ctx context.Context, chatID string, limit int) ([]StoredMessage, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, chat_id, role, content, tool_name, tool_call_id, created_at
+		SELECT id, chat_id, role, content, tool_name, tool_call_id,
+			source_im, channel, source_ts, msg_type, file_paths, sender_id, created_at
 		FROM messages
 		WHERE chat_id = $1
 		ORDER BY created_at DESC
@@ -121,7 +124,8 @@ func (s *PostgresStore) RecentMessages(ctx context.Context, chatID string, limit
 	var messages []StoredMessage
 	for rows.Next() {
 		var m StoredMessage
-		if err := rows.Scan(&m.ID, &m.ChatID, &m.Role, &m.Content, &m.ToolName, &m.ToolCallID, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.ChatID, &m.Role, &m.Content, &m.ToolName, &m.ToolCallID,
+			&m.SourceIM, &m.Channel, &m.SourceTS, &m.MsgType, pq.Array(&m.FilePaths), &m.SenderID, &m.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan message: %w", err)
 		}
 		messages = append(messages, m)
@@ -133,4 +137,237 @@ func (s *PostgresStore) RecentMessages(ctx context.Context, chatID string, limit
 	}
 
 	return messages, nil
+}
+
+// --- SemanticStore ---
+
+func (s *PostgresStore) SearchMessages(ctx context.Context, embedding []float32, chatID string, limit int) ([]StoredMessage, error) {
+	vec := pgvector.NewVector(embedding)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, chat_id, role, content, source_im, channel, msg_type, created_at,
+			embedding <=> $1 AS distance
+		FROM messages
+		WHERE chat_id = $2 AND embedding IS NOT NULL
+		ORDER BY embedding <=> $1
+		LIMIT $3
+	`, vec, chatID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("search messages: %w", err)
+	}
+	defer rows.Close()
+
+	var results []StoredMessage
+	for rows.Next() {
+		var m StoredMessage
+		var dist float64
+		if err := rows.Scan(&m.ID, &m.ChatID, &m.Role, &m.Content, &m.SourceIM, &m.Channel, &m.MsgType, &m.CreatedAt, &dist); err != nil {
+			return nil, fmt.Errorf("scan search result: %w", err)
+		}
+		results = append(results, m)
+	}
+	return results, nil
+}
+
+func (s *PostgresStore) UnembeddedMessages(ctx context.Context, limit int) ([]StoredMessage, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, content
+		FROM messages
+		WHERE embedding IS NULL AND role IN ('user', 'assistant') AND content != ''
+		ORDER BY id
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query unembedded messages: %w", err)
+	}
+	defer rows.Close()
+
+	var msgs []StoredMessage
+	for rows.Next() {
+		var m StoredMessage
+		if err := rows.Scan(&m.ID, &m.Content); err != nil {
+			return nil, fmt.Errorf("scan unembedded: %w", err)
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs, nil
+}
+
+func (s *PostgresStore) SetMessageEmbedding(ctx context.Context, messageID int64, embedding []float32) error {
+	vec := pgvector.NewVector(embedding)
+	_, err := s.db.ExecContext(ctx, `UPDATE messages SET embedding = $1 WHERE id = $2`, vec, messageID)
+	return err
+}
+
+// --- PinnedMemoryStore ---
+
+func (s *PostgresStore) SaveMemory(ctx context.Context, mem *Memory) error {
+	return s.db.QueryRowContext(ctx, `
+		INSERT INTO memories (content, category) VALUES ($1, $2)
+		RETURNING id, created_at
+	`, mem.Content, mem.Category).Scan(&mem.ID, &mem.CreatedAt)
+}
+
+func (s *PostgresStore) ListMemories(ctx context.Context, activeOnly bool) ([]Memory, error) {
+	query := `SELECT id, content, category, active, created_at, updated_at FROM memories`
+	if activeOnly {
+		query += ` WHERE active = TRUE`
+	}
+	query += ` ORDER BY created_at DESC`
+
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var mems []Memory
+	for rows.Next() {
+		var m Memory
+		if err := rows.Scan(&m.ID, &m.Content, &m.Category, &m.Active, &m.CreatedAt, &m.UpdatedAt); err != nil {
+			return nil, err
+		}
+		mems = append(mems, m)
+	}
+	return mems, nil
+}
+
+func (s *PostgresStore) SearchMemories(ctx context.Context, embedding []float32, limit int) ([]Memory, error) {
+	vec := pgvector.NewVector(embedding)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, content, category, active, created_at
+		FROM memories
+		WHERE active = TRUE AND embedding IS NOT NULL
+		ORDER BY embedding <=> $1
+		LIMIT $2
+	`, vec, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var mems []Memory
+	for rows.Next() {
+		var m Memory
+		if err := rows.Scan(&m.ID, &m.Content, &m.Category, &m.Active, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		mems = append(mems, m)
+	}
+	return mems, nil
+}
+
+func (s *PostgresStore) DeleteMemory(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE memories SET active = FALSE, updated_at = NOW() WHERE id = $1`, id)
+	return err
+}
+
+func (s *PostgresStore) SetMemoryEmbedding(ctx context.Context, memoryID int64, embedding []float32) error {
+	vec := pgvector.NewVector(embedding)
+	_, err := s.db.ExecContext(ctx, `UPDATE memories SET embedding = $1 WHERE id = $2`, vec, memoryID)
+	return err
+}
+
+// --- DocumentStore ---
+
+func (s *PostgresStore) SaveDocument(ctx context.Context, doc *Document) error {
+	return s.db.QueryRowContext(ctx, `
+		INSERT INTO documents (filename, file_path, channel, status)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id, created_at
+	`, doc.Filename, doc.FilePath, doc.Channel, doc.Status).Scan(&doc.ID, &doc.CreatedAt)
+}
+
+func (s *PostgresStore) UpdateDocumentStatus(ctx context.Context, id int64, status, errorMsg string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE documents SET status = $1, error_msg = $2 WHERE id = $3`, status, errorMsg, id)
+	return err
+}
+
+func (s *PostgresStore) PendingDocuments(ctx context.Context, limit int) ([]Document, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, filename, file_path, channel, status, created_at
+		FROM documents WHERE status = 'pending' ORDER BY created_at LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var docs []Document
+	for rows.Next() {
+		var d Document
+		if err := rows.Scan(&d.ID, &d.Filename, &d.FilePath, &d.Channel, &d.Status, &d.CreatedAt); err != nil {
+			return nil, err
+		}
+		docs = append(docs, d)
+	}
+	return docs, nil
+}
+
+func (s *PostgresStore) SaveChunks(ctx context.Context, chunks []Chunk) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	for _, c := range chunks {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO chunks (document_id, chunk_index, content) VALUES ($1, $2, $3)
+		`, c.DocumentID, c.ChunkIndex, c.Content); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *PostgresStore) SearchChunks(ctx context.Context, embedding []float32, limit int) ([]Chunk, error) {
+	vec := pgvector.NewVector(embedding)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT c.id, c.document_id, c.chunk_index, c.content,
+			d.filename, 1 - (c.embedding <=> $1) AS similarity
+		FROM chunks c
+		JOIN documents d ON d.id = c.document_id
+		WHERE c.embedding IS NOT NULL AND d.status = 'ready'
+		ORDER BY c.embedding <=> $1
+		LIMIT $2
+	`, vec, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var chunks []Chunk
+	for rows.Next() {
+		var c Chunk
+		if err := rows.Scan(&c.ID, &c.DocumentID, &c.ChunkIndex, &c.Content, &c.DocFilename, &c.Similarity); err != nil {
+			return nil, err
+		}
+		chunks = append(chunks, c)
+	}
+	return chunks, nil
+}
+
+func (s *PostgresStore) UnembeddedChunks(ctx context.Context, limit int) ([]Chunk, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, content FROM chunks WHERE embedding IS NULL ORDER BY id LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var chunks []Chunk
+	for rows.Next() {
+		var c Chunk
+		if err := rows.Scan(&c.ID, &c.Content); err != nil {
+			return nil, err
+		}
+		chunks = append(chunks, c)
+	}
+	return chunks, nil
+}
+
+func (s *PostgresStore) SetChunkEmbedding(ctx context.Context, chunkID int64, embedding []float32) error {
+	vec := pgvector.NewVector(embedding)
+	_, err := s.db.ExecContext(ctx, `UPDATE chunks SET embedding = $1 WHERE id = $2`, vec, chunkID)
+	return err
 }

@@ -38,7 +38,7 @@ type dbExecArgs struct {
 }
 
 // Protected tables that cannot be dropped.
-var protectedTables = []string{"messages", "schema_migrations", "skills"}
+var protectedTables = []string{"messages", "schema_migrations", "memories", "documents", "chunks"}
 
 func (t *DBExecTool) Execute(ctx context.Context, arguments string) (string, error) {
 	var args dbExecArgs
