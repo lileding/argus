@@ -17,6 +17,7 @@ const (
 	tokenURL       = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
 	replyURL       = "https://open.feishu.cn/open-apis/im/v1/messages/%s/reply"
 	sendMsgURL     = "https://open.feishu.cn/open-apis/im/v1/messages"
+	updateMsgURL   = "https://open.feishu.cn/open-apis/im/v1/messages/%s"
 	uploadImgURL   = "https://open.feishu.cn/open-apis/im/v1/images"
 	downloadImgURL = "https://open.feishu.cn/open-apis/im/v1/images/%s"
 	msgResourceURL = "https://open.feishu.cn/open-apis/im/v1/messages/%s/resources/%s?type=%s"
@@ -37,9 +38,15 @@ func NewClient(cfg config.FeishuConfig) *Client {
 
 // ReplyRich sends a reply with arbitrary msg_type and pre-encoded content JSON.
 func (c *Client) ReplyRich(messageID, msgType, contentJSON string) error {
+	_, err := c.ReplyRichWithID(messageID, msgType, contentJSON)
+	return err
+}
+
+// ReplyRichWithID sends a reply and returns the created message_id (for subsequent PATCH updates).
+func (c *Client) ReplyRichWithID(messageID, msgType, contentJSON string) (string, error) {
 	token, err := c.getToken()
 	if err != nil {
-		return fmt.Errorf("get token: %w", err)
+		return "", fmt.Errorf("get token: %w", err)
 	}
 
 	body := map[string]string{
@@ -51,6 +58,47 @@ func (c *Client) ReplyRich(messageID, msgType, contentJSON string) error {
 	url := fmt.Sprintf(replyURL, messageID)
 	req, err := http.NewRequest("POST", url, bytes.NewReader(data))
 	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("send reply: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("reply failed: status=%d body=%s", resp.StatusCode, respBody)
+	}
+
+	// Extract message_id from response.
+	var result struct {
+		Data struct {
+			MessageID string `json:"message_id"`
+		} `json:"data"`
+	}
+	json.Unmarshal(respBody, &result)
+	return result.Data.MessageID, nil
+}
+
+// UpdateMessage PATCHes an existing message with new card content.
+func (c *Client) UpdateMessage(messageID, cardJSON string) error {
+	token, err := c.getToken()
+	if err != nil {
+		return fmt.Errorf("get token: %w", err)
+	}
+
+	body := map[string]string{
+		"content": cardJSON,
+	}
+	data, _ := json.Marshal(body)
+
+	url := fmt.Sprintf(updateMsgURL, messageID)
+	req, err := http.NewRequest("PATCH", url, bytes.NewReader(data))
+	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
@@ -58,13 +106,13 @@ func (c *Client) ReplyRich(messageID, msgType, contentJSON string) error {
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("send reply: %w", err)
+		return fmt.Errorf("update message: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("reply rich failed: status=%d body=%s", resp.StatusCode, respBody)
+		return fmt.Errorf("update failed: status=%d body=%s", resp.StatusCode, respBody)
 	}
 
 	return nil

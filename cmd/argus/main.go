@@ -244,19 +244,13 @@ func runServer(cfg *config.Config) {
 	ag := agent.New(modelClient, st, toolReg, loader.Index(), embedClient, cfg.Agent.SystemPrompt, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
 
 	feishuClient := feishu.NewClient(cfg.Feishu)
-	renderer := render.NewRenderer(feishuClient)
+	processor := render.NewProcessor(feishuClient)
+	adapter := feishu.NewAdapter(feishuClient, processor)
 
 	onMsg := func(chatID string, msg model.Message, messageID string) {
 		slog.Info("handling message", "chat_id", chatID, "msg_text", msg.TextContent())
-		reply, err := ag.Handle(ctx, chatID, msg)
-		if err != nil {
-			slog.Error("agent handle failed", "err", err, "chat_id", chatID)
-			reply = fmt.Sprintf("Error: %v", err)
-		}
-		msgType, content := renderer.RenderForFeishu(reply)
-		if err := feishuClient.ReplyRich(messageID, msgType, content); err != nil {
-			slog.Error("reply failed", "err", err, "message_id", messageID)
-		}
+		ch := ag.HandleStream(ctx, chatID, msg)
+		adapter.HandleEvents(ch, messageID, msg.TextContent())
 	}
 
 	// Document store for RAG indexing (nil if not available).
@@ -273,7 +267,7 @@ func runServer(cfg *config.Config) {
 	handler := feishu.NewHandler(feishuClient, cfg.Feishu, cfg.Agent.WorkspaceDir, modelClient, modelClient, docReg, onMsg)
 
 	// Cron scheduler.
-	scheduler := setupCron(cfg, ag, feishuClient, renderer, ctx)
+	scheduler := setupCron(cfg, ag, feishuClient, processor, ctx)
 	scheduler.Start()
 	defer scheduler.Stop()
 
@@ -291,7 +285,7 @@ func runServer(cfg *config.Config) {
 	}
 }
 
-func setupCron(cfg *config.Config, ag *agent.Agent, feishuClient *feishu.Client, renderer *render.Renderer, ctx context.Context) *cron.Scheduler {
+func setupCron(cfg *config.Config, ag *agent.Agent, feishuClient *feishu.Client, processor *render.Processor, ctx context.Context) *cron.Scheduler {
 	scheduler := cron.NewScheduler()
 
 	for _, job := range cfg.Cron.Jobs {
@@ -307,9 +301,10 @@ func setupCron(cfg *config.Config, ag *agent.Agent, feishuClient *feishu.Client,
 				return
 			}
 
-			msgType, content := renderer.RenderForFeishu(reply)
+			md := processor.ProcessMarkdown(reply)
+			cardJSON := feishu.MarkdownToCard(md)
 			receiveIDType, receiveID := parseCronChatID(job.ChatID)
-			if err := feishuClient.SendMessageRich(receiveIDType, receiveID, msgType, content); err != nil {
+			if err := feishuClient.SendMessageRich(receiveIDType, receiveID, "interactive", cardJSON); err != nil {
 				slog.Error("cron job send failed", "job", job.Name, "err", err)
 			}
 		})

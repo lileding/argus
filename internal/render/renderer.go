@@ -9,55 +9,51 @@ type ImageUploader interface {
 	UploadImage(imageData []byte) (imageKey string, err error)
 }
 
-// Renderer converts model output to Feishu format, handling LaTeX rendering.
-type Renderer struct {
+// Processor handles IM-agnostic markdown processing (e.g. LaTeX → image replacement).
+type Processor struct {
 	uploader ImageUploader
 }
 
-// NewRenderer creates a renderer. uploader can be nil (LaTeX upload disabled).
-func NewRenderer(uploader ImageUploader) *Renderer {
-	return &Renderer{uploader: uploader}
+// NewProcessor creates a processor. uploader can be nil (LaTeX rendering disabled).
+func NewProcessor(uploader ImageUploader) *Processor {
+	return &Processor{uploader: uploader}
 }
 
-// RenderForFeishu converts markdown to Feishu format, rendering LaTeX to images.
-func (r *Renderer) RenderForFeishu(markdown string) (msgType string, contentJSON string) {
-	if r.uploader != nil {
-		markdown = r.replaceLatexWithImages(markdown)
+// ProcessMarkdown processes markdown text: renders display LaTeX to images,
+// replaces them with [[IMG:key]] markers. The IM adapter converts these
+// markers to the appropriate format (e.g. ![](key) for Feishu).
+func (p *Processor) ProcessMarkdown(markdown string) string {
+	if p.uploader == nil {
+		return markdown
 	}
-
-	return ForFeishu(markdown)
+	return p.replaceLatexWithImages(markdown)
 }
 
-// replaceLatexWithImages finds LaTeX blocks, renders to PNG, uploads to Feishu.
-func (r *Renderer) replaceLatexWithImages(text string) string {
+func (p *Processor) replaceLatexWithImages(text string) string {
 	blocks := DetectLatex(text)
 	if len(blocks) == 0 {
 		return text
 	}
 
 	for _, block := range blocks {
-		// Only render display math ($$...$$) as images.
-		// Inline $...$ stays as text — Feishu displays ![](key) as block-level,
-		// making inline formulas appear as giant blurry images.
 		if !block.Display {
 			continue
 		}
 
 		pngData, err := RenderLatexPNG(block.Expr, block.Display)
 		if err != nil {
-			slog.Debug("latex render failed, keeping raw text", "expr", block.Expr, "err", err)
+			slog.Debug("latex render failed", "expr", block.Expr, "err", err)
 			continue
 		}
 
-		imageKey, err := r.uploader.UploadImage(pngData)
+		imageKey, err := p.uploader.UploadImage(pngData)
 		if err != nil {
-			slog.Debug("latex upload failed, keeping raw text", "expr", block.Expr, "err", err)
+			slog.Debug("latex upload failed", "expr", block.Expr, "err", err)
 			continue
 		}
 
 		replacement := "[[IMG:" + imageKey + "]]"
 		text = replaceFirst(text, block.Full, replacement)
-
 		slog.Info("latex rendered", "expr", block.Expr, "image_key", imageKey)
 	}
 
