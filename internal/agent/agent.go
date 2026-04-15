@@ -47,20 +47,30 @@ func (a *Agent) Handle(ctx context.Context, chatID string, userMsg model.Message
 	// Inject chatID into context for tools (e.g. save_skill, db_exec).
 	ctx = tool.WithChatID(ctx, chatID)
 
-	// Assemble context BEFORE saving — otherwise the current message appears twice
-	// (once from history, once appended as the current message).
-	messages, toolDefs, err := a.assembleContext(ctx, chatID, userMsg)
-	if err != nil {
-		return "", fmt.Errorf("assemble context: %w", err)
-	}
-
-	// Save user message after context assembly.
-	if err := a.store.SaveMessage(ctx, &store.StoredMessage{
+	// CRASH-SAFE: Save user message FIRST, before any processing.
+	// This ensures history is preserved even if the program crashes during agent loop.
+	savedMsg := &store.StoredMessage{
 		ChatID:  chatID,
 		Role:    string(model.RoleUser),
 		Content: userMsg.TextContent(),
-	}); err != nil {
+	}
+	// Populate metadata from message if available.
+	if meta := userMsg.Meta; meta != nil {
+		savedMsg.SourceIM = meta.SourceIM
+		savedMsg.Channel = meta.Channel
+		savedMsg.SourceTS = meta.SourceTS
+		savedMsg.MsgType = meta.MsgType
+		savedMsg.FilePaths = meta.FilePaths
+		savedMsg.SenderID = meta.SenderID
+	}
+	if err := a.store.SaveMessage(ctx, savedMsg); err != nil {
 		return "", fmt.Errorf("save user message: %w", err)
+	}
+
+	// Assemble context, excluding the just-saved message ID to prevent duplication.
+	messages, toolDefs, err := a.assembleContext(ctx, chatID, userMsg, savedMsg.ID)
+	if err != nil {
+		return "", fmt.Errorf("assemble context: %w", err)
 	}
 
 	// Agent tool loop with duplicate call detection.

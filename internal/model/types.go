@@ -1,6 +1,9 @@
 package model
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"time"
+)
 
 type Role string
 
@@ -15,10 +18,21 @@ const (
 //   - string: plain text message
 //   - []ContentPart: multimodal message (text + images, OpenAI vision format)
 type Message struct {
-	Role       Role        `json:"role"`
-	Content    interface{} `json:"content,omitempty"`
-	ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`
-	ToolCallID string      `json:"tool_call_id,omitempty"`
+	Role       Role          `json:"role"`
+	Content    interface{}   `json:"content,omitempty"`
+	ToolCalls  []ToolCall    `json:"tool_calls,omitempty"`
+	ToolCallID string        `json:"tool_call_id,omitempty"`
+	Meta       *MessageMeta  `json:"-"` // not serialized to LLM, used for storage metadata
+}
+
+// MessageMeta carries source metadata for persistence.
+type MessageMeta struct {
+	SourceIM  string     // "feishu", "cli", "cron"
+	Channel   string     // specific chat/group
+	SourceTS  *time.Time // timestamp from origin platform
+	MsgType   string     // "text", "image", "audio", "file", "post"
+	FilePaths []string   // paths to saved media files
+	SenderID  string     // user identity from source IM
 }
 
 // ContentPart is a part of a multimodal message (OpenAI vision API format).

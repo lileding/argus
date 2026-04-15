@@ -116,6 +116,18 @@ func (h *Handler) processEvent(envelope EventEnvelope) {
 		return
 	}
 
+	// Populate metadata for persistence.
+	msg.Meta = &model.MessageMeta{
+		SourceIM: "feishu",
+		Channel:  chatID,
+		MsgType:  msgEvent.Message.MessageType,
+		SenderID: msgEvent.Sender.SenderID.OpenID,
+	}
+	// Extract file paths from message text if present (saved by build*Message methods).
+	if msg.Meta.FilePaths == nil {
+		msg.Meta.FilePaths = []string{}
+	}
+
 	slog.Info("message received",
 		"chat_id", chatID,
 		"chat_type", msgEvent.Message.ChatType,

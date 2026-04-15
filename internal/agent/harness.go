@@ -20,16 +20,26 @@ import (
 // The LLM sees the skill catalog (name + description) in the system prompt and
 // uses activate_skill to load full instructions when needed. No code-level
 // pre-filtering — the LLM is the best judge of intent.
-func (a *Agent) assembleContext(ctx context.Context, chatID string, userMsg model.Message) ([]model.Message, []model.ToolDef, error) {
+func (a *Agent) assembleContext(ctx context.Context, chatID string, userMsg model.Message, excludeID int64) ([]model.Message, []model.ToolDef, error) {
 	// Build system prompt with skill catalog.
 	systemPrompt := a.buildSystemPrompt()
 
 	// Curate history: keep only user messages + assistant final replies.
-	recent, err := a.store.RecentMessages(ctx, chatID, a.contextWindow)
+	// Exclude the just-saved current message to prevent duplication.
+	recent, err := a.store.RecentMessages(ctx, chatID, a.contextWindow+1) // +1 to compensate for potential exclusion
 	if err != nil {
 		return nil, nil, fmt.Errorf("load recent messages: %w", err)
 	}
-	curated := a.curateHistory(recent)
+	filtered := make([]store.StoredMessage, 0, len(recent))
+	for _, m := range recent {
+		if m.ID != excludeID {
+			filtered = append(filtered, m)
+		}
+	}
+	if len(filtered) > a.contextWindow {
+		filtered = filtered[len(filtered)-a.contextWindow:]
+	}
+	curated := a.curateHistory(filtered)
 
 	// Assemble messages.
 	messages := make([]model.Message, 0, len(curated)+2)

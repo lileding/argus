@@ -142,7 +142,9 @@ func runCLI(cfg *config.Config) {
 			continue
 		}
 
-		reply, err := ag.Handle(ctx, chatID, model.NewTextMessage(model.RoleUser, text))
+		msg := model.NewTextMessage(model.RoleUser, text)
+		msg.Meta = &model.MessageMeta{SourceIM: "cli", Channel: "local", MsgType: "text"}
+		reply, err := ag.Handle(ctx, chatID, msg)
 		if err != nil {
 			fmt.Printf("Error: %v\n> ", err)
 			continue
@@ -236,7 +238,9 @@ func setupCron(cfg *config.Config, ag *agent.Agent, feishuClient *feishu.Client,
 		scheduler.AddDaily(job.Name, job.Hour, job.Minute, func() {
 			slog.Info("cron job running", "job", job.Name, "chat_id", job.ChatID)
 
-			reply, err := ag.Handle(ctx, job.ChatID, model.NewTextMessage(model.RoleUser, job.Prompt))
+			cronMsg := model.NewTextMessage(model.RoleUser, job.Prompt)
+			cronMsg.Meta = &model.MessageMeta{SourceIM: "cron", Channel: job.ChatID, MsgType: "text"}
+			reply, err := ag.Handle(ctx, job.ChatID, cronMsg)
 			if err != nil {
 				slog.Error("cron job agent failed", "job", job.Name, "err", err)
 				return
