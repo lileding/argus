@@ -16,6 +16,7 @@ import (
 	"argus/internal/agent"
 	"argus/internal/config"
 	"argus/internal/cron"
+	"argus/internal/embedding"
 	"argus/internal/feishu"
 	"argus/internal/model"
 	"argus/internal/render"
@@ -190,6 +191,27 @@ func runServer(cfg *config.Config) {
 	}
 
 	modelClient := model.NewOpenAIClient(cfg.Model)
+
+	// Start embedding worker if enabled and DB is available.
+	if cfg.Embedding.Enabled {
+		if ss, ok := st.(store.SemanticStore); ok {
+			embedClient := embedding.NewClient(cfg.Model.BaseURL, cfg.Model.APIKey, cfg.Embedding.ModelName)
+			var ps store.PinnedMemoryStore
+			var ds store.DocumentStore
+			if p, ok := st.(store.PinnedMemoryStore); ok {
+				ps = p
+			}
+			if d, ok := st.(store.DocumentStore); ok {
+				ds = d
+			}
+			embedWorker := embedding.NewWorker(embedClient, ss, ps, ds, cfg.Embedding.BatchSize, cfg.Embedding.Interval)
+			embedWorker.Start()
+			defer embedWorker.Stop()
+		} else {
+			slog.Warn("embedding enabled but store does not support semantic search (need PostgreSQL)")
+		}
+	}
+
 	sb := buildSandbox(cfg)
 	toolReg := buildToolRegistry(cfg, sb, loader, db)
 	ag := agent.New(modelClient, st, toolReg, loader.Index(), cfg.Agent.SystemPrompt, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)

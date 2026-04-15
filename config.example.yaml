@@ -25,6 +25,12 @@ agent:
   skill_rescan: 30s
   system_prompt: "You are Argus, a personal assistant. You have memory, can use tools, and help users with various tasks. Be concise, accurate, and helpful. Respond in the user's language."
 
+embedding:
+  enabled: false           # set true when embedding model is available
+  model_name: "nomic-embed-text"
+  batch_size: 32
+  interval: 2s
+
 sandbox:
   type: local             # "local" for dev, "docker" for production
   image: argus-sandbox    # docker image name (used when type=docker)

@@ -9,13 +9,21 @@ import (
 )
 
 type Config struct {
-	Server   ServerConfig   `yaml:"server"`
-	Feishu   FeishuConfig   `yaml:"feishu"`
-	Model    ModelConfig    `yaml:"model"`
-	Database DatabaseConfig `yaml:"database"`
-	Agent   AgentConfig   `yaml:"agent"`
-	Sandbox SandboxConfig `yaml:"sandbox"`
-	Cron    CronConfig    `yaml:"cron"`
+	Server    ServerConfig    `yaml:"server"`
+	Feishu    FeishuConfig    `yaml:"feishu"`
+	Model     ModelConfig     `yaml:"model"`
+	Database  DatabaseConfig  `yaml:"database"`
+	Agent     AgentConfig     `yaml:"agent"`
+	Sandbox   SandboxConfig   `yaml:"sandbox"`
+	Embedding EmbeddingConfig `yaml:"embedding"`
+	Cron      CronConfig      `yaml:"cron"`
+}
+
+type EmbeddingConfig struct {
+	Enabled   bool          `yaml:"enabled"`
+	ModelName string        `yaml:"model_name"`
+	BatchSize int           `yaml:"batch_size"`
+	Interval  time.Duration `yaml:"interval"`
 }
 
 type CronConfig struct {
@@ -121,6 +129,15 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Agent.SkillRescan == 0 {
 		c.Agent.SkillRescan = 30 * time.Second
+	}
+	if c.Embedding.ModelName == "" {
+		c.Embedding.ModelName = "nomic-embed-text"
+	}
+	if c.Embedding.BatchSize == 0 {
+		c.Embedding.BatchSize = 32
+	}
+	if c.Embedding.Interval == 0 {
+		c.Embedding.Interval = 2 * time.Second
 	}
 	if c.Sandbox.Type == "" {
 		c.Sandbox.Type = "local"
