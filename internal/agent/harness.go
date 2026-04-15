@@ -156,6 +156,12 @@ func (a *Agent) buildSystemPrompt() string {
 	sb.WriteString("When you successfully complete a new type of recurring task, use the save_skill tool to capture your approach as a reusable skill. ")
 	sb.WriteString("A good skill should include: trigger conditions, step-by-step instructions, and which tools to use. Do not create skills for one-off tasks.\n")
 
+	// CRITICAL: Reinforce tool usage at the end (recency bias — models pay most attention to the end).
+	sb.WriteString("\n\n## REMINDER\n\n")
+	sb.WriteString("You MUST use the search tool for any factual question about people, events, technology, music, science, or current affairs. ")
+	sb.WriteString("NEVER answer factual questions from memory — your training data is outdated. Always search first, then answer based on search results. ")
+	sb.WriteString("When asked to search or look something up, call the search tool IMMEDIATELY in this response. Do not say you will search — actually call the tool.\n")
+
 	return sb.String()
 }
 
