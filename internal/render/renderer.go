@@ -36,9 +36,9 @@ func (r *Renderer) replaceLatexWithImages(text string) string {
 	}
 
 	for _, block := range blocks {
-		fontSize := 14.0
+		fontSize := 12.0
 		if block.Display {
-			fontSize = 18.0
+			fontSize = 16.0
 		}
 
 		pngData, err := RenderLatexPNG(block.Expr, fontSize, block.Display)

@@ -8,7 +8,11 @@ package render
 */
 import "C"
 import (
+	"bytes"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"regexp"
 	"unsafe"
 )
@@ -71,5 +75,35 @@ func RenderLatexPNG(latex string, fontSize float64, displayMode bool) ([]byte, e
 	pngData := C.GoBytes(unsafe.Pointer(result.data), C.int(result.len))
 	C.ratex_free_png(result.data, result.len)
 
-	return pngData, nil
+	// Post-process: make white background transparent.
+	return makeTransparent(pngData)
+}
+
+// makeTransparent converts white pixels to transparent in a PNG.
+func makeTransparent(pngData []byte) ([]byte, error) {
+	img, err := png.Decode(bytes.NewReader(pngData))
+	if err != nil {
+		return pngData, nil // fallback to original
+	}
+
+	bounds := img.Bounds()
+	rgba := image.NewNRGBA(bounds)
+
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			r, g, b, _ := img.At(x, y).RGBA()
+			// If pixel is white or near-white, make transparent.
+			if r > 0xF000 && g > 0xF000 && b > 0xF000 {
+				rgba.Set(x, y, color.NRGBA{0, 0, 0, 0})
+			} else {
+				rgba.Set(x, y, img.At(x, y))
+			}
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, rgba); err != nil {
+		return pngData, nil
+	}
+	return buf.Bytes(), nil
 }
