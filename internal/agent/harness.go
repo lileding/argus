@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
@@ -84,23 +83,24 @@ func (a *Agent) buildSystemPrompt() string {
 	return sb.String()
 }
 
-// fileRefRe matches file references like "(saved at .files/xxx.png)" or "(saved at .files/xxx.opus)"
-var fileRefRe = regexp.MustCompile(`\.files/[^\s),]+\.(?:png|jpg|jpeg|gif|webp)`)
+// imageExts lists extensions to re-inject as multimodal content.
+var imageExts = map[string]bool{".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true}
 
 // curateHistory filters message history to keep only high-signal content:
 // user messages and assistant final replies. Removes tool_call/tool_result noise.
 // For user messages referencing images in .files/, re-loads them as multimodal content.
 func (a *Agent) curateHistory(messages []store.StoredMessage) []model.Message {
+	// Build a lookup of image filenames in .files/ for robust matching.
+	imageFiles := a.scanImageFiles()
+
 	var curated []model.Message
 	for _, m := range messages {
 		switch m.Role {
 		case "user":
-			// Check if this message references image files — re-inject them.
-			imageRefs := fileRefRe.FindAllString(m.Content, -1)
-			if len(imageRefs) > 0 {
-				var dataURLs []string
-				for _, ref := range imageRefs {
-					absPath := filepath.Join(a.workspaceDir, ref)
+			// Check if this message references any known image file by name.
+			var dataURLs []string
+			for name, absPath := range imageFiles {
+				if strings.Contains(m.Content, name) {
 					data, err := os.ReadFile(absPath)
 					if err != nil {
 						continue
@@ -109,23 +109,37 @@ func (a *Agent) curateHistory(messages []store.StoredMessage) []model.Message {
 					dataURL := fmt.Sprintf("data:%s;base64,%s", contentType, base64.StdEncoding.EncodeToString(data))
 					dataURLs = append(dataURLs, dataURL)
 				}
-				if len(dataURLs) > 0 {
-					curated = append(curated, model.NewMultimodalMessage(model.RoleUser, m.Content, dataURLs...))
-					continue
-				}
 			}
-			curated = append(curated, model.Message{
-				Role:    model.RoleUser,
-				Content: m.Content,
-			})
+			if len(dataURLs) > 0 {
+				curated = append(curated, model.NewMultimodalMessage(model.RoleUser, m.Content, dataURLs...))
+			} else {
+				curated = append(curated, model.Message{Role: model.RoleUser, Content: m.Content})
+			}
 		case "assistant":
 			if m.Content != "" && m.ToolCallID == nil {
-				curated = append(curated, model.Message{
-					Role:    model.RoleAssistant,
-					Content: m.Content,
-				})
+				curated = append(curated, model.Message{Role: model.RoleAssistant, Content: m.Content})
 			}
 		}
 	}
 	return curated
+}
+
+// scanImageFiles returns a map of filename → absolute path for image files in .files/.
+func (a *Agent) scanImageFiles() map[string]string {
+	filesDir := filepath.Join(a.workspaceDir, ".files")
+	entries, err := os.ReadDir(filesDir)
+	if err != nil {
+		return nil
+	}
+	result := make(map[string]string)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(e.Name()))
+		if imageExts[ext] {
+			result[e.Name()] = filepath.Join(filesDir, e.Name())
+		}
+	}
+	return result
 }

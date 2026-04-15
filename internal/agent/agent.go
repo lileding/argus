@@ -63,7 +63,8 @@ func (a *Agent) Handle(ctx context.Context, chatID string, userMsg model.Message
 		return "", fmt.Errorf("save user message: %w", err)
 	}
 
-	// Agent tool loop.
+	// Agent tool loop with duplicate call detection.
+	recentCalls := make(map[string]int) // "tool:args" → count
 	for i := 0; i < a.maxIterations; i++ {
 		slog.Info("calling model", "chat_id", chatID, "iteration", i, "messages", len(messages), "tools", len(toolDefs))
 
@@ -105,6 +106,24 @@ func (a *Agent) Handle(ctx context.Context, chatID string, userMsg model.Message
 
 		// Execute each tool call and append results.
 		for _, tc := range resp.ToolCalls {
+			callKey := tc.Function.Name + ":" + tc.Function.Arguments
+			recentCalls[callKey]++
+
+			if recentCalls[callKey] > 2 {
+				slog.Warn("duplicate tool call detected, breaking loop",
+					"tool", tc.Function.Name,
+					"call_id", tc.ID,
+					"count", recentCalls[callKey],
+				)
+				result := fmt.Sprintf("error: this exact call (%s) has been repeated %d times with the same arguments. Stop retrying and try a different approach or report the issue to the user.", tc.Function.Name, recentCalls[callKey])
+				messages = append(messages, model.Message{
+					Role:       model.RoleTool,
+					Content:    result,
+					ToolCallID: tc.ID,
+				})
+				continue
+			}
+
 			slog.Info("tool call",
 				"tool", tc.Function.Name,
 				"call_id", tc.ID,
