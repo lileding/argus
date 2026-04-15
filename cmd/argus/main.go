@@ -97,7 +97,7 @@ func buildSandbox(cfg *config.Config) sandbox.Sandbox {
 }
 
 // buildToolRegistry creates the tool registry with all available tools.
-func buildToolRegistry(cfg *config.Config, sb sandbox.Sandbox, loader *skill.FileLoader, db *sql.DB) *tool.Registry {
+func buildToolRegistry(cfg *config.Config, sb sandbox.Sandbox, loader *skill.FileLoader, db *sql.DB, st store.Store) *tool.Registry {
 	registry := tool.NewRegistry()
 	registry.Register(tool.NewReadFileTool(cfg.Agent.WorkspaceDir))
 	registry.Register(tool.NewWriteFileTool(cfg.Agent.WorkspaceDir))
@@ -115,6 +115,12 @@ func buildToolRegistry(cfg *config.Config, sb sandbox.Sandbox, loader *skill.Fil
 		registry.Register(tool.NewDBExecTool(db))
 	}
 
+	// Memory tools (available when store supports pinned memories).
+	if ps, ok := st.(store.PinnedMemoryStore); ok {
+		registry.Register(tool.NewRememberTool(ps))
+		registry.Register(tool.NewForgetTool(ps))
+	}
+
 	return registry
 }
 
@@ -125,7 +131,7 @@ func runCLI(cfg *config.Config) {
 	modelClient := model.NewOpenAIClient(cfg.Model)
 	memStore := store.NewMemoryStore()
 	sb := buildSandbox(cfg)
-	toolReg := buildToolRegistry(cfg, sb, loader, nil)
+	toolReg := buildToolRegistry(cfg, sb, loader, nil, memStore)
 	ag := agent.New(modelClient, memStore, toolReg, loader.Index(), nil, cfg.Agent.SystemPrompt, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
 
 	chatID := "cli:local"
@@ -216,7 +222,7 @@ func runServer(cfg *config.Config) {
 	}
 
 	sb := buildSandbox(cfg)
-	toolReg := buildToolRegistry(cfg, sb, loader, db)
+	toolReg := buildToolRegistry(cfg, sb, loader, db, st)
 	ag := agent.New(modelClient, st, toolReg, loader.Index(), embedClient, cfg.Agent.SystemPrompt, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
 
 	feishuClient := feishu.NewClient(cfg.Feishu)
