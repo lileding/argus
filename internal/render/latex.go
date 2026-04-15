@@ -75,34 +75,58 @@ func RenderLatexPNG(latex string, fontSize float64, displayMode bool) ([]byte, e
 	pngData := C.GoBytes(unsafe.Pointer(result.data), C.int(result.len))
 	C.ratex_free_png(result.data, result.len)
 
-	// Post-process: make white background transparent.
-	return makeTransparent(pngData)
+	// Post-process: transparent background + tight crop.
+	return postProcess(pngData)
 }
 
-// makeTransparent converts white pixels to transparent in a PNG.
-func makeTransparent(pngData []byte) ([]byte, error) {
+// postProcess makes white pixels transparent and tight-crops to content bounds.
+func postProcess(pngData []byte) ([]byte, error) {
 	img, err := png.Decode(bytes.NewReader(pngData))
 	if err != nil {
-		return pngData, nil // fallback to original
+		return pngData, nil
 	}
 
 	bounds := img.Bounds()
 	rgba := image.NewNRGBA(bounds)
 
+	// Pass 1: convert white to transparent, track content bounds.
+	minX, minY := bounds.Max.X, bounds.Max.Y
+	maxX, maxY := bounds.Min.X, bounds.Min.Y
+
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
 			r, g, b, _ := img.At(x, y).RGBA()
-			// If pixel is white or near-white, make transparent.
 			if r > 0xF000 && g > 0xF000 && b > 0xF000 {
-				rgba.Set(x, y, color.NRGBA{0, 0, 0, 0})
+				rgba.SetNRGBA(x, y, color.NRGBA{0, 0, 0, 0})
 			} else {
 				rgba.Set(x, y, img.At(x, y))
+				// Track bounding box of non-transparent content.
+				if x < minX { minX = x }
+				if y < minY { minY = y }
+				if x > maxX { maxX = x }
+				if y > maxY { maxY = y }
 			}
 		}
 	}
 
+	// No content found.
+	if minX > maxX || minY > maxY {
+		return pngData, nil
+	}
+
+	// Pass 2: crop to content bounds with 1px margin.
+	margin := 1
+	cropRect := image.Rect(
+		max(minX-margin, bounds.Min.X),
+		max(minY-margin, bounds.Min.Y),
+		min(maxX+margin+1, bounds.Max.X),
+		min(maxY+margin+1, bounds.Max.Y),
+	)
+
+	cropped := rgba.SubImage(cropRect)
+
 	var buf bytes.Buffer
-	if err := png.Encode(&buf, rgba); err != nil {
+	if err := png.Encode(&buf, cropped); err != nil {
 		return pngData, nil
 	}
 	return buf.Bytes(), nil

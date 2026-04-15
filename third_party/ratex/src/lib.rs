@@ -81,9 +81,9 @@ fn render_inner(latex: &str, font_size: f32, display_mode: bool) -> Result<Vec<u
 
     let render_opts = RenderOptions {
         font_size,
-        padding: 1.0,
+        padding: 0.0,
         font_dir: String::new(),
-        device_pixel_ratio: 1.0,
+        device_pixel_ratio: 2.5,
     };
 
     render_to_png(&display_list, &render_opts)
