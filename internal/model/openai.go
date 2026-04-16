@@ -1,12 +1,14 @@
 package model
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"argus/internal/config"
 )
@@ -39,6 +41,7 @@ type chatRequest struct {
 	Messages  []Message `json:"messages"`
 	Tools     []ToolDef `json:"tools,omitempty"`
 	MaxTokens int       `json:"max_tokens,omitempty"`
+	Stream    bool      `json:"stream,omitempty"`
 }
 
 type chatResponse struct {
@@ -125,6 +128,106 @@ func (c *OpenAIClient) Chat(ctx context.Context, messages []Message, tools []Too
 	}
 
 	return result, nil
+}
+
+// ChatStream opens a streaming chat completion and returns a channel of chunks.
+// The channel is closed after a chunk with Done=true. On error, a final chunk
+// with Done=true and Err set is sent.
+func (c *OpenAIClient) ChatStream(ctx context.Context, messages []Message, tools []ToolDef) (<-chan StreamChunk, error) {
+	reqBody := chatRequest{
+		Model:     c.modelName,
+		Messages:  messages,
+		MaxTokens: c.maxTokens,
+		Stream:    true,
+	}
+	if len(tools) > 0 {
+		reqBody.Tools = tools
+	}
+
+	data, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+
+	url := c.baseURL + "/chat/completions"
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	// Streaming uses a separate http.Client without Timeout, since the whole
+	// generation may exceed the normal per-request timeout.
+	streamClient := &http.Client{}
+	resp, err := streamClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("send request: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("api error: status=%d body=%s", resp.StatusCode, body)
+	}
+
+	out := make(chan StreamChunk, 32)
+	go func() {
+		defer resp.Body.Close()
+		defer close(out)
+
+		reader := bufio.NewReader(resp.Body)
+		var finalUsage Usage
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+					out <- StreamChunk{Done: true, Usage: finalUsage}
+					return
+				}
+				out <- StreamChunk{Done: true, Usage: finalUsage, Err: fmt.Errorf("read stream: %w", err)}
+				return
+			}
+
+			line = strings.TrimRight(line, "\r\n")
+			if line == "" || !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			payload := line[len("data: "):]
+			if payload == "[DONE]" {
+				out <- StreamChunk{Done: true, Usage: finalUsage}
+				return
+			}
+
+			var chunk struct {
+				Choices []struct {
+					Delta struct {
+						Content string `json:"content"`
+					} `json:"delta"`
+				} `json:"choices"`
+				Usage *Usage `json:"usage,omitempty"`
+			}
+			if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+				continue // skip malformed chunks
+			}
+			if chunk.Usage != nil {
+				finalUsage = *chunk.Usage
+			}
+			if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
+				select {
+				case out <- StreamChunk{Delta: chunk.Choices[0].Delta.Content}:
+				case <-ctx.Done():
+					out <- StreamChunk{Done: true, Usage: finalUsage, Err: ctx.Err()}
+					return
+				}
+			}
+		}
+	}()
+
+	return out, nil
 }
 
 // TranscriptionResult contains the transcribed text and confidence info.

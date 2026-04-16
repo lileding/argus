@@ -96,7 +96,7 @@ func (a *Agent) HandleStream(ctx context.Context, chatID string, userMsg model.M
 		toolResults, finishSummary := a.runOrchestrator(ctx, ch, userMsg, userText, history)
 
 		// Phase 2: Synthesis — compose final answer from materials.
-		reply := a.runSynthesizer(ctx, userMsg, userText, history, toolResults, finishSummary)
+		reply := a.runSynthesizer(ctx, ch, userMsg, userText, history, toolResults, finishSummary)
 
 		// Save assistant reply.
 		if err := a.store.SaveMessage(ctx, &store.StoredMessage{
@@ -248,8 +248,10 @@ func (a *Agent) runOrchestrator(
 }
 
 // runSynthesizer is Phase 2: composes the final answer from orchestrator's materials.
+// Streams the model's output as EventReplyDelta events (accumulated text).
 func (a *Agent) runSynthesizer(
 	ctx context.Context,
+	ch chan<- Event,
 	userMsg model.Message,
 	userText string,
 	history []model.Message,
@@ -288,18 +290,42 @@ func (a *Agent) runSynthesizer(
 
 	slog.Info("synthesizer call", "materials_len", materials.Len(), "history_len", len(history))
 
-	resp, err := a.model.Chat(ctx, messages, nil) // no tools
+	stream, err := a.model.ChatStream(ctx, messages, nil) // no tools
 	if err != nil {
-		slog.Error("synthesizer chat failed", "err", err)
-		return fmt.Sprintf("Error generating response: %v", err)
+		slog.Error("synthesizer stream start failed", "err", err)
+		// Fallback to non-streaming.
+		resp, fallbackErr := a.model.Chat(ctx, messages, nil)
+		if fallbackErr != nil {
+			return fmt.Sprintf("Error generating response: %v", fallbackErr)
+		}
+		return resp.Content
+	}
+
+	var full strings.Builder
+	var finalUsage model.Usage
+	for chunk := range stream {
+		if chunk.Delta != "" {
+			full.WriteString(chunk.Delta)
+			ch <- Event{Type: EventReplyDelta, Payload: ReplyDeltaPayload{Text: full.String()}}
+		}
+		if chunk.Done {
+			finalUsage = chunk.Usage
+			if chunk.Err != nil {
+				slog.Error("synthesizer stream error", "err", chunk.Err)
+				if full.Len() == 0 {
+					return fmt.Sprintf("Error generating response: %v", chunk.Err)
+				}
+			}
+		}
 	}
 
 	slog.Info("synthesizer response",
-		"prompt_tokens", resp.Usage.PromptTokens,
-		"completion_tokens", resp.Usage.CompletionTokens,
+		"prompt_tokens", finalUsage.PromptTokens,
+		"completion_tokens", finalUsage.CompletionTokens,
+		"content_len", full.Len(),
 	)
 
-	return resp.Content
+	return full.String()
 }
 
 // Handle is the synchronous compatibility wrapper.

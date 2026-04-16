@@ -5,10 +5,11 @@ type EventType int
 
 const (
 	EventThinking   EventType = iota // agent started processing
-	EventToolCall                     // about to call a tool
-	EventToolResult                   // tool returned
-	EventReply                        // final text reply
-	EventError                        // error occurred
+	EventToolCall                    // about to call a tool
+	EventToolResult                  // tool returned
+	EventReplyDelta                  // partial reply text (streaming synthesis)
+	EventReply                       // final text reply
+	EventError                       // error occurred
 )
 
 // Event is emitted by the agent during processing.
@@ -35,6 +36,12 @@ type ToolResultPayload struct {
 }
 
 type ReplyPayload struct {
+	Text string
+}
+
+// ReplyDeltaPayload carries the accumulated (not incremental) reply text so far.
+// Downstream consumers receive the full current string — simpler for card updates.
+type ReplyDeltaPayload struct {
 	Text string
 }
 

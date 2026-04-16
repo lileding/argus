@@ -3,9 +3,15 @@ package feishu
 import (
 	"fmt"
 	"log/slog"
+	"time"
 
 	"argus/internal/agent"
 )
+
+// streamUpdateMinInterval is the minimum time between Feishu card updates during
+// synthesizer streaming. Feishu rate-limits message updates and tiny updates
+// are wasteful; ~500ms is a good tradeoff between liveness and cost.
+const streamUpdateMinInterval = 500 * time.Millisecond
 
 // MarkdownProcessor processes markdown (e.g. LaTeX rendering) without IM-specific knowledge.
 type MarkdownProcessor interface {
@@ -28,6 +34,7 @@ func NewAdapter(client *Client, processor MarkdownProcessor) *Adapter {
 func (a *Adapter) HandleEvents(ch <-chan agent.Event, triggerMessageID, userText string) {
 	lang := detectLang(userText)
 	var replyMsgID string
+	var lastStreamUpdate time.Time
 
 	for ev := range ch {
 		switch ev.Type {
@@ -49,6 +56,24 @@ func (a *Adapter) HandleEvents(ch <-chan agent.Event, triggerMessageID, userText
 			if err := a.client.UpdateMessage(replyMsgID, cardJSON); err != nil {
 				slog.Debug("update tool status", "err", err)
 			}
+
+		case agent.EventReplyDelta:
+			if replyMsgID == "" {
+				continue
+			}
+			// Throttle: skip updates that fire faster than streamUpdateMinInterval.
+			// Final text is guaranteed to arrive via EventReply afterwards.
+			if time.Since(lastStreamUpdate) < streamUpdateMinInterval {
+				continue
+			}
+			p := ev.Payload.(agent.ReplyDeltaPayload)
+			// Skip LaTeX rendering during streaming — partial $...$ would break.
+			// Raw markdown is good enough; final EventReply applies full processing.
+			cardJSON := MarkdownToCard(p.Text)
+			if err := a.client.UpdateMessage(replyMsgID, cardJSON); err != nil {
+				slog.Debug("update stream delta", "err", err)
+			}
+			lastStreamUpdate = time.Now()
 
 		case agent.EventReply:
 			p := ev.Payload.(agent.ReplyPayload)
