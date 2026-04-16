@@ -122,21 +122,8 @@ func (a *Agent) runOrchestrator(
 	userText string,
 	history []model.Message,
 ) (results []toolCallRecord, summary string) {
-	// Pre-search: keyword-triggered search before model sees anything.
-	var preSearchHint string
-	if searchResult := a.preSearch(ctx, userText); searchResult != "" {
-		preSearchHint = searchResult
-		results = append(results, toolCallRecord{
-			Name:      "search",
-			Arguments: userText,
-			Result:    searchResult,
-		})
-		ch <- Event{Type: EventToolCall, Payload: ToolCallPayload{Name: "search", Arguments: userText}}
-		ch <- Event{Type: EventToolResult, Payload: ToolResultPayload{Name: "search", Result: truncateResult(searchResult, 200)}}
-	}
-
 	// Build orchestrator system prompt.
-	sysPrompt := a.buildOrchestratorPrompt(preSearchHint)
+	sysPrompt := a.buildOrchestratorPrompt()
 
 	// Build initial messages: system + history + user message.
 	messages := make([]model.Message, 0, len(history)+2)
@@ -146,7 +133,13 @@ func (a *Agent) runOrchestrator(
 	messages = append(messages, userMsg)
 
 	toolDefs := a.toolRegistry.AllToolDefs()
-	recentCalls := make(map[string]int)
+
+	// Track consecutive calls to the same tool (regardless of args) to detect
+	// models stuck in refinement loops — e.g. same search with slightly
+	// different queries 5+ times. When we see this, we inject a strong nudge
+	// to call finish_task.
+	consecutiveSameTool := 0
+	lastToolName := ""
 
 	for i := 0; i < a.maxIterations; i++ {
 		slog.Info("orchestrator iteration", "iteration", i, "messages", len(messages), "tools", len(toolDefs))
@@ -206,14 +199,12 @@ func (a *Agent) runOrchestrator(
 				return
 			}
 
-			callKey := tc.Function.Name + ":" + tc.Function.Arguments
-			recentCalls[callKey]++
-
-			if recentCalls[callKey] > 2 {
-				slog.Warn("duplicate tool call detected", "tool", tc.Function.Name)
-				errResult := fmt.Sprintf("error: this exact call (%s) has been repeated %d times. Try a different approach or call finish_task.", tc.Function.Name, recentCalls[callKey])
-				messages = append(messages, model.Message{Role: model.RoleTool, Content: errResult, ToolCallID: tc.ID})
-				continue
+			// Loop detection: same tool name 3+ times in a row.
+			if tc.Function.Name == lastToolName {
+				consecutiveSameTool++
+			} else {
+				consecutiveSameTool = 1
+				lastToolName = tc.Function.Name
 			}
 
 			ch <- Event{Type: EventToolCall, Payload: ToolCallPayload{
@@ -226,6 +217,17 @@ func (a *Agent) runOrchestrator(
 			result = truncateResult(result, maxToolResultBytes)
 
 			slog.Info("tool result", "tool", tc.Function.Name, "result_len", len(result))
+
+			// If this tool has been repeated 3+ times in a row, append a firm
+			// nudge so the model stops refining and calls finish_task.
+			if consecutiveSameTool >= 3 {
+				result += fmt.Sprintf(
+					"\n\n[SYSTEM NUDGE] You have called %s %d times consecutively. "+
+						"Further %s calls will NOT give you new information. "+
+						"You MUST call finish_task next with a summary of what you already have.",
+					tc.Function.Name, consecutiveSameTool, tc.Function.Name)
+				slog.Warn("loop detected, nudging finish_task", "tool", tc.Function.Name, "count", consecutiveSameTool)
+			}
 
 			ch <- Event{Type: EventToolResult, Payload: ToolResultPayload{
 				Name: tc.Function.Name, CallID: tc.ID,
@@ -345,62 +347,6 @@ func (a *Agent) Handle(ctx context.Context, chatID string, userMsg model.Message
 		return "", lastErr
 	}
 	return reply, nil
-}
-
-// preSearch checks if the user message contains explicit search intent and
-// proactively runs a search.
-func (a *Agent) preSearch(ctx context.Context, text string) string {
-	lower := strings.ToLower(text)
-
-	searchTriggers := []string{
-		"搜索", "搜一下", "查一下", "查询", "网上找", "互联网", "上网",
-		"最新", "最近", "新闻", "今天", "现在",
-		"search", "look up", "google", "find online",
-		"latest", "recent", "news", "today",
-	}
-
-	hasIntent := false
-	for _, trigger := range searchTriggers {
-		if strings.Contains(lower, trigger) {
-			hasIntent = true
-			break
-		}
-	}
-
-	if !hasIntent {
-		return ""
-	}
-
-	searchTool, ok := a.toolRegistry.Get("search")
-	if !ok {
-		return ""
-	}
-
-	// Extract query by removing common prefixes.
-	query := text
-	for _, prefix := range []string{
-		"搜索网络给我", "搜索网络", "搜索一下", "搜索", "搜一下",
-		"查一下", "查询", "网上找", "帮我搜索", "帮我查",
-		"search for ", "search ", "look up ", "google ",
-	} {
-		if idx := strings.Index(lower, prefix); idx >= 0 {
-			query = text[idx+len(prefix):]
-			break
-		}
-	}
-	query = strings.TrimSpace(query)
-	if query == "" {
-		query = text
-	}
-
-	slog.Info("pre-search triggered", "query", query)
-	result, err := searchTool.Execute(ctx, `{"query":"`+strings.ReplaceAll(query, `"`, `\"`)+`"}`)
-	if err != nil {
-		slog.Warn("pre-search failed", "err", err)
-		return ""
-	}
-
-	return result
 }
 
 func (a *Agent) executeTool(ctx context.Context, tc model.ToolCall) string {

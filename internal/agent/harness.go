@@ -85,7 +85,7 @@ func (a *Agent) loadHistory(ctx context.Context, chatID string, excludeID int64)
 // buildOrchestratorPrompt assembles the Phase 1 system prompt.
 // Focused on tool calling, not answering. Includes pinned memories, skill catalog,
 // document RAG context, environment info.
-func (a *Agent) buildOrchestratorPrompt(preSearchHint string) string {
+func (a *Agent) buildOrchestratorPrompt() string {
 	var sb strings.Builder
 
 	sb.WriteString(OrchestratorPrompt)
@@ -115,14 +115,6 @@ func (a *Agent) buildOrchestratorPrompt(preSearchHint string) string {
 	if catalog := a.skillIndex.Catalog(); catalog != "" {
 		sb.WriteString("\n")
 		sb.WriteString(catalog)
-	}
-
-	// Pre-search hint if applicable.
-	if preSearchHint != "" {
-		sb.WriteString("\n## Pre-fetched Search Results\n\n")
-		sb.WriteString("The user's message triggered a proactive search. Here's what was found:\n\n")
-		sb.WriteString(truncateResult(preSearchHint, 2000))
-		sb.WriteString("\n\nIf these results sufficiently address the user's question, call finish_task. Otherwise, use search to refine the query or gather more information.\n")
 	}
 
 	return sb.String()
