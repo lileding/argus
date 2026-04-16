@@ -15,42 +15,36 @@ import (
 	"argus/internal/store"
 )
 
-// assembleContext builds the full context for the LLM from multiple sources:
-// 1. System prompt (base + skills + environment)
-// 2. Pinned memories (user-defined persistent facts)
-// 3. Semantic recall (embedding-similar past messages)
-// 4. Recent channel messages (fixed window)
-// 5. Relevant document chunks (RAG)
-// 6. Current user message
-func (a *Agent) assembleContext(ctx context.Context, chatID string, userMsg model.Message, excludeID int64) ([]model.Message, []model.ToolDef, error) {
-	systemPrompt := a.buildSystemPrompt()
-
-	// --- Pinned memories ---
-	if ps, ok := a.store.(store.PinnedMemoryStore); ok {
-		memories, err := ps.ListMemories(ctx, true)
-		if err == nil && len(memories) > 0 {
-			systemPrompt += "\n\n## Your Memories About the User\n"
-			for _, m := range memories {
-				systemPrompt += fmt.Sprintf("- [%s] %s\n", m.Category, m.Content)
-			}
-		}
+// loadHistory retrieves and curates conversation history for context.
+// Used by both orchestrator and synthesizer phases.
+func (a *Agent) loadHistory(ctx context.Context, chatID string, excludeID int64) ([]model.Message, error) {
+	recent, err := a.store.RecentMessages(ctx, chatID, a.contextWindow+1)
+	if err != nil {
+		return nil, fmt.Errorf("load recent messages: %w", err)
 	}
 
-	// --- Semantic recall ---
-	var recalled []model.Message
 	var recalledIDs map[int64]bool
+	var recalled []model.Message
+
+	// Semantic recall via embedding.
 	if a.embedder != nil {
 		if ss, ok := a.store.(store.SemanticStore); ok {
-			queryText := userMsg.TextContent()
+			// Query text is the most recent user message (excluded from history).
+			var queryText string
+			if len(recent) > 0 {
+				// Find the just-saved message to use its content as query.
+				for _, m := range recent {
+					if m.ID == excludeID {
+						queryText = m.Content
+						break
+					}
+				}
+			}
 			if queryText != "" {
 				queryVec, err := a.embedder.EmbedOne(ctx, queryText)
-				if err != nil {
-					slog.Debug("query embedding failed", "err", err)
-				} else {
+				if err == nil {
 					similar, err := ss.SearchMessages(ctx, queryVec, chatID, 10)
-					if err != nil {
-						slog.Debug("semantic search failed", "err", err)
-					} else {
+					if err == nil {
 						recalledIDs = make(map[int64]bool)
 						for _, m := range similar {
 							recalledIDs[m.ID] = true
@@ -65,38 +59,14 @@ func (a *Agent) assembleContext(ctx context.Context, chatID string, userMsg mode
 		}
 	}
 
-	// --- Document chunks (RAG) ---
-	if a.embedder != nil {
-		if ds, ok := a.store.(store.DocumentStore); ok {
-			queryText := userMsg.TextContent()
-			if queryText != "" {
-				queryVec, err := a.embedder.EmbedOne(ctx, queryText)
-				if err == nil {
-					chunks, err := ds.SearchChunks(ctx, queryVec, 5)
-					if err == nil && len(chunks) > 0 {
-						systemPrompt += "\n\n## Relevant Documents\n"
-						for _, c := range chunks {
-							systemPrompt += fmt.Sprintf("\n### From: %s (chunk %d)\n%s\n", c.DocFilename, c.ChunkIndex, c.Content)
-						}
-					}
-				}
-			}
-		}
-	}
-
-	// --- Recent channel messages ---
-	recent, err := a.store.RecentMessages(ctx, chatID, a.contextWindow+1)
-	if err != nil {
-		return nil, nil, fmt.Errorf("load recent messages: %w", err)
-	}
-	// Exclude the just-saved message and any already in semantic recall.
+	// Filter recent messages: remove excluded (just-saved) and dedup vs recalled.
 	var filtered []store.StoredMessage
 	for _, m := range recent {
 		if m.ID == excludeID {
 			continue
 		}
 		if recalledIDs != nil && recalledIDs[m.ID] {
-			continue // already in semantic recall, don't duplicate
+			continue
 		}
 		filtered = append(filtered, m)
 	}
@@ -105,67 +75,84 @@ func (a *Agent) assembleContext(ctx context.Context, chatID string, userMsg mode
 	}
 	curated := a.curateHistory(filtered)
 
-	// --- Assemble final message sequence ---
-	messages := make([]model.Message, 0, len(recalled)+len(curated)+3)
-	messages = append(messages, model.Message{Role: model.RoleSystem, Content: systemPrompt})
-
-	// Recalled messages first (older, semantically relevant).
-	if len(recalled) > 0 {
-		messages = append(messages, recalled...)
-	}
-
-	// Recent messages (chronological).
-	messages = append(messages, curated...)
-
-	// Current user message last.
-	userMsg.Role = model.RoleUser
-	messages = append(messages, userMsg)
-
-	toolDefs := a.toolRegistry.AllToolDefs()
-	return messages, toolDefs, nil
+	// Recalled first (older, semantically relevant), then recent (chronological).
+	out := make([]model.Message, 0, len(recalled)+len(curated))
+	out = append(out, recalled...)
+	out = append(out, curated...)
+	return out, nil
 }
 
-// buildSystemPrompt assembles: base prompt + environment + skills.
-func (a *Agent) buildSystemPrompt() string {
+// buildOrchestratorPrompt assembles the Phase 1 system prompt.
+// Focused on tool calling, not answering. Includes pinned memories, skill catalog,
+// document RAG context, environment info.
+func (a *Agent) buildOrchestratorPrompt(preSearchHint string) string {
 	var sb strings.Builder
 
-	sb.WriteString(a.basePrompt)
+	sb.WriteString(OrchestratorPrompt)
 
-	// Environment info.
-	sb.WriteString(fmt.Sprintf("\n\nToday: %s\n", time.Now().Format("2006-01-02 (Monday)")))
-	sb.WriteString(fmt.Sprintf("Home directory: %s\n", os.Getenv("HOME")))
-	sb.WriteString(fmt.Sprintf("Workspace directory: %s\n", a.workspaceDir))
-	sb.WriteString("The read_file and write_file tools operate on paths relative to this workspace. For files outside the workspace, use the cli tool with absolute paths (e.g. `cat /home/user/file.txt`).\n")
-	sb.WriteString("Use the current_time tool when you need to know the date, time, or resolve relative time references.\n")
+	// Environment.
+	sb.WriteString(fmt.Sprintf("\n\n## Environment\n\n"))
+	sb.WriteString(fmt.Sprintf("Today: %s\n", time.Now().Format("2006-01-02 (Monday)")))
+	sb.WriteString(fmt.Sprintf("Home: %s\n", os.Getenv("HOME")))
+	sb.WriteString(fmt.Sprintf("Workspace: %s\n", a.workspaceDir))
 
-	// Builtin skill prompts.
-	builtinPrompts := a.skillIndex.BuiltinPrompts()
-	if builtinPrompts != "" {
-		sb.WriteString(builtinPrompts)
+	// Pinned memories.
+	if ps, ok := a.store.(store.PinnedMemoryStore); ok {
+		if memories, err := ps.ListMemories(context.Background(), true); err == nil && len(memories) > 0 {
+			sb.WriteString("\n## User Memories\n\n")
+			for _, m := range memories {
+				sb.WriteString(fmt.Sprintf("- [%s] %s\n", m.Category, m.Content))
+			}
+		}
 	}
 
-	// User skill catalog.
-	catalog := a.skillIndex.Catalog()
-	if catalog != "" {
+	// Builtin skills (always injected).
+	if builtin := a.skillIndex.BuiltinPrompts(); builtin != "" {
+		sb.WriteString(builtin)
+	}
+
+	// User skill catalog (model can load via activate_skill).
+	if catalog := a.skillIndex.Catalog(); catalog != "" {
 		sb.WriteString("\n")
 		sb.WriteString(catalog)
 	}
 
-	// Skill accumulation.
-	sb.WriteString("\n\n## Skill Accumulation\n\n")
-	sb.WriteString("When you successfully complete a new type of recurring task, use the save_skill tool to capture your approach as a reusable skill. ")
-	sb.WriteString("A good skill should include: trigger conditions, step-by-step instructions, and which tools to use. Do not create skills for one-off tasks.\n")
-
-	// CRITICAL: Reinforce tool usage at the end (recency bias — models pay most attention to the end).
-	sb.WriteString("\n\n## REMINDER\n\n")
-	sb.WriteString("You MUST use the search tool for any factual question about people, events, technology, music, science, or current affairs. ")
-	sb.WriteString("NEVER answer factual questions from memory — your training data is outdated. Always search first, then answer based on search results. ")
-	sb.WriteString("When asked to search or look something up, call the search tool IMMEDIATELY in this response. Do not say you will search — actually call the tool.\n")
+	// Pre-search hint if applicable.
+	if preSearchHint != "" {
+		sb.WriteString("\n## Pre-fetched Search Results\n\n")
+		sb.WriteString("The user's message triggered a proactive search. Here's what was found:\n\n")
+		sb.WriteString(truncateResult(preSearchHint, 2000))
+		sb.WriteString("\n\nIf these results sufficiently address the user's question, call finish_task. Otherwise, use search to refine the query or gather more information.\n")
+	}
 
 	return sb.String()
 }
 
-// imageExts lists extensions to re-inject as multimodal content.
+// buildSynthesizerPrompt assembles the Phase 2 system prompt.
+// Focused on composing a final answer from materials, no tools.
+func (a *Agent) buildSynthesizerPrompt() string {
+	var sb strings.Builder
+
+	sb.WriteString(SynthesizerPrompt)
+
+	// Environment.
+	sb.WriteString(fmt.Sprintf("\n\n## Environment\n\n"))
+	sb.WriteString(fmt.Sprintf("Today: %s\n", time.Now().Format("2006-01-02 (Monday)")))
+	sb.WriteString(fmt.Sprintf("Workspace: %s\n", a.workspaceDir))
+
+	// Pinned memories (for personalization).
+	if ps, ok := a.store.(store.PinnedMemoryStore); ok {
+		if memories, err := ps.ListMemories(context.Background(), true); err == nil && len(memories) > 0 {
+			sb.WriteString("\n## User Memories\n\n")
+			for _, m := range memories {
+				sb.WriteString(fmt.Sprintf("- [%s] %s\n", m.Category, m.Content))
+			}
+		}
+	}
+
+	return sb.String()
+}
+
 var imageExts = map[string]bool{".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true}
 
 // curateHistory filters message history and re-injects images from .files/.
@@ -202,7 +189,6 @@ func (a *Agent) curateHistory(messages []store.StoredMessage) []model.Message {
 	return curated
 }
 
-// scanImageFiles returns filename → absolute path for images in .files/.
 func (a *Agent) scanImageFiles() map[string]string {
 	filesDir := filepath.Join(a.workspaceDir, ".files")
 	entries, err := os.ReadDir(filesDir)
@@ -221,3 +207,5 @@ func (a *Agent) scanImageFiles() map[string]string {
 	}
 	return result
 }
+
+var _ = slog.Default // silence unused import if slog drops out

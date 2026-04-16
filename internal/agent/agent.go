@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -44,15 +45,21 @@ func New(modelClient model.Client, st store.Store, toolReg *tool.Registry, skill
 	}
 }
 
-// HandleStream processes a user message and returns a channel of events.
-// The caller consumes events to drive UI updates (thinking, tool calls, final reply).
+// toolCallRecord tracks a tool invocation and its result for Phase 2 synthesis.
+type toolCallRecord struct {
+	Name      string
+	Arguments string
+	Result    string
+}
+
+// HandleStream processes a user message in two phases: orchestration (tool calling)
+// then synthesis (final reply generation). Returns a channel of events for UI updates.
 func (a *Agent) HandleStream(ctx context.Context, chatID string, userMsg model.Message) <-chan Event {
 	ch := make(chan Event, 16)
 
 	go func() {
 		defer close(ch)
 
-		// Emit thinking immediately.
 		ch <- Event{Type: EventThinking, Payload: ThinkingPayload{UserText: userMsg.TextContent()}}
 
 		ctx = tool.WithChatID(ctx, chatID)
@@ -76,111 +83,226 @@ func (a *Agent) HandleStream(ctx context.Context, chatID string, userMsg model.M
 			return
 		}
 
-		// Assemble context.
-		messages, toolDefs, err := a.assembleContext(ctx, chatID, userMsg, savedMsg.ID)
+		// Load history for context (used by both phases).
+		history, err := a.loadHistory(ctx, chatID, savedMsg.ID)
 		if err != nil {
-			ch <- Event{Type: EventError, Payload: ErrorPayload{Err: fmt.Errorf("assemble context: %w", err)}}
+			ch <- Event{Type: EventError, Payload: ErrorPayload{Err: err}}
 			return
 		}
 
-		// Pre-search: if user message has explicit search intent, proactively search
-		// before the model decides (compensates for models that skip tool calls).
 		userText := userMsg.TextContent()
-		if searchResult := a.preSearch(ctx, userText); searchResult != "" {
-			// Inject search result as a system hint at the end of messages.
-			messages = append(messages[:len(messages)-1], // remove user msg temporarily
-				model.Message{
-					Role:    model.RoleSystem,
-					Content: "## Pre-fetched Search Results\n\nThe user asked to search. Here are results:\n\n" + searchResult + "\n\nUse these results to answer the user's question. If more searches are needed, use the search tool.",
-				},
-				messages[len(messages)-1], // put user msg back at end
-			)
-			ch <- Event{Type: EventToolCall, Payload: ToolCallPayload{Name: "search", Arguments: userText}}
-			ch <- Event{Type: EventToolResult, Payload: ToolResultPayload{Name: "search", Result: truncateResult(searchResult, 200)}}
+
+		// Phase 1: Orchestration — collect materials via tool calls.
+		toolResults, finishSummary := a.runOrchestrator(ctx, ch, userMsg, userText, history)
+
+		// Phase 2: Synthesis — compose final answer from materials.
+		reply := a.runSynthesizer(ctx, userMsg, userText, history, toolResults, finishSummary)
+
+		// Save assistant reply.
+		if err := a.store.SaveMessage(ctx, &store.StoredMessage{
+			ChatID:  chatID,
+			Role:    string(model.RoleAssistant),
+			Content: reply,
+		}); err != nil {
+			ch <- Event{Type: EventError, Payload: ErrorPayload{Err: fmt.Errorf("save assistant reply: %w", err)}}
+			return
 		}
 
-		// Agent tool loop.
-		recentCalls := make(map[string]int)
-		for i := 0; i < a.maxIterations; i++ {
-			slog.Info("calling model", "chat_id", chatID, "iteration", i, "messages", len(messages), "tools", len(toolDefs))
-
-			resp, err := a.model.Chat(ctx, messages, toolDefs)
-			if err != nil {
-				ch <- Event{Type: EventError, Payload: ErrorPayload{Err: fmt.Errorf("model chat (iteration %d): %w", i, err)}}
-				return
-			}
-
-			slog.Info("model response",
-				"iteration", i,
-				"prompt_tokens", resp.Usage.PromptTokens,
-				"completion_tokens", resp.Usage.CompletionTokens,
-				"total_tokens", resp.Usage.TotalTokens,
-			)
-
-			// No tool calls → final reply.
-			if len(resp.ToolCalls) == 0 {
-				reply := resp.Content
-				if err := a.store.SaveMessage(ctx, &store.StoredMessage{
-					ChatID:  chatID,
-					Role:    string(model.RoleAssistant),
-					Content: reply,
-				}); err != nil {
-					ch <- Event{Type: EventError, Payload: ErrorPayload{Err: fmt.Errorf("save assistant reply: %w", err)}}
-					return
-				}
-				ch <- Event{Type: EventReply, Payload: ReplyPayload{Text: reply}}
-				return
-			}
-
-			// Append assistant message with tool calls.
-			messages = append(messages, model.Message{
-				Role:      model.RoleAssistant,
-				Content:   resp.Content,
-				ToolCalls: resp.ToolCalls,
-			})
-
-			// Execute tools.
-			for _, tc := range resp.ToolCalls {
-				callKey := tc.Function.Name + ":" + tc.Function.Arguments
-				recentCalls[callKey]++
-
-				if recentCalls[callKey] > 2 {
-					slog.Warn("duplicate tool call detected", "tool", tc.Function.Name, "count", recentCalls[callKey])
-					result := fmt.Sprintf("error: this exact call (%s) has been repeated %d times. Try a different approach.", tc.Function.Name, recentCalls[callKey])
-					messages = append(messages, model.Message{Role: model.RoleTool, Content: result, ToolCallID: tc.ID})
-					continue
-				}
-
-				// Emit tool call event.
-				ch <- Event{Type: EventToolCall, Payload: ToolCallPayload{
-					Name: tc.Function.Name, Arguments: tc.Function.Arguments, CallID: tc.ID,
-				}}
-
-				slog.Info("tool call", "tool", tc.Function.Name, "call_id", tc.ID, "arguments", tc.Function.Arguments)
-
-				result := a.executeTool(ctx, tc)
-				result = truncateResult(result, maxToolResultBytes)
-
-				slog.Info("tool result", "tool", tc.Function.Name, "call_id", tc.ID, "result_len", len(result))
-
-				// Emit tool result event.
-				ch <- Event{Type: EventToolResult, Payload: ToolResultPayload{
-					Name: tc.Function.Name, CallID: tc.ID,
-					Result:  truncateResult(result, 200),
-					IsError: strings.HasPrefix(result, "error:"),
-				}}
-
-				messages = append(messages, model.Message{Role: model.RoleTool, Content: result, ToolCallID: tc.ID})
-			}
-		}
-
-		ch <- Event{Type: EventError, Payload: ErrorPayload{Err: fmt.Errorf("agent loop exceeded max iterations (%d)", a.maxIterations)}}
+		ch <- Event{Type: EventReply, Payload: ReplyPayload{Text: reply}}
 	}()
 
 	return ch
 }
 
-// Handle is the synchronous compatibility wrapper. Blocks until the agent finishes.
+// runOrchestrator is Phase 1: loops model calls + tool execution until finish_task.
+func (a *Agent) runOrchestrator(
+	ctx context.Context,
+	ch chan<- Event,
+	userMsg model.Message,
+	userText string,
+	history []model.Message,
+) (results []toolCallRecord, summary string) {
+	// Pre-search: keyword-triggered search before model sees anything.
+	var preSearchHint string
+	if searchResult := a.preSearch(ctx, userText); searchResult != "" {
+		preSearchHint = searchResult
+		results = append(results, toolCallRecord{
+			Name:      "search",
+			Arguments: userText,
+			Result:    searchResult,
+		})
+		ch <- Event{Type: EventToolCall, Payload: ToolCallPayload{Name: "search", Arguments: userText}}
+		ch <- Event{Type: EventToolResult, Payload: ToolResultPayload{Name: "search", Result: truncateResult(searchResult, 200)}}
+	}
+
+	// Build orchestrator system prompt.
+	sysPrompt := a.buildOrchestratorPrompt(preSearchHint)
+
+	// Build initial messages: system + history + user message.
+	messages := make([]model.Message, 0, len(history)+2)
+	messages = append(messages, model.Message{Role: model.RoleSystem, Content: sysPrompt})
+	messages = append(messages, history...)
+	userMsg.Role = model.RoleUser
+	messages = append(messages, userMsg)
+
+	toolDefs := a.toolRegistry.AllToolDefs()
+	recentCalls := make(map[string]int)
+
+	for i := 0; i < a.maxIterations; i++ {
+		slog.Info("orchestrator iteration", "iteration", i, "messages", len(messages), "tools", len(toolDefs))
+
+		resp, err := a.model.Chat(ctx, messages, toolDefs)
+		if err != nil {
+			slog.Error("orchestrator chat failed", "err", err)
+			summary = fmt.Sprintf("Orchestrator error: %v", err)
+			return
+		}
+
+		slog.Info("orchestrator response",
+			"iteration", i,
+			"prompt_tokens", resp.Usage.PromptTokens,
+			"completion_tokens", resp.Usage.CompletionTokens,
+			"tool_calls", len(resp.ToolCalls),
+		)
+
+		// Retry once if first response has no tool calls (model ignored instruction).
+		if len(resp.ToolCalls) == 0 && i == 0 {
+			slog.Warn("orchestrator ignored tool-only rule, retrying with enforcement")
+			messages = append(messages,
+				model.Message{Role: model.RoleAssistant, Content: resp.Content},
+				model.Message{Role: model.RoleUser, Content: "You MUST call a tool. Text output is ignored. Call search, fetch, read_file, or finish_task now."},
+			)
+			resp, err = a.model.Chat(ctx, messages, toolDefs)
+			if err != nil {
+				summary = fmt.Sprintf("Orchestrator retry error: %v", err)
+				return
+			}
+		}
+
+		// If still no tool calls, use model text as fallback summary and exit.
+		if len(resp.ToolCalls) == 0 {
+			slog.Warn("orchestrator produced no tool calls after retry, using text as summary")
+			summary = resp.Content
+			return
+		}
+
+		// Append assistant message with tool calls.
+		messages = append(messages, model.Message{
+			Role:      model.RoleAssistant,
+			Content:   resp.Content,
+			ToolCalls: resp.ToolCalls,
+		})
+
+		// Execute tools (or detect finish_task).
+		for _, tc := range resp.ToolCalls {
+			// Detect finish_task — signal to move to synthesis.
+			if tc.Function.Name == "finish_task" {
+				var args struct {
+					Summary string `json:"summary"`
+				}
+				json.Unmarshal([]byte(tc.Function.Arguments), &args)
+				summary = args.Summary
+				slog.Info("orchestrator done", "summary", truncateResult(summary, 200))
+				return
+			}
+
+			callKey := tc.Function.Name + ":" + tc.Function.Arguments
+			recentCalls[callKey]++
+
+			if recentCalls[callKey] > 2 {
+				slog.Warn("duplicate tool call detected", "tool", tc.Function.Name)
+				errResult := fmt.Sprintf("error: this exact call (%s) has been repeated %d times. Try a different approach or call finish_task.", tc.Function.Name, recentCalls[callKey])
+				messages = append(messages, model.Message{Role: model.RoleTool, Content: errResult, ToolCallID: tc.ID})
+				continue
+			}
+
+			ch <- Event{Type: EventToolCall, Payload: ToolCallPayload{
+				Name: tc.Function.Name, Arguments: tc.Function.Arguments, CallID: tc.ID,
+			}}
+
+			slog.Info("tool call", "tool", tc.Function.Name, "arguments", tc.Function.Arguments)
+
+			result := a.executeTool(ctx, tc)
+			result = truncateResult(result, maxToolResultBytes)
+
+			slog.Info("tool result", "tool", tc.Function.Name, "result_len", len(result))
+
+			ch <- Event{Type: EventToolResult, Payload: ToolResultPayload{
+				Name: tc.Function.Name, CallID: tc.ID,
+				Result:  truncateResult(result, 200),
+				IsError: strings.HasPrefix(result, "error:"),
+			}}
+
+			results = append(results, toolCallRecord{
+				Name:      tc.Function.Name,
+				Arguments: tc.Function.Arguments,
+				Result:    result,
+			})
+
+			messages = append(messages, model.Message{Role: model.RoleTool, Content: result, ToolCallID: tc.ID})
+		}
+	}
+
+	summary = fmt.Sprintf("(reached max %d iterations without finish_task)", a.maxIterations)
+	return
+}
+
+// runSynthesizer is Phase 2: composes the final answer from orchestrator's materials.
+func (a *Agent) runSynthesizer(
+	ctx context.Context,
+	userMsg model.Message,
+	userText string,
+	history []model.Message,
+	toolResults []toolCallRecord,
+	summary string,
+) string {
+	// Build synthesizer prompt with environment info.
+	sysPrompt := a.buildSynthesizerPrompt()
+
+	// Build materials section.
+	var materials strings.Builder
+	materials.WriteString("## Materials Collected by Orchestrator\n\n")
+	if summary != "" {
+		materials.WriteString("### Summary\n")
+		materials.WriteString(summary)
+		materials.WriteString("\n\n")
+	}
+	for i, r := range toolResults {
+		materials.WriteString(fmt.Sprintf("### Tool Call #%d: %s\n", i+1, r.Name))
+		materials.WriteString(fmt.Sprintf("Arguments: `%s`\n\n", r.Arguments))
+		materials.WriteString("Result:\n```\n")
+		materials.WriteString(r.Result)
+		materials.WriteString("\n```\n\n")
+	}
+	if len(toolResults) == 0 && summary == "" {
+		materials.WriteString("(No tool results — answer from conversation context alone.)\n")
+	}
+
+	// Messages: system + history + user + materials.
+	messages := make([]model.Message, 0, len(history)+3)
+	messages = append(messages, model.Message{Role: model.RoleSystem, Content: sysPrompt})
+	messages = append(messages, history...)
+	userMsg.Role = model.RoleUser
+	messages = append(messages, userMsg)
+	messages = append(messages, model.Message{Role: model.RoleSystem, Content: materials.String()})
+
+	slog.Info("synthesizer call", "materials_len", materials.Len(), "history_len", len(history))
+
+	resp, err := a.model.Chat(ctx, messages, nil) // no tools
+	if err != nil {
+		slog.Error("synthesizer chat failed", "err", err)
+		return fmt.Sprintf("Error generating response: %v", err)
+	}
+
+	slog.Info("synthesizer response",
+		"prompt_tokens", resp.Usage.PromptTokens,
+		"completion_tokens", resp.Usage.CompletionTokens,
+	)
+
+	return resp.Content
+}
+
+// Handle is the synchronous compatibility wrapper.
 func (a *Agent) Handle(ctx context.Context, chatID string, userMsg model.Message) (string, error) {
 	ch := a.HandleStream(ctx, chatID, userMsg)
 	var reply string
@@ -200,16 +322,15 @@ func (a *Agent) Handle(ctx context.Context, chatID string, userMsg model.Message
 }
 
 // preSearch checks if the user message contains explicit search intent and
-// proactively runs a search. Returns search results or empty string.
-// This compensates for local models that sometimes skip tool calls despite
-// being told to search.
+// proactively runs a search.
 func (a *Agent) preSearch(ctx context.Context, text string) string {
 	lower := strings.ToLower(text)
 
-	// Detect explicit search intent (Chinese and English).
 	searchTriggers := []string{
 		"搜索", "搜一下", "查一下", "查询", "网上找", "互联网", "上网",
+		"最新", "最近", "新闻", "今天", "现在",
 		"search", "look up", "google", "find online",
+		"latest", "recent", "news", "today",
 	}
 
 	hasIntent := false
@@ -224,16 +345,13 @@ func (a *Agent) preSearch(ctx context.Context, text string) string {
 		return ""
 	}
 
-	// Extract a search query from the user message.
-	// Use the search tool directly.
 	searchTool, ok := a.toolRegistry.Get("search")
 	if !ok {
 		return ""
 	}
 
-	// Build a search query — use the full user text as query.
+	// Extract query by removing common prefixes.
 	query := text
-	// Remove common prefixes.
 	for _, prefix := range []string{
 		"搜索网络给我", "搜索网络", "搜索一下", "搜索", "搜一下",
 		"查一下", "查询", "网上找", "帮我搜索", "帮我查",

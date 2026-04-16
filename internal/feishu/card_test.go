@@ -38,6 +38,24 @@ func TestThinkingCard(t *testing.T) {
 	}
 }
 
+func TestToolStatusCard_Search(t *testing.T) {
+	card := ToolStatusCard("search", `{"query":"普罗科菲耶夫"}`, "zh")
+	if !strings.Contains(card, "正在搜索") || !strings.Contains(card, "普罗科菲耶夫") {
+		t.Errorf("expected Chinese search status with query, got: %s", card)
+	}
+	card = ToolStatusCard("search", `{"query":"Prokofiev"}`, "en")
+	if !strings.Contains(card, "Searching") || !strings.Contains(card, "Prokofiev") {
+		t.Errorf("expected English search status with query, got: %s", card)
+	}
+}
+
+func TestToolStatusCard_ReadFile(t *testing.T) {
+	card := ToolStatusCard("read_file", `{"path":"report.pdf"}`, "zh")
+	if !strings.Contains(card, "读取") || !strings.Contains(card, "report.pdf") {
+		t.Errorf("expected read file status, got: %s", card)
+	}
+}
+
 func TestDetectLang(t *testing.T) {
 	if detectLang("你好世界") != "zh" {
 		t.Error("expected zh")

@@ -45,7 +45,7 @@ func (a *Adapter) HandleEvents(ch <-chan agent.Event, triggerMessageID, userText
 				continue
 			}
 			p := ev.Payload.(agent.ToolCallPayload)
-			cardJSON := ToolStatusCard(p.Name, lang)
+			cardJSON := ToolStatusCard(p.Name, p.Arguments, lang)
 			if err := a.client.UpdateMessage(replyMsgID, cardJSON); err != nil {
 				slog.Debug("update tool status", "err", err)
 			}
