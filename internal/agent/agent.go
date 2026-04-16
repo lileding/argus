@@ -134,12 +134,22 @@ func (a *Agent) runOrchestrator(
 
 	toolDefs := a.toolRegistry.AllToolDefs()
 
-	// Track consecutive calls to the same tool (regardless of args) to detect
-	// models stuck in refinement loops — e.g. same search with slightly
-	// different queries 5+ times. When we see this, we inject a strong nudge
-	// to call finish_task.
-	consecutiveSameTool := 0
-	lastToolName := ""
+	// Per-tool hard budgets. Once exhausted, further calls to that tool are
+	// rejected at the harness layer (never dispatched to the actual tool).
+	// Small budgets for expensive/noisy tools like search; unrestricted tools
+	// (not listed) can be called freely.
+	toolBudgets := map[string]int{
+		"search": 3,
+		"fetch":  4,
+		"db":     6,
+	}
+	toolCounts := map[string]int{}
+
+	// Cumulative count of calls rejected by budget. Models that ignore
+	// "call finish_task" nudges keep issuing rejected calls; after too many
+	// we force a transition to synthesis with whatever we already have.
+	budgetRejections := 0
+	const maxBudgetRejections = 5
 
 	for i := 0; i < a.maxIterations; i++ {
 		slog.Info("orchestrator iteration", "iteration", i, "messages", len(messages), "tools", len(toolDefs))
@@ -199,12 +209,42 @@ func (a *Agent) runOrchestrator(
 				return
 			}
 
-			// Loop detection: same tool name 3+ times in a row.
-			if tc.Function.Name == lastToolName {
-				consecutiveSameTool++
-			} else {
-				consecutiveSameTool = 1
-				lastToolName = tc.Function.Name
+			// Hard budget: reject at harness layer if exhausted.
+			if budget, has := toolBudgets[tc.Function.Name]; has {
+				if toolCounts[tc.Function.Name] >= budget {
+					budgetRejections++
+					errResult := fmt.Sprintf(
+						"error: %s budget exhausted (%d/%d calls already used). "+
+							"No further %s calls will be executed this turn. "+
+							"Call finish_task NOW with a summary based on the results you have already seen.",
+						tc.Function.Name, toolCounts[tc.Function.Name], budget, tc.Function.Name)
+					slog.Warn("tool budget exhausted, rejecting call",
+						"tool", tc.Function.Name,
+						"used", toolCounts[tc.Function.Name],
+						"budget", budget,
+						"total_rejections", budgetRejections,
+					)
+					ch <- Event{Type: EventToolResult, Payload: ToolResultPayload{
+						Name: tc.Function.Name, CallID: tc.ID,
+						Result: truncateResult(errResult, 200), IsError: true,
+					}}
+					messages = append(messages, model.Message{Role: model.RoleTool, Content: errResult, ToolCallID: tc.ID})
+
+					// If the model keeps ignoring budget rejections, force synthesis.
+					if budgetRejections >= maxBudgetRejections {
+						slog.Warn("too many budget rejections, forcing synthesis",
+							"rejections", budgetRejections,
+							"results_gathered", len(results),
+						)
+						summary = fmt.Sprintf(
+							"(Orchestrator force-stopped: model ignored %d budget-exhausted rejections. "+
+								"Synthesizing from %d materials gathered so far.)",
+							budgetRejections, len(results))
+						return
+					}
+					continue
+				}
+				toolCounts[tc.Function.Name]++
 			}
 
 			ch <- Event{Type: EventToolCall, Payload: ToolCallPayload{
@@ -217,17 +257,6 @@ func (a *Agent) runOrchestrator(
 			result = truncateResult(result, maxToolResultBytes)
 
 			slog.Info("tool result", "tool", tc.Function.Name, "result_len", len(result))
-
-			// If this tool has been repeated 3+ times in a row, append a firm
-			// nudge so the model stops refining and calls finish_task.
-			if consecutiveSameTool >= 3 {
-				result += fmt.Sprintf(
-					"\n\n[SYSTEM NUDGE] You have called %s %d times consecutively. "+
-						"Further %s calls will NOT give you new information. "+
-						"You MUST call finish_task next with a summary of what you already have.",
-					tc.Function.Name, consecutiveSameTool, tc.Function.Name)
-				slog.Warn("loop detected, nudging finish_task", "tool", tc.Function.Name, "count", consecutiveSameTool)
-			}
 
 			ch <- Event{Type: EventToolResult, Payload: ToolResultPayload{
 				Name: tc.Function.Name, CallID: tc.ID,
@@ -245,7 +274,13 @@ func (a *Agent) runOrchestrator(
 		}
 	}
 
-	summary = fmt.Sprintf("(reached max %d iterations without finish_task)", a.maxIterations)
+	// Max iterations reached. Don't fabricate a summary — let the synthesizer
+	// compose an answer from whatever materials were actually gathered.
+	slog.Warn("orchestrator reached max iterations without finish_task",
+		"iterations", a.maxIterations,
+		"results_gathered", len(results),
+	)
+	summary = fmt.Sprintf("(Orchestrator reached max %d iterations; synthesizing from %d materials gathered.)", a.maxIterations, len(results))
 	return
 }
 

@@ -245,12 +245,21 @@ func (c *OpenAIClient) Transcribe(ctx context.Context, audioData []byte, filenam
 	// Model.
 	writeFormField(&buf, boundary, "model", c.transcriptionModel)
 
-	// Prompt: domain vocabulary hints for better accuracy.
+	// Prompt: domain vocabulary hints for better accuracy. Whisper uses this as
+	// a rolling-window context prompt; listed terms get strong priors. Include
+	// both Latin names and common Chinese transliterations since users switch
+	// between them mid-sentence.
 	writeFormField(&buf, boundary, "prompt",
 		"This audio may contain mixed Chinese and English. "+
-			"Domain vocabulary includes technology terms (API, Kubernetes, Docker, GPU, LLM, transformer, embedding, MLX, vLLM), "+
-			"finance terms (ETF, PE ratio, hedge fund, derivatives, quantitative), "+
-			"and arts terms (sonata, concerto, fugue, Chopin, Debussy, Rachmaninoff, Scriabin, Grieg, Dvořák, Mahler). "+
+			"Technology terms: API, Kubernetes, Docker, GPU, LLM, transformer, embedding, MLX, vLLM, omlx. "+
+			"Finance terms: ETF, PE ratio, hedge fund, derivatives, quantitative. "+
+			"Classical composers (Latin + Chinese): Chopin 肖邦, Debussy 德彪西, "+
+			"Rachmaninoff 拉赫玛尼诺夫, Scriabin 斯克里亚宾, Prokofiev 普罗科菲耶夫, "+
+			"Tchaikovsky 柴可夫斯基, Shostakovich 肖斯塔科维奇, Stravinsky 斯特拉文斯基, "+
+			"Mussorgsky 穆索尔斯基, Rimsky-Korsakov 里姆斯基-科萨科夫, Glinka 格林卡, "+
+			"Grieg 格里格, Dvořák 德沃夏克, Mahler 马勒, Bruckner 布鲁克纳, Sibelius 西贝柳斯, "+
+			"Bartók 巴托克, Ravel 拉威尔, Saint-Saëns 圣桑, Fauré 福雷. "+
+			"Musical forms: sonata, concerto, fugue, symphony, étude, nocturne, prelude. "+
 			"Transcribe accurately, preserving code-switching between languages.")
 
 	// Response format: verbose_json for confidence scores.
