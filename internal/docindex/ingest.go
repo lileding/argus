@@ -119,22 +119,34 @@ func (ing *Ingester) processDocument(ctx context.Context, doc store.Document) {
 
 func (ing *Ingester) extractText(ctx context.Context, doc store.Document) (string, error) {
 	ext := strings.ToLower(doc.Filename)
+	// Always shell-quote the path; file names from external sources may contain
+	// quotes, spaces, semicolons, backticks, etc. that would otherwise break
+	// out of the command string.
+	qPath := shellQuote(doc.FilePath)
 
 	switch {
 	case strings.HasSuffix(ext, ".pdf"):
-		return ing.sandbox.Exec(ctx, "pdftotext '"+doc.FilePath+"' -", "")
+		return ing.sandbox.Exec(ctx, "pdftotext "+qPath+" -", "")
 	case strings.HasSuffix(ext, ".txt"), strings.HasSuffix(ext, ".md"),
 		strings.HasSuffix(ext, ".csv"), strings.HasSuffix(ext, ".json"),
 		strings.HasSuffix(ext, ".xml"), strings.HasSuffix(ext, ".yaml"),
 		strings.HasSuffix(ext, ".yml"), strings.HasSuffix(ext, ".log"):
-		return ing.sandbox.Exec(ctx, "cat '"+doc.FilePath+"'", "")
+		return ing.sandbox.Exec(ctx, "cat "+qPath, "")
 	case strings.HasSuffix(ext, ".docx"):
-		// Try python-docx if available.
-		return ing.sandbox.Exec(ctx, "python3 -c \"from docx import Document; d=Document('"+doc.FilePath+"'); print('\\n'.join(p.text for p in d.paragraphs))\"", "")
+		// Pass the path as argv[1] so Python receives it as a safe string
+		// rather than splicing it into the source code itself.
+		const docxScript = `import sys; from docx import Document; d=Document(sys.argv[1]); print("\n".join(p.text for p in d.paragraphs))`
+		return ing.sandbox.Exec(ctx, "python3 -c "+shellQuote(docxScript)+" "+qPath, "")
 	default:
-		// Try cat as fallback.
-		return ing.sandbox.Exec(ctx, "cat '"+doc.FilePath+"'", "")
+		return ing.sandbox.Exec(ctx, "cat "+qPath, "")
 	}
+}
+
+// shellQuote wraps s in POSIX single quotes, escaping any embedded single
+// quotes via the '\'' trick. Safe for arbitrary strings including ones
+// containing `;`, `$`, backticks, spaces, etc.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // ChunkText splits text into overlapping chunks.

@@ -212,18 +212,28 @@ All messages are handled by a local LLM via an OpenAI-compatible endpoint (omlx,
 
 | Role | Model | Notes |
 |------|-------|-------|
-| Chat | Qwen3-30B-A3B / Qwen3.5-35B-A3B (MoE) | Current recommendation. MoE = fast decode on unified-memory Macs; 3B active on 30B/35B total runs 30–50 tok/s decode on M4 Max 128G. Hermes-style tool calling is strict — fewer loop/skip bugs. |
-| Chat (legacy) | Gemma 4 31B dense 8bit | Works but **unreliable at instruction following**: skips tool calls, loops search queries 20+ times, ignores loop-nudge system messages. Kept as fallback only. |
+| Chat | Qwen3-30B-A3B / Qwen3.5-35B-A3B (MoE) | MoE architecture: 3B active on 30B/35B total. Hermes-style tool calling is strict — very few loop/skip bugs in production. |
 | Transcription | Whisper Large v3 | `/v1/audio/transcriptions` with domain-prompt vocabulary |
 | Embedding | modernbert-embed-base (768 dim) | Async worker batches unembedded messages every 2 s |
 
 KV cache quantization (4-bit) is recommended; unified-memory Macs are
 bandwidth-bound for decode so compressing KV cache directly buys speed.
 
+**Dense models are not recommended.** Tested dense chat models on the
+same hardware had two disqualifying failure modes: (1) bandwidth-bound
+decode at long context (~5 tok/s), and (2) unreliable instruction
+following under the two-phase contract (skipping tool calls, looping
+the same search 20+ times with trivial query variations, ignoring
+system-level loop-break nudges). The harness budgets in the
+Orchestrator were originally added to survive exactly this behavior;
+on MoE models with stricter tool-calling, they rarely fire.
+
 ### Hardware baseline (M4 Max 128 GB, observed)
 
-- 31B dense 8bit: prefill ~190 tok/s, decode 4–9 tok/s (long context) — **at the bandwidth ceiling, no further tuning available**
-- 30B MoE 8bit (3B active): prefill similar, decode ~30–45 tok/s — **~5× the dense speed on this hardware**
+- 30B MoE 4bit (3B active): prefill ~200 tok/s, decode 40+ tok/s
+- 30B MoE 8bit (3B active): prefill ~180 tok/s, decode ~30 tok/s
+- For comparison, 31B dense 8bit on the same hardware maxes out at
+  4–9 tok/s decode — the bandwidth ceiling.
 
 MoE is the correct architecture for this deployment envelope.
 
@@ -557,7 +567,7 @@ third_party/ratex/           Embedded Rust LaTeX renderer (CGo)
 |-----------|--------|
 | Language | Go |
 | IM | Feishu Bot API (text, image, audio, file, rich text, interactive cards) |
-| Chat Model | Local MoE preferred (Qwen3-30B-A3B / Qwen3.5-35B-A3B); dense fallback (Gemma 4 31B) |
+| Chat Model | Local MoE (Qwen3-30B-A3B / Qwen3.5-35B-A3B) via omlx / vLLM |
 | Transcription | Whisper Large v3 via `/v1/audio/transcriptions` |
 | Embedding | modernbert-embed-base (768 dim) via `/v1/embeddings` |
 | Database | PostgreSQL + pgvector (optional, memory store fallback) |
