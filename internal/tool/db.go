@@ -6,21 +6,28 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"argus/internal/sqlsandbox"
 )
 
-// DBTool executes read-only SQL queries against the database.
+// DBTool executes read-only SQL queries against the database, rewriting
+// table references through sqlsandbox so the model can only reach its
+// own namespace of tables (see internal/sqlsandbox).
 type DBTool struct {
-	db *sql.DB
+	db     *sql.DB
+	prefix string
 }
 
 func NewDBTool(db *sql.DB) *DBTool {
-	return &DBTool{db: db}
+	return &DBTool{db: db, prefix: sqlsandbox.DefaultPrefix}
 }
 
 func (t *DBTool) Name() string { return "db" }
 
 func (t *DBTool) Description() string {
-	return "Execute a read-only SQL query against the PostgreSQL database. Returns results as a table. Use this for querying structured data like food logs, message history, etc."
+	return "Execute a read-only SQL query against your scratch database. " +
+		"You can query any tables you have previously created (e.g. food_log). " +
+		"Use standard PostgreSQL syntax. Returns results as a table."
 }
 
 func (t *DBTool) Parameters() json.RawMessage {
@@ -43,6 +50,11 @@ func (t *DBTool) Execute(ctx context.Context, arguments string) (string, error) 
 		return "", fmt.Errorf("parse arguments: %w", err)
 	}
 
+	rewritten, err := sqlsandbox.Rewrite(args.SQL, t.prefix)
+	if err != nil {
+		return "", err
+	}
+
 	// Execute in a read-only transaction for safety.
 	tx, err := t.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
@@ -50,9 +62,9 @@ func (t *DBTool) Execute(ctx context.Context, arguments string) (string, error) 
 	}
 	defer tx.Rollback()
 
-	rows, err := tx.QueryContext(ctx, args.SQL)
+	rows, err := tx.QueryContext(ctx, rewritten)
 	if err != nil {
-		return "", fmt.Errorf("execute query: %w", err)
+		return "", fmt.Errorf("execute query: %s", sqlsandbox.StripPrefix(err.Error(), t.prefix))
 	}
 	defer rows.Close()
 

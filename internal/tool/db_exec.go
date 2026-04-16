@@ -5,22 +5,30 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"strings"
+
+	"argus/internal/sqlsandbox"
 )
 
-// DBExecTool executes write SQL statements (INSERT, UPDATE, DELETE, CREATE TABLE, etc.).
+// DBExecTool executes write SQL statements (INSERT, UPDATE, DELETE, CREATE
+// TABLE, etc.), rewriting every table reference through sqlsandbox to
+// confine the model to its own namespace. System tables (messages,
+// memories, documents, chunks, schema_migrations) are unreachable because
+// the prefix reserves a disjoint namespace.
 type DBExecTool struct {
-	db *sql.DB
+	db     *sql.DB
+	prefix string
 }
 
 func NewDBExecTool(db *sql.DB) *DBExecTool {
-	return &DBExecTool{db: db}
+	return &DBExecTool{db: db, prefix: sqlsandbox.DefaultPrefix}
 }
 
 func (t *DBExecTool) Name() string { return "db_exec" }
 
 func (t *DBExecTool) Description() string {
-	return "Execute a write SQL statement (INSERT, UPDATE, DELETE, CREATE TABLE, ALTER TABLE) against the database. Returns rows affected. Use the 'db' tool for SELECT queries."
+	return "Execute a write SQL statement (INSERT, UPDATE, DELETE, CREATE TABLE, " +
+		"ALTER TABLE, CREATE INDEX) against your scratch database. Returns rows " +
+		"affected. Use the 'db' tool for SELECT queries. Only one statement per call."
 }
 
 func (t *DBExecTool) Parameters() json.RawMessage {
@@ -37,26 +45,20 @@ type dbExecArgs struct {
 	SQL string `json:"sql"`
 }
 
-// Protected tables that cannot be dropped.
-var protectedTables = []string{"messages", "schema_migrations", "memories", "documents", "chunks"}
-
 func (t *DBExecTool) Execute(ctx context.Context, arguments string) (string, error) {
 	var args dbExecArgs
 	if err := json.Unmarshal([]byte(arguments), &args); err != nil {
 		return "", fmt.Errorf("parse arguments: %w", err)
 	}
 
-	// Safety check: prevent dropping protected tables.
-	sqlLower := strings.ToLower(strings.TrimSpace(args.SQL))
-	for _, table := range protectedTables {
-		if strings.Contains(sqlLower, "drop") && strings.Contains(sqlLower, table) {
-			return "", fmt.Errorf("cannot drop protected table: %s", table)
-		}
+	rewritten, err := sqlsandbox.Rewrite(args.SQL, t.prefix)
+	if err != nil {
+		return "", err
 	}
 
-	result, err := t.db.ExecContext(ctx, args.SQL)
+	result, err := t.db.ExecContext(ctx, rewritten)
 	if err != nil {
-		return "", fmt.Errorf("execute sql: %w", err)
+		return "", fmt.Errorf("execute sql: %s", sqlsandbox.StripPrefix(err.Error(), t.prefix))
 	}
 
 	rowsAffected, _ := result.RowsAffected()

@@ -320,8 +320,8 @@ When the agent successfully completes a new type of recurring task, it uses `sav
 | `save_skill` | Create/update SKILL.md files | Always |
 | `activate_skill` | Load a skill's full instructions on demand | Always |
 | `finish_task` | Sentinel — signals orchestrator → synthesizer transition | Always |
-| `db` | Read-only SQL queries — **budget 6/turn** | When DB available |
-| `db_exec` | Write SQL (INSERT/UPDATE/CREATE TABLE) | When DB available |
+| `db` | Read-only SQL queries — **budget 6/turn**, sandboxed (see below) | When DB available |
+| `db_exec` | Write SQL (INSERT/UPDATE/CREATE TABLE), sandboxed (see below) | When DB available |
 | `remember` | Pin a persistent memory (pgvector indexed) | When DB available |
 | `forget` | Deactivate a pinned memory by ID | When DB available |
 
@@ -329,9 +329,47 @@ When the agent successfully completes a new type of recurring task, it uses `sav
 
 - `read_file` / `write_file`: paths restricted to workspace, `..` traversal blocked, `~` rejected with helpful error suggesting `cli` tool
 - `cli`: execution delegated to sandbox (local or Docker with network/memory/CPU limits)
-- `db_exec`: DROP on protected tables (messages, schema_migrations) is blocked
+- `db` / `db_exec`: all model SQL passes through `internal/sqlsandbox` (see below)
 - Tool output truncated to 16 KB to prevent context overflow
 - All tool calls logged with full arguments before execution
+
+### DB Sandboxing
+
+The model never names a system table. Every SQL statement passed to `db` or
+`db_exec` is parsed by PostgreSQL's own parser (via libpg_query) and every
+user-level table/index identifier gets the hidden prefix `argus_`. The model
+writes `SELECT * FROM food_log`; the tool executes
+`SELECT * FROM argus_food_log`. Error messages are scrubbed on the way back
+so the model never sees the prefix.
+
+Three machine-enforced rules give the **non-collision guarantee**:
+
+1. System tables (`messages`, `schema_migrations`, `memories`, `documents`,
+   `chunks`) never start with `argus_` — the namespace is reserved. A guard
+   test walks `internal/store/migrations/*.sql` and fails CI if any future
+   migration reserves a model-namespace name.
+2. Every model-issued `RangeVar` is prefixed. Full AST coverage by
+   `sandbox_test.go` catches a stray unhandled case.
+3. Inputs that already contain an `argus_`-prefixed identifier are rejected
+   outright — closes the double-prefix escape.
+
+Additional rejections: schema-qualified references
+(`public.x`, `information_schema.*`, `pg_catalog.*`), multi-statement SQL
+(`SELECT 1; DROP TABLE messages`), and `DROP` of non-relation object types
+(schemas, functions, roles, …).
+
+The old `protectedTables` DROP-string-match is gone — the namespace split
+makes it redundant.
+
+**Operational migration for existing DBs**: if an earlier version of Argus
+wrote tables under unprefixed names (e.g. `food_log`), rename them once:
+
+```sql
+ALTER TABLE food_log RENAME TO argus_food_log;
+-- repeat for indexes / sequences as needed
+```
+
+Not automated because a shared PG instance may also host unrelated tables.
 
 ---
 
@@ -527,6 +565,11 @@ internal/
     sandbox.go               Sandbox interface: Exec(ctx, command, workDir)
     local.go                 Host execution (bash -c)
     docker.go                Container execution (docker run)
+  sqlsandbox/
+    sandbox.go               SQL rewriter: AST-walk, prefix RangeVars,
+                             reject schema-qualified / pre-prefixed /
+                             multi-statement inputs; StripPrefix for errors
+    sandbox_test.go          Accept/reject corpus + migrations invariant guard
   skill/
     index.go                 SkillIndex: thread-safe catalog + prompt lookup
     loader.go                FileLoader: load builtins + rescan .skills/
