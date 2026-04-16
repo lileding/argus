@@ -59,8 +59,8 @@ Feishu message (text / image / audio / file / post)
 
 A single-phase agent asks the model to do too much at once — understand the
 request, choose tools, evaluate results, AND compose the answer. Weaker local
-models (Gemma 4, some 7–13B) skip tool calls entirely and answer from training
-memory. Splitting into two narrow roles dramatically improves reliability:
+models skip tool calls entirely and answer from training memory. Splitting
+into two narrow roles dramatically improves reliability:
 
 - **Orchestrator** only calls tools. Its system prompt forbids text answers
   ("your text output is DISCARDED"). It loops until it calls `finish_task`
@@ -212,11 +212,11 @@ All messages are handled by a local LLM via an OpenAI-compatible endpoint (omlx,
 
 | Role | Model | Notes |
 |------|-------|-------|
-| Chat | Qwen3-30B-A3B / Qwen3.5-35B-A3B (MoE) | MoE architecture: 3B active on 30B/35B total. Hermes-style tool calling is strict — very few loop/skip bugs in production. |
-| Transcription | Whisper Large v3 | `/v1/audio/transcriptions` with domain-prompt vocabulary |
-| Embedding | modernbert-embed-base (768 dim) | Async worker batches unembedded messages every 2 s |
+| Chat | **Qwen3.5-35B-A3B 8bit (MoE)** — production | 3B active on 35B total. Hermes-style tool calling is strict — very few loop/skip bugs observed in production. |
+| Transcription | Whisper Large v3 | `/v1/audio/transcriptions` with domain-prompt vocabulary (composers, tech, finance) |
+| Embedding | modernbert-embed-base (768 dim) | Async worker batches unembedded messages/memories/chunks every 2 s |
 
-KV cache quantization (4-bit) is recommended; unified-memory Macs are
+KV cache 4-bit quantization is recommended; unified-memory Macs are
 bandwidth-bound for decode so compressing KV cache directly buys speed.
 
 **Dense models are not recommended.** Tested dense chat models on the
@@ -228,14 +228,17 @@ system-level loop-break nudges). The harness budgets in the
 Orchestrator were originally added to survive exactly this behavior;
 on MoE models with stricter tool-calling, they rarely fire.
 
-### Hardware baseline (M4 Max 128 GB, observed)
+### Hardware baseline (M4 Max 128 GB)
 
-- 30B MoE 4bit (3B active): prefill ~200 tok/s, decode 40+ tok/s
-- 30B MoE 8bit (3B active): prefill ~180 tok/s, decode ~30 tok/s
-- For comparison, 31B dense 8bit on the same hardware maxes out at
-  4–9 tok/s decode — the bandwidth ceiling.
+| Config | Prefill | Decode (long ctx) | Notes |
+|---|---:|---:|---|
+| Qwen3.5-35B-A3B 8bit + KV 4bit | ~180 tok/s | ~30 tok/s | **current production** |
+| Qwen3.5-35B-A3B 4bit + KV 4bit | ~200 tok/s | 40+ tok/s | faster, slightly less accurate |
+| 31B dense 8bit (reference) | ~190 tok/s | 4–9 tok/s | bandwidth-bound ceiling |
 
-MoE is the correct architecture for this deployment envelope.
+MoE is the correct architecture for this deployment envelope: the same
+model file is ~5× faster at decode than a comparable dense model on this
+hardware.
 
 ---
 
@@ -361,15 +364,18 @@ Additional rejections: schema-qualified references
 The old `protectedTables` DROP-string-match is gone — the namespace split
 makes it redundant.
 
-**Operational migration for existing DBs**: if an earlier version of Argus
-wrote tables under unprefixed names (e.g. `food_log`), rename them once:
+**Upgrading from a pre-sandbox DB**: if a pre-sandbox deployment wrote
+tables under unprefixed names, a one-shot manual rename brings them into
+the new namespace:
 
 ```sql
+-- For each model-created table that used to exist unprefixed:
 ALTER TABLE food_log RENAME TO argus_food_log;
--- repeat for indexes / sequences as needed
+-- Indexes and sequences rename automatically with the table in PostgreSQL.
 ```
 
-Not automated because a shared PG instance may also host unrelated tables.
+Not automated because a shared PG instance may also host unrelated tables
+(e.g. Mattermost in the same cluster).
 
 ---
 
@@ -497,7 +503,7 @@ feishu:
 
 model:
   base_url: "http://localhost:8000/v1"
-  model_name: "Qwen3.5-35B-A3B-4bit"     # MoE preferred on unified-memory Macs
+  model_name: "Qwen3.5-35B-A3B-8bit"     # MoE; 4bit also works (trade accuracy for speed)
   transcription_model: "whisper-large-v3"
   api_key: "omlx"
   max_tokens: 4096
@@ -610,7 +616,7 @@ third_party/ratex/           Embedded Rust LaTeX renderer (CGo)
 |-----------|--------|
 | Language | Go |
 | IM | Feishu Bot API (text, image, audio, file, rich text, interactive cards) |
-| Chat Model | Local MoE (Qwen3-30B-A3B / Qwen3.5-35B-A3B) via omlx / vLLM |
+| Chat Model | Local MoE — Qwen3.5-35B-A3B 8bit in production, via omlx / vLLM |
 | Transcription | Whisper Large v3 via `/v1/audio/transcriptions` |
 | Embedding | modernbert-embed-base (768 dim) via `/v1/embeddings` |
 | Database | PostgreSQL + pgvector (optional, memory store fallback) |
@@ -636,4 +642,4 @@ third_party/ratex/           Embedded Rust LaTeX renderer (CGo)
 - Skills grow organically through use, not through code changes
 - All media saved to workspace for memory system reference
 - Local models handle everything; API cost approaches zero
-- Prefer MoE on unified-memory Macs — bandwidth-bound decode, dense 30B hits ~5 tok/s ceiling while a 30B/3B MoE breaks 40 tok/s
+- Prefer MoE on unified-memory Macs — bandwidth-bound decode, dense 30B hits ~5 tok/s ceiling while a 35B/3B MoE at 8bit holds ~30 tok/s in production
