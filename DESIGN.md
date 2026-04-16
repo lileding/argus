@@ -30,25 +30,55 @@ Feishu message (text / image / audio / file / post)
         ↓
    Media processing (download, save to .files/, transcribe audio)
         ↓
-   Harness (context curation)
+   Store user message (crash-safe, async embedding)
         ↓
-   LLM (local, OpenAI-compatible API)
+   ┌─────────────────────────────────────────────────────────┐
+   │ PHASE 1 — Orchestrator (tool-only)                      │
+   │   system prompt: "tools only, no text answers"          │
+   │   loop: model → tool_calls → sandbox → results → …      │
+   │   hard budgets: search≤3, fetch≤4, db≤6                 │
+   │   exits on: finish_task | budget strike-out | max iter  │
+   └─────────────────────────────────────────────────────────┘
+        ↓ (materials + summary)
+   ┌─────────────────────────────────────────────────────────┐
+   │ PHASE 2 — Synthesizer (answer-only, streaming)          │
+   │   system prompt: "use ONLY the materials, no tools"     │
+   │   single Chat call, SSE streamed token-by-token         │
+   └─────────────────────────────────────────────────────────┘
+        ↓ (streaming deltas + final reply)
+   Feishu adapter
+   ├─ thinking card       (EventThinking)
+   ├─ tool status card    (EventToolCall — humanized per tool)
+   ├─ streaming card      (EventReplyDelta — throttled 500ms)
+   └─ final card          (EventReply — LaTeX rendered, images uploaded)
         ↓
-   Tool call ──→ Sandbox.Exec ──→ Result (truncated) ──→ Continue loop
-        ↓                ↓
-   Render reply  ┌───────┴───────┐
-   (md → feishu) Local        Docker
-        ↓       (bash -c)   (docker run)
-   Send via Feishu API
-        ↓
-   Store to DB
+   Store assistant reply
 ```
 
-### Two-Phase Execution
+### Two-Phase Agent (Orchestrator + Synthesizer)
 
-Tool calls and sandbox execution are **orthogonal**:
-- **Phase 1 (Tool Layer)**: LLM outputs tool calls — defines WHAT to do
-- **Phase 2 (Sandbox Layer)**: Sandbox executes — defines WHERE to run
+A single-phase agent asks the model to do too much at once — understand the
+request, choose tools, evaluate results, AND compose the answer. Weaker local
+models (Gemma 4, some 7–13B) skip tool calls entirely and answer from training
+memory. Splitting into two narrow roles dramatically improves reliability:
+
+- **Orchestrator** only calls tools. Its system prompt forbids text answers
+  ("your text output is DISCARDED"). It loops until it calls `finish_task`
+  with a summary, gets force-stopped by the harness (see below), or hits
+  `max_iterations`.
+- **Synthesizer** only writes the answer. It receives the user question, the
+  curated history, and a `Materials` block containing every tool result and
+  the orchestrator's summary. No tools are available — it must work from
+  what Phase 1 gathered.
+
+Both phases use the same model; the difference is purely the system prompt
+and the tool list (empty for Phase 2).
+
+### Tool vs Sandbox Orthogonality
+
+These are unrelated axes:
+- **Tool layer**: the LLM outputs tool calls — defines WHAT to do
+- **Sandbox layer**: the sandbox executes — defines WHERE to run
 
 Sandboxes are configurable:
 - `local` — direct host execution via `bash -c` (development)
@@ -66,7 +96,7 @@ Argus handles all Feishu message types natively:
 | **image** | Download → save to `.files/` → base64 data URL via OpenAI vision API |
 | **post** (rich text) | Extract text + images, build multimodal message |
 | **audio** | Download → save to `.files/` → Whisper transcription → LLM post-processing → text |
-| **file** (PDF, etc.) | Download → save to `.files/` → model uses `cli` tool to process (e.g. `pdftotext`) |
+| **file** (PDF, docx, etc.) | Download → save to `.files/` → document ingester → pgvector chunks for RAG |
 
 ### Multi-Turn Vision
 
@@ -78,16 +108,25 @@ Images are saved to `workspace/.files/`. When building history context, messages
 Feishu audio → download → save .opus to .files/
     → Whisper v3 transcription (with domain vocabulary prompt)
     → LLM post-processing (add punctuation, fix domain terms)
-    → corrected text sent to model
+    → corrected text sent to orchestrator
 ```
 
 The transcription prompt includes hints for:
 - Mixed Chinese/English code-switching
-- Technology terms (API, Kubernetes, Docker, LLM, Maxwell, Transformer)
-- Finance terms (ETF, ROI, derivatives, hedge fund)
-- Arts terms (sonata, concerto, Chopin, Scriabin, Grieg, Dvořák)
+- Technology terms (API, Kubernetes, Docker, LLM, MLX, omlx, vLLM)
+- Finance terms (ETF, PE ratio, derivatives, hedge fund)
+- Classical composers in Latin + Chinese (Chopin 肖邦, Scriabin 斯克里亚宾,
+  Prokofiev 普罗科菲耶夫, Rachmaninoff 拉赫玛尼诺夫, …). Paired translit
+  helps Whisper disambiguate proper names across languages.
 
 Every transcription is post-processed by the main LLM to add punctuation and fix misheard words. The raw and corrected text are both logged for debugging.
+
+### Document RAG
+
+Non-image files (PDF, docx, etc.) go through the `docindex` ingester:
+download → extract text via sandbox CLI (`pdftotext`, `pandoc`) → chunk →
+embed each chunk → store in `chunks` table with pgvector index. The model
+can semantically search ingested documents via the agent's semantic recall.
 
 ---
 
@@ -95,87 +134,121 @@ Every transcription is post-processed by the main LLM to add punctuation and fix
 
 **Core principle: context is a scarce, finite resource. Only high-signal content goes in.**
 
-The LLM never sees raw conversation history. Every request goes through a curation pipeline:
+The LLM never sees raw conversation history. Both phases go through a curation pipeline, but they build different system prompts:
 
 ```
-User message arrives
-    ↓
-[1] System Prompt Assembly
-    - Base prompt (with behavioral rules: act don't describe, search first)
-    - Environment: today's date, home dir, workspace path
-    - Builtin skill prompts (compiled in, always present)
-    - User skill catalog (name + description only)
-    - Skill accumulation guide
-    ↓
-[2] History Curation
+User message arrives + saved to store
+        ↓
+[1] History Curation (shared by both phases)
     - Load recent N messages from store
-    - Keep only: user messages + assistant final replies
+    - Semantic recall: embed current message, pgvector search older messages
+    - Filter: user messages + assistant final replies only
     - Remove: tool_call / tool_result noise
     - Re-inject images from .files/ for multi-turn vision
-    ↓
-[3] Assemble: [system prompt] + [curated history] + [current user message]
-    ↓
-[4] Safety
-    - Tool results truncated to 16KB max
-    - Context assembled BEFORE saving user message (prevents duplicates)
-    ↓
-    Send to model
+        ↓
+[2a] Orchestrator Prompt                [2b] Synthesizer Prompt
+     - OrchestratorPrompt (tool-only         - SynthesizerPrompt (answer-only
+       rules, loop prevention)                 rules, language matching)
+     - Environment (date, workspace)          - Environment
+     - Pinned memories                        - Pinned memories
+     - Builtin skill prompts                  (no skills/tools — just compose)
+     - User skill catalog (name + desc)
+        ↓                                        ↓
+[3] Assemble                            [3] Assemble
+    [sys] + [history] + [user]              [sys] + [history] + [user]
+                                              + [materials from Phase 1]
+        ↓                                        ↓
+   Model.Chat (with tools)                  Model.ChatStream (no tools)
 ```
 
-### System Prompt Policies
+### Safety
 
-The default system prompt enforces:
-- **Act, don't describe**: "NEVER say 'I will try to...' without making the actual tool call"
-- **Search first**: "For ANY factual question, ALWAYS use the search tool first. Do NOT answer from memory alone."
-- **Date awareness**: Today's date is always injected so the model never has a wrong year
+- Tool results truncated to 16 KB max before entering context
+- Messages saved BEFORE context assembly (prevents duplicates on retry/crash)
+- Async embedding worker — saving is never blocked on the embed endpoint
+
+---
+
+## Tool Budgets & Loop Prevention
+
+Prompt-layer rules are insufficient against weak-instruction-following
+models. Argus enforces hard limits at the harness layer:
+
+| Safeguard | Trigger | Action |
+|-----------|---------|--------|
+| **Per-tool budget** | `search`≤3, `fetch`≤4, `db`≤6 calls per turn | Harness rejects further calls without dispatching; returns error "budget exhausted, call finish_task NOW" |
+| **Cumulative rejection strike-out** | 5 budget-exhausted rejections in a turn | Force-exit orchestrator, pass gathered materials to synthesizer |
+| **Tool-only retry** | First iteration produces text without tool calls | Inject "You MUST call a tool" user message, retry once |
+| **Text fallback** | Still no tool calls after retry | Use model text as synthesis summary |
+| **Max iterations** | Configurable ceiling (default 10) | Force-exit with gathered materials |
+
+Worst-case wall-clock is thus bounded: `maxIterations × (model_latency + tool_latency)`, not unbounded retry.
+
+---
+
+## Streaming
+
+Phase 2 (synthesizer) streams its output via Server-Sent Events:
+
+- `model.Client.ChatStream` returns `<-chan StreamChunk` with incremental
+  deltas from an OpenAI-compatible streaming endpoint
+- Agent emits `EventReplyDelta` with accumulated text on each chunk
+- Feishu adapter throttles card updates to at most one per 500 ms
+  (Feishu rate-limit friendly)
+- During streaming, LaTeX rendering is skipped — partial `$...$` would
+  break parsing. The final `EventReply` triggers full processing
+  (LaTeX → PNG upload → `![](image_key)` embedding)
+
+Users see the answer appear progressively instead of waiting 30–60 s
+in silence behind a static "thinking" card.
 
 ---
 
 ## Model Strategy
 
-All messages are handled by a local LLM via OpenAI-compatible API. No routing layer — the model decides implicitly through tool calling what capabilities to use.
+All messages are handled by a local LLM via an OpenAI-compatible endpoint (omlx, vLLM, or similar). No routing layer — the orchestrator decides implicitly through tool calling what capabilities to use.
 
-### Model Configuration
+### Model Choice
 
-| Role | Model | Purpose |
-|------|-------|---------|
-| Chat | Gemma 4 / Qwen / Llama (configurable) | Main conversation + tool calling |
-| Transcription | Whisper Large v3 | Audio → text via `/v1/audio/transcriptions` |
+| Role | Model | Notes |
+|------|-------|-------|
+| Chat | Qwen3-30B-A3B / Qwen3.5-35B-A3B (MoE) | Current recommendation. MoE = fast decode on unified-memory Macs; 3B active on 30B/35B total runs 30–50 tok/s decode on M4 Max 128G. Hermes-style tool calling is strict — fewer loop/skip bugs. |
+| Chat (legacy) | Gemma 4 31B dense 8bit | Works but **unreliable at instruction following**: skips tool calls, loops search queries 20+ times, ignores loop-nudge system messages. Kept as fallback only. |
+| Transcription | Whisper Large v3 | `/v1/audio/transcriptions` with domain-prompt vocabulary |
+| Embedding | modernbert-embed-base (768 dim) | Async worker batches unembedded messages every 2 s |
 
-Both models served by the same inference engine (omlx, vLLM, etc.) on the same endpoint. Prefix KV cache handled transparently by the engine.
+KV cache quantization (4-bit) is recommended; unified-memory Macs are
+bandwidth-bound for decode so compressing KV cache directly buys speed.
 
----
+### Hardware baseline (M4 Max 128 GB, observed)
 
-## Agent Loop
+- 31B dense 8bit: prefill ~190 tok/s, decode 4–9 tok/s (long context) — **at the bandwidth ceiling, no further tuning available**
+- 30B MoE 8bit (3B active): prefill similar, decode ~30–45 tok/s — **~5× the dense speed on this hardware**
 
-```
-1. Receive message (may be multimodal)
-2. Harness curates context (system prompt + history + skills)
-3. Save user message to store
-4. Call model
-5. Parse response:
-   - tool_calls → execute in sandbox → inject result (truncated) → back to 4
-   - no tool_calls → render reply → send via Feishu
-6. Save assistant reply to store
-7. Log token usage per iteration
-```
-
-Max iterations configurable (default: 10). The loop continues as long as the model returns tool calls, regardless of `finish_reason`.
+MoE is the correct architecture for this deployment envelope.
 
 ---
 
 ## Output Rendering
 
-Model output goes through a render layer before sending to Feishu:
+All agent output is delivered as **Feishu interactive cards** (`msg_type: "interactive"`), schema 2.0 with `update_multi: true` so the same card can be PATCHed multiple times as state evolves:
 
-- **Plain text** → `msg_type: "text"` (pass-through)
-- **Markdown** (detected by `**`, `#`, `[](`, `` ``` ``) → `msg_type: "post"` (Feishu rich text)
-  - `# heading` → post title
-  - `**bold**` → bold element
-  - `[text](url)` → link element
-  - Code blocks → preserved as text
-  - Lists → bullet prefixed
-- **LaTeX** (future) → render to PNG via sandbox, upload as Feishu image
+1. **Thinking card** — emoji + "Thinking…" / "正在思考…" (language auto-detected)
+2. **Tool status card** — humanized per tool, e.g.
+   - `🔍 正在搜索: 普罗科菲耶夫` / `🔍 Searching: Prokofiev`
+   - `📖 读取文件: report.pdf`
+   - `⚙️ 执行: pdftotext ...`
+   - `🎯 加载技能: stock-analysis`
+3. **Streaming reply card** — markdown content updated every ~500 ms during synthesis
+4. **Final reply card** — raw markdown + LaTeX images
+
+### LaTeX Rendering
+
+Display LaTeX blocks (`$$…$$` or `\[…\]`) are detected in the final reply,
+rendered to PNG via the embedded **RaTeX** renderer (Rust, via CGo),
+uploaded to Feishu as images, and inline-replaced with
+`[[IMG:image_key]]` markers — which the Feishu card's markdown block
+renders as images.
 
 ---
 
@@ -185,9 +258,9 @@ Skills follow the [Agent Skills open standard](https://agentskills.io) (same SKI
 
 ### Two Types
 
-**Builtin skills** — compiled into the binary, platform-conditional (`//go:build unix` / `windows`). Their full prompt is always injected into the system prompt. Example: `posix-cli` teaches the model how to use grep, find, awk, sed, jq, pipelines, and enforces rules like "NEVER use `ls -R`, ALWAYS use `find`".
+**Builtin skills** — compiled into the binary, platform-conditional (`//go:build unix` / `windows`). Their full prompt is always injected into the orchestrator system prompt. Example: `posix-cli` teaches the model how to use grep, find, awk, sed, jq, pipelines, and enforces rules like "NEVER use `ls -R`, ALWAYS use `find`".
 
-**User skills** — SKILL.md files in `workspace/.skills/`, created by the agent via `save_skill` or by the user manually. Loaded at startup, background-rescanned every 30s. Only name + description appear in the system prompt catalog; full prompt loaded via `activate_skill` tool on demand.
+**User skills** — SKILL.md files in `workspace/.skills/`, created by the agent via `save_skill` or by the user manually. Loaded at startup, background-rescanned every 30 s. Only name + description appear in the orchestrator's system prompt catalog; full prompt loaded via `activate_skill` tool on demand.
 
 User skills with the same name as a builtin override it.
 
@@ -231,20 +304,23 @@ When the agent successfully completes a new type of recurring task, it uses `sav
 | `read_file` | Read file contents (workspace-relative paths) | Always |
 | `write_file` | Write file contents (auto-creates directories) | Always |
 | `cli` | Execute shell commands via sandbox | Always |
-| `search` | Web search (DuckDuckGo, no API key needed) | Always |
-| `fetch` | Fetch URL content as text (HTML → readable text) | Always |
-| `current_time` | Get current date/time with timezone support | Always |
+| `search` | Web search (DuckDuckGo, no API key) — **budget 3/turn** | Always |
+| `fetch` | URL → readable text — **budget 4/turn** | Always |
+| `current_time` | Date/time with timezone support | Always |
 | `save_skill` | Create/update SKILL.md files | Always |
 | `activate_skill` | Load a skill's full instructions on demand | Always |
-| `db` | Read-only SQL queries | When DB available |
+| `finish_task` | Sentinel — signals orchestrator → synthesizer transition | Always |
+| `db` | Read-only SQL queries — **budget 6/turn** | When DB available |
 | `db_exec` | Write SQL (INSERT/UPDATE/CREATE TABLE) | When DB available |
+| `remember` | Pin a persistent memory (pgvector indexed) | When DB available |
+| `forget` | Deactivate a pinned memory by ID | When DB available |
 
 ### Safety
 
 - `read_file` / `write_file`: paths restricted to workspace, `..` traversal blocked, `~` rejected with helpful error suggesting `cli` tool
 - `cli`: execution delegated to sandbox (local or Docker with network/memory/CPU limits)
 - `db_exec`: DROP on protected tables (messages, schema_migrations) is blocked
-- Tool output truncated to 16KB to prevent context window overflow
+- Tool output truncated to 16 KB to prevent context overflow
 - All tool calls logged with full arguments before execution
 
 ---
@@ -257,45 +333,95 @@ All downloaded media is saved to `workspace/.files/`:
 workspace/.files/
   img_v3_xxx.png          # Feishu images
   file_v3_xxx.opus        # Voice messages
-  file_v3_xxx.pdf         # Uploaded files
+  file_v3_xxx.pdf         # Uploaded files → ingested into pgvector
 ```
 
 Files are named by their Feishu file key + original extension. This directory serves as:
 - Source for multi-turn image re-injection into context
-- Archive for the future memory system to reference
-- Input for model processing (e.g. `pdftotext` on PDFs)
+- Source for document RAG ingestion
+- Archive for the memory system to reference
 
 ---
 
 ## Memory
 
-**Current**: fixed window (last 20 messages) + history curation (tool noise removed, images re-injected).
+Argus has three memory layers, all active:
 
-**Future**:
-- Short-term summaries: generated async after conversations
-- Long-term memory: daily user profile generation
-- Semantic recall: pgvector cosine similarity search
+| Layer | Scope | Mechanism |
+|-------|-------|-----------|
+| **Sliding window** | Last `context_window` messages | Direct load from `messages` table |
+| **Semantic recall** | All historical messages | pgvector cosine search on the current message's embedding, deduped against the window |
+| **Pinned memories** | User-curated persistent notes | `memories` table; agent uses `remember`/`forget` tools; pgvector embeds them for recall |
+
+### Startup Repair
+
+On server startup, the `RepairableStore` interface runs:
+- `RepairStuckDocuments` — mark stuck-in-processing docs as failed
+- `RepairOrphanChunks` — clean chunks pointing at missing documents
+- `CountUnembeddedMessages` — warn if embedding backlog
+- `FailedTranscriptions` — warn on persistent audio failures
 
 ---
 
-## Data Model (PostgreSQL)
+## Data Model (PostgreSQL + pgvector)
 
 ```sql
+-- Core conversation history
 CREATE TABLE messages (
-    id           BIGSERIAL PRIMARY KEY,
-    chat_id      TEXT NOT NULL,
-    role         TEXT NOT NULL,
-    content      TEXT NOT NULL,
-    tool_name    TEXT,
+    id          BIGSERIAL PRIMARY KEY,
+    chat_id     TEXT NOT NULL,
+    role        TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    tool_name   TEXT,
     tool_call_id TEXT,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    -- metadata
+    source_im   TEXT NOT NULL DEFAULT 'unknown',  -- feishu / cli / cron
+    channel     TEXT NOT NULL DEFAULT '',
+    source_ts   TIMESTAMPTZ,
+    msg_type    TEXT NOT NULL DEFAULT 'text',     -- text / image / audio / file
+    file_paths  TEXT[],
+    sender_id   TEXT,
+    embedding   vector(768),                      -- nullable; async-filled
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE INDEX ON messages (chat_id, created_at);
+
+-- Agent-curated persistent memories
+CREATE TABLE memories (
+    id         BIGSERIAL PRIMARY KEY,
+    content    TEXT NOT NULL,
+    category   TEXT NOT NULL DEFAULT 'general',
+    embedding  vector(768),
+    active     BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Document RAG
+CREATE TABLE documents (
+    id         BIGSERIAL PRIMARY KEY,
+    filename   TEXT NOT NULL,
+    file_path  TEXT NOT NULL,
+    channel    TEXT,
+    status     TEXT NOT NULL DEFAULT 'pending',  -- pending / processing / done / failed
+    error_msg  TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE chunks (
+    id          BIGSERIAL PRIMARY KEY,
+    document_id BIGINT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    chunk_index INT NOT NULL,
+    content     TEXT NOT NULL,
+    embedding   vector(768),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 ```
 
-Database is optional — server mode falls back to memory store if PostgreSQL is unavailable. Business tables (e.g. food_log) are created dynamically by the agent via `db_exec`.
+IVFFlat cosine indexes on all three embedding columns. Agent-created business tables (e.g. `food_log`) live alongside these and are created dynamically via `db_exec`.
 
-`docker-compose.yaml` provided for one-command PostgreSQL setup: `make up`.
+Database is optional — server mode falls back to memory store if PostgreSQL is unavailable, though semantic recall, pinned memories, and document RAG are disabled in that mode.
+
+`docker-compose.yaml` provided for one-command PostgreSQL+pgvector setup: `make up`.
 
 ---
 
@@ -303,7 +429,7 @@ Database is optional — server mode falls back to memory store if PostgreSQL is
 
 Background goroutine runs a cron scheduler, independent of user interaction:
 - Jobs defined in config (name, hour, minute, target chat_id, prompt)
-- Each job runs `agent.Handle()` and pushes the result via Feishu
+- Each job runs `agent.Handle()` (synchronous wrapper over the two-phase stream) and pushes the result via Feishu
 
 ---
 
@@ -313,18 +439,21 @@ Single config file at `<workspace>/config.yaml`. CLI flag: `--workspace <dir>`.
 
 ```yaml
 server:
-  port: "8080"
+  port: "8088"
 
 feishu:
   app_id: ""
   app_secret: ""
+  verification_token: ""
+  encrypt_key: ""
 
 model:
   base_url: "http://localhost:8000/v1"
-  model_name: "gemma-4-27b"
+  model_name: "Qwen3.5-35B-A3B-4bit"     # MoE preferred on unified-memory Macs
   transcription_model: "whisper-large-v3"
+  api_key: "omlx"
   max_tokens: 4096
-  timeout: 120s
+  timeout: 240s
 
 database:
   dsn: "postgres://argus:argus@localhost:5432/argus?sslmode=disable"
@@ -332,13 +461,20 @@ database:
 agent:
   max_iterations: 10
   context_window: 20
-  skills_dir: ".skills"
   skill_rescan: 30s
 
+embedding:
+  enabled: true
+  model_name: "modernbert-embed-base"
+  batch_size: 32
+  interval: 2s
+
 sandbox:
-  type: local
+  type: local             # "local" for dev, "docker" for production
   image: argus-sandbox
   timeout: 30s
+  memory_limit: "512m"    # docker only
+  network: "none"         # docker only
 
 cron:
   jobs: []
@@ -349,53 +485,68 @@ cron:
 ## Project Structure
 
 ```
-cmd/argus/main.go           Entry point, --workspace and --mode flags
+cmd/argus/main.go            Entry point, --workspace and --mode flags
 internal/
   agent/
-    agent.go                Agent loop: tool call → sandbox exec → iterate
-    harness.go              Context curation: prompt assembly, history filtering,
-                            image re-injection, date injection
-  config/config.go          YAML config + env overrides
-  cron/cron.go              Daily job scheduler
+    agent.go                 Two-phase orchestrator + streaming synthesizer
+    harness.go               Context curation: history + two prompt builders
+    prompts.go               OrchestratorPrompt + SynthesizerPrompt constants
+    event.go                 Event types: Thinking, ToolCall, ToolResult,
+                             ReplyDelta, Reply, Error
+  config/config.go           YAML config + env overrides
+  cron/cron.go               Daily job scheduler
+  docindex/ingest.go         Document RAG ingester (chunk + embed)
+  embedding/
+    client.go                Embedding HTTP client (OpenAI-compatible)
+    worker.go                Async worker: embed unembedded messages/memories/chunks
   feishu/
-    handler.go              Webhook handler: text/image/audio/file/post messages,
-                            media download, audio transcription + LLM correction
-    client.go               Feishu API: reply, send, upload image, download resources
-    event.go                Event type definitions
-    dedup.go                Event ID deduplication
+    handler.go               Webhook handler; media download; audio pipeline
+    client.go                Feishu API: reply, send, upload image, download
+    event.go                 Event type definitions
+    dedup.go                 Event ID deduplication
+    adapter.go               Agent events → Feishu card PATCHes (throttled)
+    card.go                  Interactive card builders + per-tool humanizer
   model/
-    model.go                Client interface (Chat + Transcribe)
-    openai.go               OpenAI-compatible implementation (chat + whisper)
-    types.go                Message (multimodal), ContentPart, ToolCall, Response, Usage
+    model.go                 Client interface: Chat + ChatStream + Transcribe
+    openai.go                OpenAI-compatible impl (JSON + SSE + multipart)
+    types.go                 Message (multimodal), ToolCall, Response, Usage
   render/
-    feishu.go               Markdown → Feishu post format converter
-    latex.go                LaTeX detection + rendering (via sandbox)
+    renderer.go              Processor: markdown → LaTeX images → markers
+    latex.go                 LaTeX detection + RaTeX PNG rendering
   sandbox/
-    sandbox.go              Sandbox interface: Exec(ctx, command, workDir)
-    local.go                Host execution (bash -c)
-    docker.go               Container execution (docker run)
+    sandbox.go               Sandbox interface: Exec(ctx, command, workDir)
+    local.go                 Host execution (bash -c)
+    docker.go                Container execution (docker run)
   skill/
-    index.go                SkillIndex: thread-safe in-memory index + catalog
-    loader.go               FileLoader: load builtins + scan .skills/ + background rescan
-    builtin.go              BuiltinSkills() dispatcher
-    builtin_unix.go         POSIX CLI skill (grep/find/awk/sed/jq)
-    builtin_windows.go      PowerShell CLI skill
+    index.go                 SkillIndex: thread-safe catalog + prompt lookup
+    loader.go                FileLoader: load builtins + rescan .skills/
+    builtin.go               Builtin dispatcher
+    builtin_unix.go          POSIX CLI skill (grep/find/awk/sed/jq)
+    builtin_windows.go       PowerShell CLI skill
   store/
-    store.go                Store interface
-    postgres.go             PostgreSQL + embedded migrations
-    memory.go               In-memory store (CLI / no-DB mode)
+    store.go                 Interface + sub-interfaces (Semantic, Pinned,
+                             Document, Repairable)
+    postgres.go              PostgreSQL + pgvector + embedded migrations
+    memory.go                In-memory store (CLI / no-DB mode)
+    repair.go                Startup repair helpers
+    migrations/
+      001_init.sql           messages table
+      002_memory_system.sql  pgvector + memories + documents + chunks
   tool/
-    tool.go                 Tool interface + ToModelToolDef
-    registry.go             Tool registry with name-filtered lookup
-    file.go                 read_file + write_file (workspace-restricted)
-    cli.go                  Shell commands (delegates to sandbox)
-    search.go               DuckDuckGo web search
-    fetch.go                URL fetcher with HTML-to-text conversion
-    current_time.go         Date/time with timezone support
-    db.go / db_exec.go      Database read/write
-    save_skill.go           Create SKILL.md files
-    activate_skill.go       Load skill prompt on demand
-    context.go              ChatID context key for tools
+    tool.go                  Tool interface + ToolDef conversion
+    registry.go              Registry with name lookup
+    file.go                  read_file + write_file (workspace-restricted)
+    cli.go                   Shell commands (delegates to sandbox)
+    search.go                DuckDuckGo web search
+    fetch.go                 URL fetcher with HTML-to-text conversion
+    current_time.go          Date/time with timezone support
+    db.go / db_exec.go       Database read/write
+    save_skill.go            Create SKILL.md files
+    activate_skill.go        Load skill prompt on demand
+    remember.go / forget.go  Pinned memory management
+    finish_task.go           Sentinel tool (orchestrator exit signal)
+    context.go               ChatID context key for tools
+third_party/ratex/           Embedded Rust LaTeX renderer (CGo)
 ```
 
 ---
@@ -405,13 +556,16 @@ internal/
 | Component | Choice |
 |-----------|--------|
 | Language | Go |
-| IM | Feishu Bot API (text, image, audio, file, rich text) |
-| Chat Model | Any local model via OpenAI-compatible API (omlx, vLLM, Ollama) |
+| IM | Feishu Bot API (text, image, audio, file, rich text, interactive cards) |
+| Chat Model | Local MoE preferred (Qwen3-30B-A3B / Qwen3.5-35B-A3B); dense fallback (Gemma 4 31B) |
 | Transcription | Whisper Large v3 via `/v1/audio/transcriptions` |
-| Database | PostgreSQL (optional, falls back to memory) |
+| Embedding | modernbert-embed-base (768 dim) via `/v1/embeddings` |
+| Database | PostgreSQL + pgvector (optional, memory store fallback) |
 | Sandbox | Local (dev) / Docker (prod) |
 | Web Search | DuckDuckGo HTML (no API key) |
-| Output Render | Markdown → Feishu rich text post format |
+| LaTeX | RaTeX (Rust, CGo-embedded) → PNG → Feishu image |
+| Output Format | Feishu interactive cards (schema 2.0, update_multi) |
+| Streaming | SSE from model → throttled card PATCH (500 ms) |
 | Skills | SKILL.md files (Agent Skills standard) + compiled builtins |
 | Deployment | Single binary, `--workspace` flag, `docker-compose.yaml` for PostgreSQL |
 
@@ -421,10 +575,12 @@ internal/
 
 - No "sessions", only a timeline
 - Context is scarce — only high-signal tokens (Harness Engineering)
-- Act, don't describe — model must call tools, not narrate plans
-- Search first — factual questions use web search, not training data
+- **Trust no single model output** — harness enforces hard safety limits,
+  not prompts
+- Two narrow roles beat one wide role (Orchestrator + Synthesizer)
 - Tool calls and execution are orthogonal (tool layer × sandbox layer)
 - Builtin skills compiled in with platform build tags; user skills are files
 - Skills grow organically through use, not through code changes
-- All media saved to workspace for future memory system reference
+- All media saved to workspace for memory system reference
 - Local models handle everything; API cost approaches zero
+- Prefer MoE on unified-memory Macs — bandwidth-bound decode, dense 30B hits ~5 tok/s ceiling while a 30B/3B MoE breaks 40 tok/s
