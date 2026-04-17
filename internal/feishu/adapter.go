@@ -30,15 +30,21 @@ func NewAdapter(client *Client, processor MarkdownProcessor) *Adapter {
 
 // HandleEvents consumes an agent event stream and updates Feishu messages accordingly.
 // triggerMessageID is the incoming Feishu message to reply to.
+// existingReplyID is the thinking card already sent by the handler (may be "").
 // userText is the user's message text (for language detection).
-func (a *Adapter) HandleEvents(ch <-chan agent.Event, triggerMessageID, userText string) {
+func (a *Adapter) HandleEvents(ch <-chan agent.Event, triggerMessageID, existingReplyID, userText string) {
 	lang := detectLang(userText)
-	var replyMsgID string
+	replyMsgID := existingReplyID
 	var lastStreamUpdate time.Time
 
 	for ev := range ch {
 		switch ev.Type {
 		case agent.EventThinking:
+			// Handler already sent the thinking card. If it failed (replyMsgID==""),
+			// try again here as a fallback.
+			if replyMsgID != "" {
+				continue
+			}
 			cardJSON := ThinkingCard(lang)
 			id, err := a.client.ReplyRichWithID(triggerMessageID, "interactive", cardJSON)
 			if err != nil {
@@ -55,6 +61,15 @@ func (a *Adapter) HandleEvents(ch <-chan agent.Event, triggerMessageID, userText
 			cardJSON := ToolStatusCard(p.Name, p.Arguments, lang)
 			if err := a.client.UpdateMessage(replyMsgID, cardJSON); err != nil {
 				slog.Debug("update tool status", "err", err)
+			}
+
+		case agent.EventComposing:
+			if replyMsgID == "" {
+				continue
+			}
+			cardJSON := ComposingCard(lang)
+			if err := a.client.UpdateMessage(replyMsgID, cardJSON); err != nil {
+				slog.Debug("update composing status", "err", err)
 			}
 
 		case agent.EventReplyDelta:
@@ -107,4 +122,18 @@ func detectLang(text string) string {
 		}
 	}
 	return "en"
+}
+
+// quickDetectLang does a fast language detection on raw Feishu message
+// content JSON. Used by the handler to pick the thinking-card language
+// before the full message is built. Falls back to "zh" if undetermined
+// (the primary user is Chinese).
+func quickDetectLang(rawContentJSON string) string {
+	for _, r := range rawContentJSON {
+		if r >= 0x4E00 && r <= 0x9FFF {
+			return "zh"
+		}
+	}
+	// Default to Chinese for audio/image messages where no text exists yet.
+	return "zh"
 }

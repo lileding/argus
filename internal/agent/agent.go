@@ -95,6 +95,9 @@ func (a *Agent) HandleStream(ctx context.Context, chatID string, userMsg model.M
 		// Phase 1: Orchestration — collect materials via tool calls.
 		toolResults, finishSummary := a.runOrchestrator(ctx, ch, userMsg, userText, history)
 
+		// Signal transition: orchestrator done, synthesizer starting.
+		ch <- Event{Type: EventComposing}
+
 		// Phase 2: Synthesis — compose final answer from materials.
 		reply := a.runSynthesizer(ctx, ch, userMsg, userText, history, toolResults, finishSummary)
 

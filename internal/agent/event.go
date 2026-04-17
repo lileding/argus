@@ -7,6 +7,7 @@ const (
 	EventThinking   EventType = iota // agent started processing
 	EventToolCall                    // about to call a tool
 	EventToolResult                  // tool returned
+	EventComposing                   // orchestrator done, synthesizer starting
 	EventReplyDelta                  // partial reply text (streaming synthesis)
 	EventReply                       // final text reply
 	EventError                       // error occurred

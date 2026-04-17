@@ -23,6 +23,15 @@ func ThinkingCard(lang string) string {
 	return buildCard(text)
 }
 
+// ComposingCard builds a "composing answer" status card.
+func ComposingCard(lang string) string {
+	text := "✍️ Composing answer..."
+	if lang == "zh" {
+		text = "✍️ 正在撰写回复..."
+	}
+	return buildCard(text)
+}
+
 // ToolStatusCard builds a human-readable status card for a tool call.
 // Parses the tool arguments to show specific, meaningful status text.
 func ToolStatusCard(toolName, argsJSON, lang string) string {

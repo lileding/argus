@@ -18,8 +18,9 @@ import (
 	"argus/internal/store"
 )
 
-// MessageHandler is called to process an incoming message.
-type MessageHandler func(chatID string, msg model.Message, messageID string)
+// MessageHandler is called to process an incoming message. replyMsgID is the
+// ID of the thinking card already sent to the user (may be "" if sending failed).
+type MessageHandler func(chatID string, msg model.Message, messageID, replyMsgID string)
 
 // Transcriber can transcribe audio files to text.
 type Transcriber interface {
@@ -118,9 +119,25 @@ func (h *Handler) processEvent(envelope EventEnvelope) {
 		return
 	}
 
-	msg, err := h.buildMessage(msgEvent)
+	// Send thinking card IMMEDIATELY — before any media download or
+	// transcription. This gives the user instant visual feedback.
+	lang := quickDetectLang(msgEvent.Message.Content)
+	var replyMsgID string
+	cardJSON := ThinkingCard(lang)
+	id, err := h.client.ReplyRichWithID(msgEvent.Message.MessageID, "interactive", cardJSON)
 	if err != nil {
-		slog.Warn("unsupported message", "type", msgEvent.Message.MessageType, "err", err)
+		slog.Warn("send early thinking card", "err", err)
+	} else {
+		replyMsgID = id
+	}
+
+	msg, buildErr := h.buildMessage(msgEvent)
+	if buildErr != nil {
+		slog.Warn("unsupported message", "type", msgEvent.Message.MessageType, "err", buildErr)
+		// Clean up the thinking card on failure.
+		if replyMsgID != "" {
+			h.client.UpdateMessage(replyMsgID, MarkdownToCard("(unsupported message type)"))
+		}
 		return
 	}
 
@@ -131,7 +148,6 @@ func (h *Handler) processEvent(envelope EventEnvelope) {
 		MsgType:  msgEvent.Message.MessageType,
 		SenderID: msgEvent.Sender.SenderID.OpenID,
 	}
-	// Extract file paths from message text if present (saved by build*Message methods).
 	if msg.Meta.FilePaths == nil {
 		msg.Meta.FilePaths = []string{}
 	}
@@ -143,7 +159,7 @@ func (h *Handler) processEvent(envelope EventEnvelope) {
 		"text", msg.TextContent(),
 	)
 
-	h.onMsg(chatID, msg, msgEvent.Message.MessageID)
+	h.onMsg(chatID, msg, msgEvent.Message.MessageID, replyMsgID)
 }
 
 func (h *Handler) buildMessage(event MessageEvent) (model.Message, error) {

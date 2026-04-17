@@ -248,10 +248,10 @@ func runServer(cfg *config.Config) {
 	processor := render.NewProcessor(feishuClient)
 	adapter := feishu.NewAdapter(feishuClient, processor)
 
-	onMsg := func(chatID string, msg model.Message, messageID string) {
+	onMsg := func(chatID string, msg model.Message, messageID, replyMsgID string) {
 		slog.Info("handling message", "chat_id", chatID, "msg_text", msg.TextContent())
 		ch := ag.HandleStream(ctx, chatID, msg)
-		adapter.HandleEvents(ch, messageID, msg.TextContent())
+		adapter.HandleEvents(ch, messageID, replyMsgID, msg.TextContent())
 	}
 
 	// Document store for RAG indexing (nil if not available).
