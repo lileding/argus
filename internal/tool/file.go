@@ -9,9 +9,10 @@ import (
 	"strings"
 )
 
-// workspacePath resolves a relative path within the workspace, preventing directory traversal.
+// workspacePath resolves a path within the workspace, preventing directory traversal.
+// Accepts both relative paths ("foo/bar.txt") and absolute paths that land within
+// the workspace ("/Users/x/workspace/foo/bar.txt"). Rejects everything else.
 func workspacePath(workspaceDir, path string) (string, error) {
-	// Expand ~ to indicate it's not supported here.
 	if strings.HasPrefix(path, "~") {
 		return "", fmt.Errorf("path %q uses ~, which is not supported. Use paths relative to the workspace (%s), or use the cli tool for files outside the workspace", path, workspaceDir)
 	}
@@ -19,7 +20,11 @@ func workspacePath(workspaceDir, path string) (string, error) {
 	cleaned := filepath.Clean(path)
 
 	if filepath.IsAbs(cleaned) {
-		return "", fmt.Errorf("absolute path %q not allowed. Use paths relative to the workspace (%s), or use the cli tool (e.g. cat %s) for files outside the workspace", path, workspaceDir, path)
+		// Allow absolute paths that resolve within the workspace.
+		if strings.HasPrefix(cleaned, workspaceDir+string(filepath.Separator)) || cleaned == workspaceDir {
+			return cleaned, nil
+		}
+		return "", fmt.Errorf("absolute path %q is outside the workspace (%s). Use paths relative to the workspace, or use the cli tool", path, workspaceDir)
 	}
 	if strings.HasPrefix(cleaned, "..") {
 		return "", fmt.Errorf("path %q escapes workspace (%s). Use the cli tool for files outside the workspace", path, workspaceDir)
@@ -64,6 +69,19 @@ type readFileArgs struct {
 	Path string `json:"path"`
 }
 
+// binaryDescs maps file extensions to human-readable descriptions.
+// Files with these extensions are returned as a summary instead of raw bytes,
+// since dumping binary content into a text-only LLM context is useless.
+var binaryDescs = map[string]string{
+	".png": "PNG image", ".jpg": "JPEG image", ".jpeg": "JPEG image",
+	".gif": "GIF image", ".webp": "WebP image", ".bmp": "BMP image",
+	".opus": "Opus audio", ".mp3": "MP3 audio", ".wav": "WAV audio",
+	".ogg": "Ogg audio", ".m4a": "AAC audio",
+	".mp4": "MP4 video", ".mov": "MOV video", ".avi": "AVI video",
+	".zip": "ZIP archive", ".tar": "tar archive", ".gz": "gzip archive",
+	".bin": "binary file",
+}
+
 func (t *ReadFileTool) Execute(_ context.Context, arguments string) (string, error) {
 	var args readFileArgs
 	if err := json.Unmarshal([]byte(arguments), &args); err != nil {
@@ -73,6 +91,20 @@ func (t *ReadFileTool) Execute(_ context.Context, arguments string) (string, err
 	fullPath, err := workspacePath(t.workspaceDir, args.Path)
 	if err != nil {
 		return "", err
+	}
+
+	// Detect binary files by extension and return a description instead
+	// of raw bytes — a text-only model cannot interpret binary content.
+	ext := strings.ToLower(filepath.Ext(fullPath))
+	if desc, ok := binaryDescs[ext]; ok {
+		info, statErr := os.Stat(fullPath)
+		if statErr != nil {
+			return "", fmt.Errorf("read file: %w", statErr)
+		}
+		return fmt.Sprintf("Binary file: %s (%.1f KB). Cannot be read as text. "+
+			"If this is an image the user sent, its content is described in the conversation history — "+
+			"check previous user messages for a text description of what was in the image.",
+			desc, float64(info.Size())/1024), nil
 	}
 
 	data, err := os.ReadFile(fullPath)
