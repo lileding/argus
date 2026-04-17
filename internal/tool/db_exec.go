@@ -58,9 +58,36 @@ func (t *DBExecTool) Execute(ctx context.Context, arguments string) (string, err
 
 	result, err := t.db.ExecContext(ctx, rewritten)
 	if err != nil {
-		return "", fmt.Errorf("execute sql: %s", sqlsandbox.StripPrefix(err.Error(), t.prefix))
+		errMsg := sqlsandbox.StripPrefix(err.Error(), t.prefix)
+		hint := schemaHintForExec(ctx, t.db, rewritten, t.prefix)
+		if hint != "" {
+			errMsg += "\n\n" + hint
+		}
+		return "", fmt.Errorf("execute sql: %s", errMsg)
 	}
 
 	rowsAffected, _ := result.RowsAffected()
 	return fmt.Sprintf("OK, %d rows affected", rowsAffected), nil
 }
+
+// schemaHintForExec reuses the same hint logic as DBTool. Extracted as a
+// function rather than a method since DBExecTool is a different type.
+func schemaHintForExec(ctx context.Context, db *sql.DB, rewrittenSQL, prefix string) string {
+	tableName := extractFirstTable(rewrittenSQL, prefix)
+	if tableName == "" {
+		return ""
+	}
+	row := db.QueryRowContext(ctx,
+		`SELECT string_agg(column_name || ' ' || data_type, ', ' ORDER BY ordinal_position)
+		 FROM information_schema.columns
+		 WHERE table_schema = 'public' AND table_name = $1`,
+		tableName)
+	var cols string
+	if err := row.Scan(&cols); err != nil || cols == "" {
+		return ""
+	}
+	visible := sqlsandbox.StripPrefix(tableName, prefix)
+	return fmt.Sprintf("Hint: table %q has columns: %s", visible, cols)
+}
+
+// extractFirstTable is defined in db.go (same package).

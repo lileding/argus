@@ -64,7 +64,12 @@ func (t *DBTool) Execute(ctx context.Context, arguments string) (string, error) 
 
 	rows, err := tx.QueryContext(ctx, rewritten)
 	if err != nil {
-		return "", fmt.Errorf("execute query: %s", sqlsandbox.StripPrefix(err.Error(), t.prefix))
+		errMsg := sqlsandbox.StripPrefix(err.Error(), t.prefix)
+		hint := t.schemaHint(ctx, rewritten, t.prefix)
+		if hint != "" {
+			errMsg += "\n\n" + hint
+		}
+		return "", fmt.Errorf("execute query: %s", errMsg)
 	}
 	defer rows.Close()
 
@@ -108,4 +113,64 @@ func (t *DBTool) Execute(ctx context.Context, arguments string) (string, error) 
 
 	sb.WriteString(fmt.Sprintf("\n(%d rows)", rowCount))
 	return sb.String(), nil
+}
+
+// schemaHint extracts the first table name from a failed query's rewritten
+// SQL and returns the column list for that table, so the model can self-
+// correct on the next iteration (e.g. fix "date" → "meal_date"). Returns
+// "" if we can't determine the table or it doesn't exist.
+func (t *DBTool) schemaHint(ctx context.Context, rewrittenSQL, prefix string) string {
+	// Extract table name from error context by querying the first argus_
+	// prefixed table used in the query. We use a simple heuristic: find
+	// the first FROM/INTO/TABLE token followed by an argus_ identifier.
+	tableName := extractFirstTable(rewrittenSQL, prefix)
+	if tableName == "" {
+		return ""
+	}
+
+	row := t.db.QueryRowContext(ctx,
+		`SELECT string_agg(column_name || ' ' || data_type, ', ' ORDER BY ordinal_position)
+		 FROM information_schema.columns
+		 WHERE table_schema = 'public' AND table_name = $1`,
+		tableName)
+
+	var cols string
+	if err := row.Scan(&cols); err != nil || cols == "" {
+		return ""
+	}
+	// Return using the model-visible (unprefixed) name.
+	visible := sqlsandbox.StripPrefix(tableName, prefix)
+	return fmt.Sprintf("Hint: table %q has columns: %s", visible, cols)
+}
+
+// extractFirstTable finds the first argus_-prefixed identifier that follows
+// a FROM/INTO/TABLE keyword in the SQL.
+func extractFirstTable(sql, prefix string) string {
+	lower := strings.ToLower(sql)
+	for _, kw := range []string{"from ", "into ", "table "} {
+		idx := strings.Index(lower, kw)
+		if idx < 0 {
+			continue
+		}
+		rest := strings.TrimSpace(sql[idx+len(kw):])
+		// Table name may be quoted or bare.
+		name := extractIdentifier(rest)
+		if strings.HasPrefix(strings.ToLower(name), strings.ToLower(prefix)) {
+			return name
+		}
+	}
+	return ""
+}
+
+func extractIdentifier(s string) string {
+	var end int
+	for end < len(s) {
+		c := s[end]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
+			end++
+		} else {
+			break
+		}
+	}
+	return s[:end]
 }
