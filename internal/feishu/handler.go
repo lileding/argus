@@ -153,6 +153,7 @@ func (h *Handler) processEvent(envelope EventEnvelope) {
 		MsgID:        msg.ID,
 		ChatID:       chatID,
 		TriggerMsgID: msgEvent.Message.MessageID,
+		Lang:         quickDetectLang(msgEvent.Message.Content),
 		ReadyCh:      readyCh,
 	}
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"time"
 
 	"argus/internal/agent"
 	"argus/internal/store"
@@ -16,6 +17,7 @@ type QueuedMessage struct {
 	MsgID        int64
 	ChatID       string
 	TriggerMsgID string
+	Lang         string        // pre-detected language ("zh"/"en") for thinking card
 	ReadyCh      chan struct{} // closed when media processing is done
 }
 
@@ -141,7 +143,11 @@ func (d *Dispatcher) processChat(chatID string, ch chan QueuedMessage) {
 		// Open thinking card immediately — user sees instant feedback.
 		replyChannelID := ""
 		if msg.TriggerMsgID != "" {
-			cardJSON := ThinkingCard("zh") // default; will be replaced by real content
+			lang := msg.Lang
+			if lang == "" {
+				lang = "zh"
+			}
+			cardJSON := ThinkingCard(lang)
 			if id, err := d.client.ReplyRichWithID(msg.TriggerMsgID, "interactive", cardJSON); err != nil {
 				slog.Warn("dispatcher: send thinking card", "msg_id", msg.MsgID, "err", err)
 			} else {
@@ -149,8 +155,18 @@ func (d *Dispatcher) processChat(chatID string, ch chan QueuedMessage) {
 			}
 		}
 
-		// Wait for media processing to complete.
-		<-msg.ReadyCh
+		// Wait for media processing to complete (with safety timeout).
+		select {
+		case <-msg.ReadyCh:
+			// normal path
+		case <-time.After(2 * time.Minute):
+			slog.Error("dispatcher: media processing timed out, skipping",
+				"chat_id", chatID, "msg_id", msg.MsgID)
+			if replyChannelID != "" {
+				d.client.UpdateMessage(replyChannelID, MarkdownToCard("⚠️ Message processing timed out."))
+			}
+			continue
+		}
 
 		// Reload processed content from DB.
 		claimed, err := d.store.ClaimNextReply(ctx, chatID)
