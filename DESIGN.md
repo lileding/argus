@@ -25,35 +25,69 @@ One assistant, one memory, one timeline. The user never needs to "start a new se
 
 ## Architecture
 
+### Three-Stage Pipeline
+
+Message processing is a DB-driven pipeline with per-chat serialization.
+The `messages.reply_status` column is the conveyor belt:
+
 ```
-Feishu message (text / image / audio / file / post)
-        ↓
-   Media processing (download, save to .files/, transcribe audio)
-        ↓
-   Store user message (crash-safe, async embedding)
-        ↓
-   ┌─────────────────────────────────────────────────────────┐
-   │ PHASE 1 — Orchestrator (tool-only)                      │
-   │   system prompt: "tools only, no text answers"          │
-   │   loop: model → tool_calls → sandbox → results → …      │
-   │   hard budgets: search≤3, fetch≤4, db≤6                 │
-   │   exits on: finish_task | budget strike-out | max iter  │
-   └─────────────────────────────────────────────────────────┘
-        ↓ (materials + summary)
-   ┌─────────────────────────────────────────────────────────┐
-   │ PHASE 2 — Synthesizer (answer-only, streaming)          │
-   │   system prompt: "use ONLY the materials, no tools"     │
-   │   single Chat call, SSE streamed token-by-token         │
-   └─────────────────────────────────────────────────────────┘
-        ↓ (streaming deltas + final reply)
-   Feishu adapter
-   ├─ thinking card       (EventThinking)
-   ├─ tool status card    (EventToolCall — humanized per tool)
-   ├─ streaming card      (EventReplyDelta — throttled 500ms)
-   └─ final card          (EventReply — LaTeX rendered, images uploaded)
-        ↓
-   Store assistant reply
+received → filtering → ready → processing → done
 ```
+
+```
+IM message arrives
+    ↓
+┌─ HANDLER (inbound) ────────────────────────────────────────┐
+│  parse webhook → INSERT raw message JSON → status=received │
+│  fully reentrant: no lock, no download, sub-millisecond    │
+└────────────────────────────────────────────────────────────┘
+    ↓ filterCh (notify)
+┌─ FILTER ───────────────────────────────────────────────────┐
+│  download media → transcribe audio → LLM correction        │
+│  send thinking card (ACK) → store reply_channel_id         │
+│  UPDATE content to processed text → status=ready           │
+└────────────────────────────────────────────────────────────┘
+    ↓ dispatchCh (notify)
+┌─ DISPATCHER ───────────────────────────────────────────────┐
+│  per-chat serial: sync.Map ensures 1 goroutine per chat    │
+│  different chats run in parallel                            │
+│  ┌─ Orchestrator (Phase 1) ─────────────────────────────┐  │
+│  │  tools only, hard budgets, finish_task sentinel       │  │
+│  └──────────────────────────────────────────────────────┘  │
+│  ┌─ Synthesizer (Phase 2, streaming) ───────────────────┐  │
+│  │  SSE token stream → card updates (500ms throttle)     │  │
+│  └──────────────────────────────────────────────────────┘  │
+│  save assistant reply → status=done                        │
+└────────────────────────────────────────────────────────────┘
+    ↓ (events)
+HANDLER (outbound) — event-driven card updates:
+  💭 正在思考 → 🔍 搜索中 → ✍️ 撰写中 → streaming → final
+```
+
+Each stage communicates via **DB (source of truth) + channel (low-latency
+notification) + 5s periodic scan (safety net)**. If the server crashes,
+`RecoverQueue` on startup resets `processing→ready` and
+`filtering→received`, then re-drives the pipeline from where it left off.
+
+### Per-Chat Serialization
+
+Within a single chat, messages are processed strictly FIFO. The
+Dispatcher's `sync.Map` guards: at most one goroutine per chatID.
+Different chats run fully in parallel.
+
+The Handler's inbound path is completely reentrant — 5 messages arriving
+simultaneously for the same chat all get INSERT'd in sub-millisecond time
+and queued for sequential processing. No message is dropped or blocked.
+
+### reply_channel_id Abstraction
+
+The reply card handle is IM-agnostic:
+- **Feishu**: message_id from ReplyRichWithID (used for PATCH updates)
+- **Slack** (future): message ts
+- **CLI**: empty string
+
+The Adapter uses this handle to drive the card lifecycle without knowing
+which IM created it.
 
 ### Two-Phase Agent (Orchestrator + Synthesizer)
 
@@ -92,11 +126,15 @@ Argus handles all Feishu message types natively:
 
 | Message Type | Processing |
 |-------------|-----------|
-| **text** | Direct to model |
-| **image** | Download → save to `.files/` → base64 data URL via OpenAI vision API |
-| **post** (rich text) | Extract text + images, build multimodal message |
-| **audio** | Download → save to `.files/` → Whisper transcription → LLM post-processing → text |
-| **file** (PDF, docx, etc.) | Download → save to `.files/` → document ingester → pgvector chunks for RAG |
+| **text** | Handler stores raw JSON → Filter extracts text → ready |
+| **image** | Handler stores raw JSON → Filter downloads to `.files/` → ready |
+| **post** (rich text) | Handler stores raw JSON → Filter extracts text + downloads images → ready |
+| **audio** | Handler stores raw JSON → Filter downloads `.opus` → Whisper → LLM correction → ready |
+| **file** (PDF, docx, etc.) | Handler stores raw JSON → Filter downloads to `.files/` → registers for RAG → ready |
+
+All media processing happens in the **Filter** stage, not the Handler. The
+Handler's inbound path is sub-millisecond: it persists the raw Feishu
+content JSON and returns immediately.
 
 ### Multi-Turn Vision
 
@@ -137,7 +175,7 @@ can semantically search ingested documents via the agent's semantic recall.
 The LLM never sees raw conversation history. Both phases go through a curation pipeline, but they build different system prompts:
 
 ```
-User message arrives + saved to store
+Dispatcher claims a 'ready' message from the queue
         ↓
 [1] History Curation (shared by both phases)
     - Load recent N messages from store
@@ -246,14 +284,15 @@ hardware.
 
 All agent output is delivered as **Feishu interactive cards** (`msg_type: "interactive"`), schema 2.0 with `update_multi: true` so the same card can be PATCHed multiple times as state evolves:
 
-1. **Thinking card** — emoji + "Thinking…" / "正在思考…" (language auto-detected)
-2. **Tool status card** — humanized per tool, e.g.
-   - `🔍 正在搜索: 普罗科菲耶夫` / `🔍 Searching: Prokofiev`
-   - `📖 读取文件: report.pdf`
-   - `⚙️ 执行: pdftotext ...`
-   - `🎯 加载技能: stock-analysis`
-3. **Streaming reply card** — markdown content updated every ~500 ms during synthesis
-4. **Final reply card** — raw markdown + LaTeX images
+1. **Thinking card** — sent by Filter as ACK ("💭 正在思考…")
+2. **Tool status card** — humanized per tool (e.g. `🔍 正在搜索: X`)
+3. **Composing card** — Phase 1→2 transition ("✍️ 正在撰写回复…")
+4. **Streaming reply card** — markdown content updated every ~500 ms
+5. **Final reply card** — full markdown + LaTeX images
+
+All cards are PATCHed onto the same `reply_channel_id` created by the
+thinking card. The adapter receives events from the Dispatcher (which
+runs the agent) and drives the card lifecycle.
 
 ### LaTeX Rendering
 
@@ -436,7 +475,11 @@ CREATE TABLE messages (
     file_paths  TEXT[],
     sender_id   TEXT,
     embedding   vector(768),                      -- nullable; async-filled
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- Pipeline queue (user messages only; NULL for assistant/tool msgs)
+    reply_status     TEXT,                        -- received/filtering/ready/processing/done
+    reply_channel_id TEXT,                        -- IM-abstract card handle (set on ACK)
+    trigger_msg_id   TEXT                         -- IM trigger message ID (reply thread root)
 );
 
 -- Agent-curated persistent memories
@@ -542,7 +585,9 @@ cron:
 cmd/argus/main.go            Entry point, --workspace and --mode flags
 internal/
   agent/
-    agent.go                 Two-phase orchestrator + streaming synthesizer
+    agent.go                 Two-phase orchestrator + streaming synthesizer;
+                             HandleStreamQueued for pipeline mode,
+                             HandleStream/Handle for CLI/Cron
     harness.go               Context curation: history + two prompt builders
     prompts.go               OrchestratorPrompt + SynthesizerPrompt constants
     event.go                 Event types: Thinking, ToolCall, ToolResult,
@@ -554,12 +599,15 @@ internal/
     client.go                Embedding HTTP client (OpenAI-compatible)
     worker.go                Async worker: embed unembedded messages/memories/chunks
   feishu/
-    handler.go               Webhook handler; media download; audio pipeline
+    handler.go               Webhook inbound: parse → store raw → notify Filter
+    filter.go                FeishuFilter: media download, Whisper transcribe,
+                             LLM correction, thinking card ACK, status→ready
+    dispatcher.go            Per-chat serial agent dispatch (sync.Map guard)
+    adapter.go               Agent events → card PATCHes (throttled streaming)
     client.go                Feishu API: reply, send, upload image, download
+    card.go                  Interactive card builders + per-tool humanizer
     event.go                 Event type definitions
     dedup.go                 Event ID deduplication
-    adapter.go               Agent events → Feishu card PATCHes (throttled)
-    card.go                  Interactive card builders + per-tool humanizer
   model/
     model.go                 Client interface: Chat + ChatStream + Transcribe
     openai.go                OpenAI-compatible impl (JSON + SSE + multipart)
@@ -584,13 +632,14 @@ internal/
     builtin_windows.go       PowerShell CLI skill
   store/
     store.go                 Interface + sub-interfaces (Semantic, Pinned,
-                             Document, Repairable)
-    postgres.go              PostgreSQL + pgvector + embedded migrations
+                             Document, QueueStore)
+    postgres.go              PostgreSQL + pgvector + QueueStore + migrations
     memory.go                In-memory store (CLI / no-DB mode)
     repair.go                Startup repair helpers
     migrations/
       001_init.sql           messages table
       002_memory_system.sql  pgvector + memories + documents + chunks
+      003_message_queue.sql  reply_status + reply_channel_id + trigger_msg_id
   tool/
     tool.go                  Tool interface + ToolDef conversion
     registry.go              Registry with name lookup
@@ -638,6 +687,10 @@ third_party/ratex/           Embedded Rust LaTeX renderer (CGo)
   not prompts
 - Two narrow roles beat one wide role (Orchestrator + Synthesizer)
 - Tool calls and execution are orthogonal (tool layer × sandbox layer)
+- **Store first, process later** — MQTT QoS=1: persist the message before
+  any processing or acknowledgment. Crash at any point = no data loss
+- **Per-chat serial, cross-chat parallel** — DB-driven queue with
+  `sync.Map` guard ensures FIFO within a chat, full parallelism across chats
 - Builtin skills compiled in with platform build tags; user skills are files
 - Skills grow organically through use, not through code changes
 - All media saved to workspace for memory system reference
