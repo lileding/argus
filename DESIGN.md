@@ -25,59 +25,74 @@ One assistant, one memory, one timeline. The user never needs to "start a new se
 
 ## Architecture
 
-### Three-Stage Pipeline
+### Handler + Dispatcher (Channel-per-Chat)
 
-Message processing is a DB-driven pipeline with per-chat serialization.
-The `messages.reply_status` column is the conveyor belt:
+Message processing has two components. The `messages.reply_status` column
+is the DB-side state machine:
 
 ```
-received → filtering → ready → processing → done
+notReady → ready → processing → done
 ```
 
 ```
 IM message arrives
     ↓
-┌─ HANDLER (inbound) ────────────────────────────────────────┐
-│  parse webhook → INSERT raw message JSON → status=received │
-│  fully reentrant: no lock, no download, sub-millisecond    │
-└────────────────────────────────────────────────────────────┘
-    ↓ filterCh (notify)
-┌─ FILTER ───────────────────────────────────────────────────┐
-│  download media → transcribe audio → LLM correction        │
-│  send thinking card (ACK) → store reply_channel_id         │
-│  UPDATE content to processed text → status=ready           │
-└────────────────────────────────────────────────────────────┘
-    ↓ dispatchCh (notify)
-┌─ DISPATCHER ───────────────────────────────────────────────┐
-│  per-chat serial: sync.Map ensures 1 goroutine per chat    │
-│  different chats run in parallel                            │
-│  ┌─ Orchestrator (Phase 1) ─────────────────────────────┐  │
-│  │  tools only, hard budgets, finish_task sentinel       │  │
-│  └──────────────────────────────────────────────────────┘  │
-│  ┌─ Synthesizer (Phase 2, streaming) ───────────────────┐  │
-│  │  SSE token stream → card updates (500ms throttle)     │  │
-│  └──────────────────────────────────────────────────────┘  │
-│  save assistant reply → status=done                        │
-└────────────────────────────────────────────────────────────┘
-    ↓ (events)
-HANDLER (outbound) — event-driven card updates:
-  💭 正在思考 → 🔍 搜索中 → ✍️ 撰写中 → streaming → final
+HANDLER (fully reentrant, sub-millisecond)
+  ├─ parse webhook
+  ├─ INSERT raw message JSON → status=notReady
+  ├─ push QueuedMessage{ReadyCh} to Dispatcher's per-chat channel
+  └─ go ProcessMedia(msg, readyCh)
+       ├─ download media / transcribe audio / LLM correction
+       ├─ UPDATE content → processed text
+       ├─ UPDATE status → ready
+       └─ close(readyCh)
+    ↓
+DISPATCHER (one goroutine per chat, MPSC channel)
+  ├─ pop from channel
+  ├─ open thinking card IMMEDIATELY (one card per chat)
+  ├─ <-msg.ReadyCh  ← blocks until media goroutine finishes
+  │     (text = instant, audio = ~5s while card shows "thinking")
+  ├─ ClaimNextReply from DB (ready → processing)
+  ├─ Orchestrator (Phase 1): tools only, hard budgets
+  ├─ Synthesizer (Phase 2): SSE streaming → throttled card updates
+  ├─ FinishReply (processing → done)
+  └─ loop: pop next message from channel
 ```
 
-Each stage communicates via **DB (source of truth) + channel (low-latency
-notification) + 5s periodic scan (safety net)**. If the server crashes,
-`RecoverQueue` on startup resets `processing→ready` and
-`filtering→received`, then re-drives the pipeline from where it left off.
+There is no separate Filter stage. Media processing is an async goroutine
+per message, synchronized with the Dispatcher via a `chan struct{}`
+(`ReadyCh`). This solves the card-timing problem:
 
-### Per-Chat Serialization
+- **Card opens immediately**: Dispatcher pops → opens card before
+  waiting on ReadyCh. The user sees "💭 thinking" the instant the
+  Dispatcher reaches their message.
+- **At most one card per chat**: Dispatcher processes one message at a
+  time per chat. The next message's card only appears after the
+  previous reply is sent.
+- **No wasted wait for text messages**: ProcessMedia for text is just
+  a JSON parse — ReadyCh is closed before the Dispatcher even reads it.
 
-Within a single chat, messages are processed strictly FIFO. The
-Dispatcher's `sync.Map` guards: at most one goroutine per chatID.
-Different chats run fully in parallel.
+### Per-Chat FIFO Serialization
+
+Each chat gets a buffered `chan QueuedMessage` (MPSC: Handler pushes,
+Dispatcher's goroutine consumes). Created lazily on first push via
+`sync.Map.LoadOrStore`. Different chats run fully in parallel.
 
 The Handler's inbound path is completely reentrant — 5 messages arriving
-simultaneously for the same chat all get INSERT'd in sub-millisecond time
-and queued for sequential processing. No message is dropped or blocked.
+simultaneously for the same chat each do INSERT + channel push in
+sub-millisecond time. The Dispatcher drains them strictly FIFO.
+
+### Crash Recovery
+
+On startup, `Dispatcher.Recover`:
+1. `processing → ready` in DB (agent was mid-run → re-process)
+2. `notReady` messages → re-spawn `ProcessMedia` goroutines
+   (media download was interrupted → retry from scratch)
+3. `ready` messages → push to chat channels with pre-closed ReadyCh
+
+DB `source_im` + `msg_type` tell the recovery code which media
+processor to spawn (currently only Feishu; future IMs register their
+own processors).
 
 ### reply_channel_id Abstraction
 
@@ -126,15 +141,17 @@ Argus handles all Feishu message types natively:
 
 | Message Type | Processing |
 |-------------|-----------|
-| **text** | Handler stores raw JSON → Filter extracts text → ready |
-| **image** | Handler stores raw JSON → Filter downloads to `.files/` → ready |
-| **post** (rich text) | Handler stores raw JSON → Filter extracts text + downloads images → ready |
-| **audio** | Handler stores raw JSON → Filter downloads `.opus` → Whisper → LLM correction → ready |
-| **file** (PDF, docx, etc.) | Handler stores raw JSON → Filter downloads to `.files/` → registers for RAG → ready |
+| **text** | Handler stores raw JSON → `ProcessMedia` extracts text (instant) |
+| **image** | Handler stores raw JSON → `ProcessMedia` downloads to `.files/` |
+| **post** (rich text) | Handler stores raw JSON → `ProcessMedia` extracts text + downloads images |
+| **audio** | Handler stores raw JSON → `ProcessMedia` downloads `.opus` → Whisper → LLM correction |
+| **file** (PDF, docx, etc.) | Handler stores raw JSON → `ProcessMedia` downloads to `.files/` → registers for RAG |
 
-All media processing happens in the **Filter** stage, not the Handler. The
-Handler's inbound path is sub-millisecond: it persists the raw Feishu
-content JSON and returns immediately.
+All media processing runs in an async goroutine (`ProcessMedia`) spawned
+by the Handler. The Handler's inbound path is sub-millisecond: INSERT +
+channel push + goroutine spawn. The Dispatcher opens the thinking card
+immediately on pop, then blocks on the goroutine's `ReadyCh` until
+content is ready.
 
 ### Multi-Turn Vision
 
@@ -175,7 +192,7 @@ can semantically search ingested documents via the agent's semantic recall.
 The LLM never sees raw conversation history. Both phases go through a curation pipeline, but they build different system prompts:
 
 ```
-Dispatcher claims a 'ready' message from the queue
+Dispatcher pops a message, waits on ReadyCh, claims from DB
         ↓
 [1] History Curation (shared by both phases)
     - Load recent N messages from store
@@ -284,7 +301,7 @@ hardware.
 
 All agent output is delivered as **Feishu interactive cards** (`msg_type: "interactive"`), schema 2.0 with `update_multi: true` so the same card can be PATCHed multiple times as state evolves:
 
-1. **Thinking card** — sent by Filter as ACK ("💭 正在思考…")
+1. **Thinking card** — sent by Dispatcher on pop ("💭 正在思考…")
 2. **Tool status card** — humanized per tool (e.g. `🔍 正在搜索: X`)
 3. **Composing card** — Phase 1→2 transition ("✍️ 正在撰写回复…")
 4. **Streaming reply card** — markdown content updated every ~500 ms
@@ -477,7 +494,7 @@ CREATE TABLE messages (
     embedding   vector(768),                      -- nullable; async-filled
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     -- Pipeline queue (user messages only; NULL for assistant/tool msgs)
-    reply_status     TEXT,                        -- received/filtering/ready/processing/done
+    reply_status     TEXT,                        -- notReady/ready/processing/done
     reply_channel_id TEXT,                        -- IM-abstract card handle (set on ACK)
     trigger_msg_id   TEXT                         -- IM trigger message ID (reply thread root)
 );
@@ -599,10 +616,11 @@ internal/
     client.go                Embedding HTTP client (OpenAI-compatible)
     worker.go                Async worker: embed unembedded messages/memories/chunks
   feishu/
-    handler.go               Webhook inbound: parse → store raw → notify Filter
-    filter.go                FeishuFilter: media download, Whisper transcribe,
-                             LLM correction, thinking card ACK, status→ready
-    dispatcher.go            Per-chat serial agent dispatch (sync.Map guard)
+    handler.go               Webhook inbound (INSERT + channel push +
+                             spawn ProcessMedia goroutine); media
+                             processing (download, Whisper, LLM correction)
+    dispatcher.go            Per-chat MPSC channel, thinking card on pop,
+                             ReadyCh wait, agent dispatch, crash recovery
     adapter.go               Agent events → card PATCHes (throttled streaming)
     client.go                Feishu API: reply, send, upload image, download
     card.go                  Interactive card builders + per-tool humanizer
@@ -689,8 +707,9 @@ third_party/ratex/           Embedded Rust LaTeX renderer (CGo)
 - Tool calls and execution are orthogonal (tool layer × sandbox layer)
 - **Store first, process later** — MQTT QoS=1: persist the message before
   any processing or acknowledgment. Crash at any point = no data loss
-- **Per-chat serial, cross-chat parallel** — DB-driven queue with
-  `sync.Map` guard ensures FIFO within a chat, full parallelism across chats
+- **Per-chat serial, cross-chat parallel** — MPSC channel per chat with
+  async media goroutines; `ReadyCh` synchronizes content readiness without
+  polling or state tracking
 - Builtin skills compiled in with platform build tags; user skills are files
 - Skills grow organically through use, not through code changes
 - All media saved to workspace for memory system reference
