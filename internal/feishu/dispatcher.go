@@ -19,18 +19,20 @@ type Dispatcher struct {
 	agent   *agent.Agent
 	adapter *Adapter
 
-	active sync.Map    // chatID → struct{}: at most one goroutine per chat
-	notify chan string  // chatID notification (non-blocking send)
+	active sync.Map      // chatID → struct{}: at most one goroutine per chat
+	notify <-chan string // chatID notification from upstream (Filter)
 	quit   chan struct{}
 	wg     sync.WaitGroup
 }
 
-func NewDispatcher(st store.QueueStore, ag *agent.Agent, adapter *Adapter) *Dispatcher {
+// NewDispatcher creates a Dispatcher. notify is the channel that upstream
+// (Filter) sends chatID notifications on when a message becomes 'ready'.
+func NewDispatcher(st store.QueueStore, ag *agent.Agent, adapter *Adapter, notify <-chan string) *Dispatcher {
 	return &Dispatcher{
 		store:   st,
 		agent:   ag,
 		adapter: adapter,
-		notify:  make(chan string, 256),
+		notify:  notify,
 		quit:    make(chan struct{}),
 	}
 }
@@ -52,13 +54,13 @@ func (d *Dispatcher) Start(ctx context.Context) {
 		}
 	}
 
-	// Re-notify for any 'ready' messages left from before the crash.
+	// Directly process any 'ready' messages left from before the crash.
 	readyChats, err := d.store.PendingChats(ctx)
 	if err != nil {
 		slog.Error("dispatcher: pending chats", "err", err)
 	}
 	for _, chatID := range readyChats {
-		d.Notify(chatID)
+		d.tryProcess(chatID)
 	}
 
 	d.wg.Add(1)
@@ -72,15 +74,8 @@ func (d *Dispatcher) Stop() {
 	slog.Info("dispatcher stopped")
 }
 
-// Notify signals that chatID has new work available. Non-blocking.
-func (d *Dispatcher) Notify(chatID string) {
-	select {
-	case d.notify <- chatID:
-	default:
-		// Channel full — the periodic scan will catch it.
-		slog.Debug("dispatcher: notify channel full, relying on scan", "chat_id", chatID)
-	}
-}
+// Notification comes from the upstream channel (Filter writes to it).
+// No Notify method needed — the dispatcher reads from the channel directly.
 
 func (d *Dispatcher) run() {
 	defer d.wg.Done()

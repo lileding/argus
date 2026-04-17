@@ -248,12 +248,6 @@ func runServer(cfg *config.Config) {
 	processor := render.NewProcessor(feishuClient)
 	adapter := feishu.NewAdapter(feishuClient, processor)
 
-	onMsg := func(chatID string, msg model.Message, messageID, replyMsgID string) {
-		slog.Info("handling message", "chat_id", chatID, "msg_text", msg.TextContent())
-		ch := ag.HandleStream(ctx, chatID, msg)
-		adapter.HandleEvents(ch, messageID, replyMsgID, msg.TextContent())
-	}
-
 	// Document store for RAG indexing (nil if not available).
 	var docReg feishu.DocRegisterer
 	if ds, ok := st.(store.DocumentStore); ok {
@@ -265,7 +259,31 @@ func runServer(cfg *config.Config) {
 		defer ingester.Stop()
 	}
 
-	handler := feishu.NewHandler(feishuClient, cfg.Feishu, cfg.Agent.WorkspaceDir, modelClient, modelClient, docReg, onMsg)
+	// Pipeline: Handler → Filter → Dispatcher.
+	// QueueStore: use PostgresStore if DB available, else MemoryStore.
+	var qs store.QueueStore
+	if ps, ok := st.(*store.PostgresStore); ok {
+		qs = ps
+	} else {
+		qs = st.(*store.MemoryStore)
+	}
+
+	// Channels for inter-stage notification.
+	filterCh := make(chan string, 256)
+	dispatchCh := make(chan string, 256)
+
+	// Dispatcher: per-chat serial agent processing.
+	dispatcher := feishu.NewDispatcher(qs, ag, adapter, dispatchCh)
+	dispatcher.Start(ctx)
+	defer dispatcher.Stop()
+
+	// Filter: media download + transcription + ACK (thinking card).
+	filter := feishu.NewFeishuFilter(feishuClient, modelClient, modelClient, docReg, qs, cfg.Agent.WorkspaceDir, dispatchCh)
+	filter.StartWorker(filterCh)
+	defer filter.Stop()
+
+	// Handler: pure inbound (store + notify) + outbound (event-driven).
+	handler := feishu.NewHandler(feishuClient, cfg.Feishu, cfg.Agent.WorkspaceDir, qs, feishu.NewFilterChanNotifier(filterCh))
 
 	// Cron scheduler.
 	scheduler := setupCron(cfg, ag, feishuClient, processor, ctx)

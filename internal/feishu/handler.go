@@ -2,7 +2,6 @@ package feishu
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,9 +17,27 @@ import (
 	"argus/internal/store"
 )
 
-// MessageHandler is called to process an incoming message. replyMsgID is the
-// ID of the thinking card already sent to the user (may be "" if sending failed).
-type MessageHandler func(chatID string, msg model.Message, messageID, replyMsgID string)
+// FilterNotifier is used by Handler to notify the Filter that a new message
+// is available for processing.
+type FilterNotifier interface {
+	Notify(chatID string)
+}
+
+// filterChanNotifier wraps a channel as a FilterNotifier.
+type filterChanNotifier struct {
+	ch chan<- string
+}
+
+func NewFilterChanNotifier(ch chan<- string) FilterNotifier {
+	return &filterChanNotifier{ch: ch}
+}
+
+func (n *filterChanNotifier) Notify(chatID string) {
+	select {
+	case n.ch <- chatID:
+	default:
+	}
+}
 
 // Transcriber can transcribe audio files to text.
 type Transcriber interface {
@@ -37,31 +54,28 @@ type DocRegisterer interface {
 	SaveDocument(ctx context.Context, doc *store.Document) error
 }
 
-// Handler handles Feishu webhook events.
+// Handler handles Feishu webhook events. Inbound: parse + store to DB + notify
+// Filter. All media processing is done by the Filter, not the Handler.
 type Handler struct {
 	client       *Client
-	transcriber  Transcriber
-	corrector    Corrector
-	docStore     DocRegisterer // nil if not available
+	store        store.QueueStore
 	dedup        *Dedup
 	cfg          config.FeishuConfig
 	workspaceDir string
-	onMsg        MessageHandler
+	filterNotify FilterNotifier
 }
 
-func NewHandler(client *Client, cfg config.FeishuConfig, workspaceDir string, transcriber Transcriber, corrector Corrector, docStore DocRegisterer, onMsg MessageHandler) *Handler {
+func NewHandler(client *Client, cfg config.FeishuConfig, workspaceDir string, st store.QueueStore, filterNotify FilterNotifier) *Handler {
 	filesDir := filepath.Join(workspaceDir, ".files")
 	os.MkdirAll(filesDir, 0755)
 
 	return &Handler{
 		client:       client,
-		transcriber:  transcriber,
-		corrector:    corrector,
-		docStore:     docStore,
+		store:        st,
 		dedup:        NewDedup(5 * time.Minute),
 		cfg:          cfg,
 		workspaceDir: workspaceDir,
-		onMsg:        onMsg,
+		filterNotify: filterNotify,
 	}
 }
 
@@ -102,6 +116,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	go h.processEvent(envelope)
 }
 
+// processEvent is the inbound path: parse envelope → store raw message → notify Filter.
+// Fully reentrant — no per-chat locking, no media download, no agent call.
 func (h *Handler) processEvent(envelope EventEnvelope) {
 	if envelope.Header.EventType != "im.message.receive_v1" {
 		return
@@ -119,280 +135,39 @@ func (h *Handler) processEvent(envelope EventEnvelope) {
 		return
 	}
 
-	// Send thinking card IMMEDIATELY — before any media download or
-	// transcription. This gives the user instant visual feedback.
-	lang := quickDetectLang(msgEvent.Message.Content)
-	var replyMsgID string
-	cardJSON := ThinkingCard(lang)
-	id, err := h.client.ReplyRichWithID(msgEvent.Message.MessageID, "interactive", cardJSON)
-	if err != nil {
-		slog.Warn("send early thinking card", "err", err)
-	} else {
-		replyMsgID = id
+	// Store raw message immediately (QoS=1: persist before anything else).
+	msg := &store.StoredMessage{
+		ChatID:       chatID,
+		Role:         "user",
+		Content:      msgEvent.Message.Content, // raw Feishu JSON
+		SourceIM:     "feishu",
+		Channel:      chatID,
+		MsgType:      msgEvent.Message.MessageType,
+		SenderID:     msgEvent.Sender.SenderID.OpenID,
+		TriggerMsgID: msgEvent.Message.MessageID,
 	}
-
-	msg, buildErr := h.buildMessage(msgEvent)
-	if buildErr != nil {
-		slog.Warn("unsupported message", "type", msgEvent.Message.MessageType, "err", buildErr)
-		// Clean up the thinking card on failure.
-		if replyMsgID != "" {
-			h.client.UpdateMessage(replyMsgID, MarkdownToCard("(unsupported message type)"))
-		}
+	if err := h.store.SaveMessageQueued(context.Background(), msg); err != nil {
+		slog.Error("handler: save message", "err", err)
 		return
 	}
 
-	// Populate metadata for persistence.
-	msg.Meta = &model.MessageMeta{
-		SourceIM: "feishu",
-		Channel:  chatID,
-		MsgType:  msgEvent.Message.MessageType,
-		SenderID: msgEvent.Sender.SenderID.OpenID,
-	}
-	if msg.Meta.FilePaths == nil {
-		msg.Meta.FilePaths = []string{}
-	}
-
-	slog.Info("message received",
+	slog.Info("message queued",
+		"msg_id", msg.ID,
 		"chat_id", chatID,
 		"chat_type", msgEvent.Message.ChatType,
 		"msg_type", msgEvent.Message.MessageType,
-		"text", msg.TextContent(),
 	)
 
-	h.onMsg(chatID, msg, msgEvent.Message.MessageID, replyMsgID)
+	// Notify Filter that there's work.
+	h.filterNotify.Notify(chatID)
 }
 
-func (h *Handler) buildMessage(event MessageEvent) (model.Message, error) {
-	switch event.Message.MessageType {
-	case "text":
-		return h.buildTextMessage(event)
-	case "image":
-		return h.buildImageMessage(event)
-	case "post":
-		return h.buildPostMessage(event)
-	case "audio":
-		return h.buildAudioMessage(event)
-	case "file":
-		return h.buildFileMessage(event)
-	default:
-		return model.Message{}, fmt.Errorf("unsupported message type: %s", event.Message.MessageType)
-	}
-}
+// The build*Message, downloadAndSaveMedia, and correctTranscription methods
+// have moved to filter.go (FeishuFilter). Handler no longer does media
+// processing — it stores the raw message and lets Filter handle the rest.
 
-func (h *Handler) buildTextMessage(event MessageEvent) (model.Message, error) {
-	var content TextContent
-	if err := json.Unmarshal([]byte(event.Message.Content), &content); err != nil {
-		return model.Message{}, fmt.Errorf("parse text content: %w", err)
-	}
-	return model.NewTextMessage(model.RoleUser, content.Text), nil
-}
-
-func (h *Handler) buildImageMessage(event MessageEvent) (model.Message, error) {
-	var content struct {
-		ImageKey string `json:"image_key"`
-	}
-	if err := json.Unmarshal([]byte(event.Message.Content), &content); err != nil {
-		return model.Message{}, fmt.Errorf("parse image content: %w", err)
-	}
-
-	filePath, dataURL, err := h.downloadAndSaveMedia(event.Message.MessageID, content.ImageKey, "image", ".png")
-	if err != nil {
-		slog.Warn("image download failed", "err", err)
-		return model.NewTextMessage(model.RoleUser, "[User sent an image that could not be downloaded]"), nil
-	}
-
-	slog.Info("media saved", "type", "image", "path", filePath)
-	return model.NewMultimodalMessage(model.RoleUser,
-		fmt.Sprintf("The user sent an image (saved at %s). Describe or analyze it as needed.", filePath),
-		dataURL,
-	), nil
-}
-
-func (h *Handler) buildPostMessage(event MessageEvent) (model.Message, error) {
-	var raw json.RawMessage
-	if err := json.Unmarshal([]byte(event.Message.Content), &raw); err != nil {
-		return model.Message{}, fmt.Errorf("parse post content: %w", err)
-	}
-
-	text, imageKeys := extractPostContent(raw)
-
-	if len(imageKeys) == 0 {
-		if text == "" {
-			text = "[Empty post message]"
-		}
-		return model.NewTextMessage(model.RoleUser, text), nil
-	}
-
-	var dataURLs []string
-	var savedPaths []string
-	for _, key := range imageKeys {
-		filePath, dataURL, err := h.downloadAndSaveMedia(event.Message.MessageID, key, "image", ".png")
-		if err != nil {
-			slog.Warn("post image download failed", "image_key", key, "err", err)
-			continue
-		}
-		dataURLs = append(dataURLs, dataURL)
-		savedPaths = append(savedPaths, filePath)
-	}
-
-	if text == "" {
-		text = "The user sent images. Describe or analyze them as needed."
-	}
-	if len(savedPaths) > 0 {
-		text += fmt.Sprintf(" (images saved at: %s)", strings.Join(savedPaths, ", "))
-	}
-
-	if len(dataURLs) == 0 {
-		return model.NewTextMessage(model.RoleUser, text), nil
-	}
-
-	return model.NewMultimodalMessage(model.RoleUser, text, dataURLs...), nil
-}
-
-func (h *Handler) buildAudioMessage(event MessageEvent) (model.Message, error) {
-	var content struct {
-		FileKey  string `json:"file_key"`
-		Duration int    `json:"duration"`
-	}
-	if err := json.Unmarshal([]byte(event.Message.Content), &content); err != nil {
-		return model.Message{}, fmt.Errorf("parse audio content: %w", err)
-	}
-
-	filePath, _, err := h.downloadAndSaveMedia(event.Message.MessageID, content.FileKey, "file", ".opus")
-	if err != nil {
-		slog.Warn("audio download failed", "err", err)
-		return model.NewTextMessage(model.RoleUser, "[User sent a voice message that could not be downloaded]"), nil
-	}
-
-	slog.Info("media saved", "type", "audio", "path", filePath, "duration_ms", content.Duration)
-
-	// Read the saved file for transcription.
-	absPath := filepath.Join(h.workspaceDir, filePath)
-	audioData, err2 := os.ReadFile(absPath)
-	if err2 != nil {
-		return model.NewTextMessage(model.RoleUser, "[Voice message saved but could not be read for transcription]"), nil
-	}
-
-	// Transcribe using the model's /v1/audio/transcriptions endpoint.
-	result, err2 := h.transcriber.Transcribe(context.Background(), audioData, filepath.Base(absPath))
-	if err2 != nil {
-		slog.Warn("transcription failed", "err", err2)
-		return model.NewTextMessage(model.RoleUser,
-			fmt.Sprintf("[User sent a %d-second voice message (saved at %s) but transcription failed: %v]",
-				content.Duration/1000, filePath, err2)), nil
-	}
-
-	transcript := result.Text
-	slog.Info("audio transcribed", "text", transcript, "confidence", result.Confidence)
-
-	// Always run LLM correction: fix misheard words and add punctuation.
-	if h.corrector != nil {
-		corrected := h.correctTranscription(transcript)
-		if corrected != "" {
-			slog.Info("transcription corrected", "original", transcript, "corrected", corrected)
-			transcript = corrected
-		}
-	}
-
-	return model.NewTextMessage(model.RoleUser,
-		fmt.Sprintf("[Voice message, %ds, saved at %s]\n%s", content.Duration/1000, filePath, transcript)), nil
-}
-
-// downloadAndSaveMedia downloads a media file from Feishu, saves it to workspace/.files/,
-// and returns the file path and base64 data URL.
-// correctTranscription uses the main LLM to fix transcription errors.
-func (h *Handler) correctTranscription(raw string) string {
-	messages := []model.Message{
-		{Role: model.RoleSystem, Content: "You are a transcription post-processor. Your task:\n" +
-			"1. Add proper punctuation (commas, periods, question marks, etc.)\n" +
-			"2. Fix misheard words, especially technical terms and proper nouns\n" +
-			"3. The speaker uses mixed Chinese and English\n" +
-			"4. Common domains: technology (API, Kubernetes, Docker, GPU, LLM, MLX, Maxwell, Transformer), " +
-			"finance (ETF, hedge fund, derivatives), arts (sonata, Chopin, Scriabin, Grieg, Dvořák)\n" +
-			"5. Return ONLY the corrected text with punctuation. No explanations, no quotes."},
-		{Role: model.RoleUser, Content: raw},
-	}
-
-	resp, err := h.corrector.Chat(context.Background(), messages, nil)
-	if err != nil {
-		slog.Warn("transcription correction failed", "err", err)
-		return ""
-	}
-
-	return resp.Content
-}
-
-func (h *Handler) buildFileMessage(event MessageEvent) (model.Message, error) {
-	var content struct {
-		FileKey  string `json:"file_key"`
-		FileName string `json:"file_name"`
-	}
-	if err := json.Unmarshal([]byte(event.Message.Content), &content); err != nil {
-		return model.Message{}, fmt.Errorf("parse file content: %w", err)
-	}
-
-	// Download file.
-	ext := filepath.Ext(content.FileName)
-	if ext == "" {
-		ext = ".bin"
-	}
-	filePath, _, err := h.downloadAndSaveMedia(event.Message.MessageID, content.FileKey, "file", ext)
-	if err != nil {
-		slog.Warn("file download failed", "err", err)
-		return model.NewTextMessage(model.RoleUser,
-			fmt.Sprintf("[User sent a file '%s' that could not be downloaded]", content.FileName)), nil
-	}
-
-	slog.Info("media saved", "type", "file", "path", filePath, "name", content.FileName)
-
-	absPath := filepath.Join(h.workspaceDir, filePath)
-
-	// Register document for RAG indexing if store is available.
-	if h.docStore != nil {
-		h.docStore.SaveDocument(context.Background(), &store.Document{
-			Filename: content.FileName,
-			FilePath: absPath,
-			Status:   "pending",
-		})
-	}
-
-	return model.NewTextMessage(model.RoleUser,
-		fmt.Sprintf("The user sent a file '%s' (saved at %s, absolute path: %s). Read and process it as needed. For PDFs use `pdftotext '%s' -` via the cli tool.",
-			content.FileName, filePath, absPath, absPath)), nil
-}
-
-func (h *Handler) downloadAndSaveMedia(messageID, fileKey, resourceType, ext string) (filePath, dataURL string, err error) {
-	data, err := h.client.DownloadMessageResource(messageID, fileKey, resourceType)
-	if err != nil {
-		return "", "", err
-	}
-
-	if len(data) == 0 {
-		return "", "", fmt.Errorf("empty response")
-	}
-
-	// Check for error JSON response.
-	if len(data) < 1000 && data[0] == '{' {
-		return "", "", fmt.Errorf("API error: %s", string(data))
-	}
-
-	// Save to workspace/.files/
-	filename := fileKey + ext
-	filePath = filepath.Join(h.filesDir(), filename)
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
-		return "", "", fmt.Errorf("save file: %w", err)
-	}
-
-	// Build data URL.
-	contentType := http.DetectContentType(data)
-	dataURL = fmt.Sprintf("data:%s;base64,%s", contentType, base64.StdEncoding.EncodeToString(data))
-
-	slog.Info("media downloaded", "size", len(data), "path", filePath)
-
-	// Return path relative to workspace for the model to reference.
-	relPath, _ := filepath.Rel(h.workspaceDir, filePath)
-	return relPath, dataURL, nil
-}
+// extractPostContent and deriveChatID are shared helpers used by both
+// handler and filter.
 
 // extractPostContent extracts text and image keys from a Feishu post message.
 func extractPostContent(raw json.RawMessage) (text string, imageKeys []string) {
