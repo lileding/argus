@@ -259,7 +259,6 @@ func runServer(cfg *config.Config) {
 		defer ingester.Stop()
 	}
 
-	// Pipeline: Handler → Filter → Dispatcher.
 	// QueueStore: use PostgresStore if DB available, else MemoryStore.
 	var qs store.QueueStore
 	if ps, ok := st.(*store.PostgresStore); ok {
@@ -268,22 +267,17 @@ func runServer(cfg *config.Config) {
 		qs = st.(*store.MemoryStore)
 	}
 
-	// Channels for inter-stage notification.
-	filterCh := make(chan string, 256)
-	dispatchCh := make(chan string, 256)
-
-	// Dispatcher: per-chat serial agent processing.
-	dispatcher := feishu.NewDispatcher(qs, ag, adapter, feishuClient, dispatchCh)
-	dispatcher.Start(ctx)
+	// Dispatcher: per-chat serial agent processing (channel-per-chat).
+	dispatcher := feishu.NewDispatcher(qs, ag, adapter, feishuClient)
 	defer dispatcher.Stop()
 
-	// Filter: media download + transcription + ACK (thinking card).
-	filter := feishu.NewFeishuFilter(feishuClient, modelClient, modelClient, docReg, qs, cfg.Agent.WorkspaceDir, dispatchCh)
-	filter.StartWorker(filterCh)
-	defer filter.Stop()
+	// Handler: inbound (store + push + spawn media goroutine).
+	handler := feishu.NewHandler(feishuClient, cfg.Feishu, cfg.Agent.WorkspaceDir, qs, dispatcher, modelClient, modelClient, docReg)
 
-	// Handler: pure inbound (store + notify) + outbound (event-driven).
-	handler := feishu.NewHandler(feishuClient, cfg.Feishu, cfg.Agent.WorkspaceDir, qs, feishu.NewFilterChanNotifier(filterCh))
+	// Crash recovery: re-queue interrupted messages.
+	dispatcher.Recover(ctx, func(msg *store.StoredMessage, readyCh chan struct{}) {
+		go handler.ProcessMedia(msg, readyCh)
+	})
 
 	// Cron scheduler.
 	scheduler := setupCron(cfg, ag, feishuClient, processor, ctx)

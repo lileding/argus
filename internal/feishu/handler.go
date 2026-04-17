@@ -17,28 +17,6 @@ import (
 	"argus/internal/store"
 )
 
-// FilterNotifier is used by Handler to notify the Filter that a new message
-// is available for processing.
-type FilterNotifier interface {
-	Notify(chatID string)
-}
-
-// filterChanNotifier wraps a channel as a FilterNotifier.
-type filterChanNotifier struct {
-	ch chan<- string
-}
-
-func NewFilterChanNotifier(ch chan<- string) FilterNotifier {
-	return &filterChanNotifier{ch: ch}
-}
-
-func (n *filterChanNotifier) Notify(chatID string) {
-	select {
-	case n.ch <- chatID:
-	default:
-	}
-}
-
 // Transcriber can transcribe audio files to text.
 type Transcriber interface {
 	Transcribe(ctx context.Context, audioData []byte, filename string) (*model.TranscriptionResult, error)
@@ -54,33 +32,50 @@ type DocRegisterer interface {
 	SaveDocument(ctx context.Context, doc *store.Document) error
 }
 
-// Handler handles Feishu webhook events. Inbound: parse + store to DB + notify
-// Filter. All media processing is done by the Filter, not the Handler.
+// Handler handles Feishu webhook events.
+//
+// Inbound: parse → INSERT raw message (notReady) → push to Dispatcher's
+// per-chat channel → spawn async media processing goroutine.
+//
+// The media goroutine downloads/transcribes, updates DB content to ready,
+// and closes the message's ReadyCh. The Dispatcher opens the card
+// immediately on pop, blocks on ReadyCh, then runs the agent.
 type Handler struct {
 	client       *Client
 	store        store.QueueStore
+	dispatcher   *Dispatcher
+	transcriber  Transcriber
+	corrector    Corrector
+	docStore     DocRegisterer
 	dedup        *Dedup
 	cfg          config.FeishuConfig
 	workspaceDir string
-	filterNotify FilterNotifier
 }
 
-func NewHandler(client *Client, cfg config.FeishuConfig, workspaceDir string, st store.QueueStore, filterNotify FilterNotifier) *Handler {
+func NewHandler(
+	client *Client,
+	cfg config.FeishuConfig,
+	workspaceDir string,
+	st store.QueueStore,
+	dispatcher *Dispatcher,
+	transcriber Transcriber,
+	corrector Corrector,
+	docStore DocRegisterer,
+) *Handler {
 	filesDir := filepath.Join(workspaceDir, ".files")
 	os.MkdirAll(filesDir, 0755)
 
 	return &Handler{
 		client:       client,
 		store:        st,
+		dispatcher:   dispatcher,
+		transcriber:  transcriber,
+		corrector:    corrector,
+		docStore:     docStore,
 		dedup:        NewDedup(5 * time.Minute),
 		cfg:          cfg,
 		workspaceDir: workspaceDir,
-		filterNotify: filterNotify,
 	}
-}
-
-func (h *Handler) filesDir() string {
-	return filepath.Join(h.workspaceDir, ".files")
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -91,11 +86,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slog.Debug("webhook received", "body", string(body))
-
 	var envelope EventEnvelope
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		slog.Error("parse envelope", "err", err, "body", string(body))
+		slog.Error("parse envelope", "err", err)
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -116,8 +109,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	go h.processEvent(envelope)
 }
 
-// processEvent is the inbound path: parse envelope → store raw message → notify Filter.
-// Fully reentrant — no per-chat locking, no media download, no agent call.
+// processEvent: parse → store raw → push to chat channel → spawn media goroutine.
 func (h *Handler) processEvent(envelope EventEnvelope) {
 	if envelope.Header.EventType != "im.message.receive_v1" {
 		return
@@ -130,12 +122,11 @@ func (h *Handler) processEvent(envelope EventEnvelope) {
 	}
 
 	chatID := deriveChatID(msgEvent.Message.ChatType, msgEvent.Sender.SenderID.OpenID, msgEvent.Message.ChatID)
-
 	if msgEvent.Message.ChatType == "group" && len(msgEvent.Message.Mentions) == 0 {
 		return
 	}
 
-	// Store raw message immediately (QoS=1: persist before anything else).
+	// 1. Store raw message immediately (notReady).
 	msg := &store.StoredMessage{
 		ChatID:       chatID,
 		Role:         "user",
@@ -152,26 +143,196 @@ func (h *Handler) processEvent(envelope EventEnvelope) {
 	}
 
 	slog.Info("message queued",
-		"msg_id", msg.ID,
-		"chat_id", chatID,
-		"chat_type", msgEvent.Message.ChatType,
+		"msg_id", msg.ID, "chat_id", chatID,
 		"msg_type", msgEvent.Message.MessageType,
 	)
 
-	// Notify Filter that there's work.
-	h.filterNotify.Notify(chatID)
+	// 2. Push to Dispatcher's per-chat channel.
+	readyCh := make(chan struct{})
+	h.dispatcher.ChatChan(chatID) <- QueuedMessage{
+		MsgID:        msg.ID,
+		ChatID:       chatID,
+		TriggerMsgID: msgEvent.Message.MessageID,
+		ReadyCh:      readyCh,
+	}
+
+	// 3. Spawn async media processing goroutine.
+	go h.ProcessMedia(msg, readyCh)
 }
 
-// The build*Message, downloadAndSaveMedia, and correctTranscription methods
-// have moved to filter.go (FeishuFilter). Handler no longer does media
-// processing — it stores the raw message and lets Filter handle the rest.
+// processMedia downloads media, transcribes audio, updates DB content to
+// the processed form, marks the message as ready, and closes readyCh.
+// This is the function also used by Dispatcher.Recover for crash recovery.
+func (h *Handler) ProcessMedia(msg *store.StoredMessage, readyCh chan struct{}) {
+	defer close(readyCh)
+	ctx := context.Background()
 
-// extractPostContent and deriveChatID are shared helpers used by both
-// handler and filter.
+	processedText, err := h.buildProcessedContent(ctx, msg)
+	if err != nil {
+		slog.Warn("processMedia: build content failed", "msg_id", msg.ID, "err", err)
+		processedText = fmt.Sprintf("[Message processing failed: %v]", err)
+	}
 
-// extractPostContent extracts text and image keys from a Feishu post message.
+	// Update content + status in DB.
+	if err := h.store.UpdateMessageContent(ctx, msg.ID, processedText); err != nil {
+		slog.Error("processMedia: update content", "msg_id", msg.ID, "err", err)
+	}
+	if err := h.store.SetReplyStatus(ctx, msg.ID, "ready"); err != nil {
+		slog.Error("processMedia: set ready", "msg_id", msg.ID, "err", err)
+	}
+
+	slog.Info("processMedia: ready", "msg_id", msg.ID, "msg_type", msg.MsgType)
+}
+
+// buildProcessedContent converts raw Feishu content JSON into agent-ready text.
+func (h *Handler) buildProcessedContent(ctx context.Context, msg *store.StoredMessage) (string, error) {
+	raw := msg.Content
+
+	switch msg.MsgType {
+	case "text":
+		var c TextContent
+		if err := json.Unmarshal([]byte(raw), &c); err != nil {
+			return raw, nil
+		}
+		return c.Text, nil
+
+	case "image":
+		var c struct {
+			ImageKey string `json:"image_key"`
+		}
+		if err := json.Unmarshal([]byte(raw), &c); err != nil {
+			return "[User sent an image]", nil
+		}
+		filePath, err := h.downloadMedia(msg.TriggerMsgID, c.ImageKey, "image", ".png")
+		if err != nil {
+			return "[User sent an image that could not be downloaded]", nil
+		}
+		return fmt.Sprintf("The user sent an image (saved at %s).", filePath), nil
+
+	case "audio":
+		var c struct {
+			FileKey  string `json:"file_key"`
+			Duration int    `json:"duration"`
+		}
+		if err := json.Unmarshal([]byte(raw), &c); err != nil {
+			return "[User sent a voice message]", nil
+		}
+		filePath, err := h.downloadMedia(msg.TriggerMsgID, c.FileKey, "file", ".opus")
+		if err != nil {
+			return "[Voice message could not be downloaded]", nil
+		}
+		slog.Info("media saved", "type", "audio", "path", filePath, "duration_ms", c.Duration)
+
+		absPath := filepath.Join(h.workspaceDir, filePath)
+		audioData, err := os.ReadFile(absPath)
+		if err != nil {
+			return fmt.Sprintf("[Voice message saved at %s but could not be read]", filePath), nil
+		}
+
+		result, err := h.transcriber.Transcribe(ctx, audioData, filepath.Base(absPath))
+		if err != nil {
+			return fmt.Sprintf("[Voice message, %ds, transcription failed: %v]", c.Duration/1000, err), nil
+		}
+		transcript := result.Text
+		slog.Info("audio transcribed", "text", transcript, "confidence", result.Confidence)
+
+		if h.corrector != nil {
+			if corrected := h.correctTranscription(ctx, transcript); corrected != "" {
+				slog.Info("transcription corrected", "original", transcript, "corrected", corrected)
+				transcript = corrected
+			}
+		}
+		return fmt.Sprintf("[Voice message, %ds, saved at %s]\n%s", c.Duration/1000, filePath, transcript), nil
+
+	case "post":
+		var rawMsg json.RawMessage
+		if err := json.Unmarshal([]byte(raw), &rawMsg); err != nil {
+			return raw, nil
+		}
+		text, imageKeys := extractPostContent(rawMsg)
+		var savedPaths []string
+		for _, key := range imageKeys {
+			if fp, err := h.downloadMedia(msg.TriggerMsgID, key, "image", ".png"); err == nil {
+				savedPaths = append(savedPaths, fp)
+			}
+		}
+		if text == "" {
+			text = "The user sent images."
+		}
+		if len(savedPaths) > 0 {
+			text += fmt.Sprintf(" (images saved at: %s)", strings.Join(savedPaths, ", "))
+		}
+		return text, nil
+
+	case "file":
+		var c struct {
+			FileKey  string `json:"file_key"`
+			FileName string `json:"file_name"`
+		}
+		if err := json.Unmarshal([]byte(raw), &c); err != nil {
+			return "[User sent a file]", nil
+		}
+		ext := filepath.Ext(c.FileName)
+		if ext == "" {
+			ext = ".bin"
+		}
+		filePath, err := h.downloadMedia(msg.TriggerMsgID, c.FileKey, "file", ext)
+		if err != nil {
+			return fmt.Sprintf("[File '%s' could not be downloaded]", c.FileName), nil
+		}
+		absPath := filepath.Join(h.workspaceDir, filePath)
+		if h.docStore != nil {
+			h.docStore.SaveDocument(ctx, &store.Document{
+				Filename: c.FileName, FilePath: absPath, Status: "pending",
+			})
+		}
+		return fmt.Sprintf("The user sent a file '%s' (saved at %s, absolute path: %s).",
+			c.FileName, filePath, absPath), nil
+
+	default:
+		return raw, nil
+	}
+}
+
+func (h *Handler) downloadMedia(messageID, fileKey, resourceType, ext string) (string, error) {
+	data, err := h.client.DownloadMessageResource(messageID, fileKey, resourceType)
+	if err != nil {
+		return "", err
+	}
+	if len(data) == 0 {
+		return "", fmt.Errorf("empty response")
+	}
+	if len(data) < 1000 && data[0] == '{' {
+		return "", fmt.Errorf("API error: %s", string(data))
+	}
+	filename := fileKey + ext
+	fullPath := filepath.Join(h.workspaceDir, ".files", filename)
+	if err := os.WriteFile(fullPath, data, 0644); err != nil {
+		return "", fmt.Errorf("save file: %w", err)
+	}
+	slog.Info("media downloaded", "size", len(data), "path", fullPath)
+	relPath, _ := filepath.Rel(h.workspaceDir, fullPath)
+	return relPath, nil
+}
+
+func (h *Handler) correctTranscription(ctx context.Context, raw string) string {
+	messages := []model.Message{
+		{Role: model.RoleSystem, Content: "You are a transcription post-processor. Your task:\n" +
+			"1. Add proper punctuation\n2. Fix misheard words, especially technical terms and proper nouns\n" +
+			"3. The speaker uses mixed Chinese and English\n" +
+			"4. Return ONLY the corrected text. No explanations."},
+		{Role: model.RoleUser, Content: raw},
+	}
+	resp, err := h.corrector.Chat(ctx, messages, nil)
+	if err != nil {
+		return ""
+	}
+	return resp.Content
+}
+
+// --- Shared helpers ---
+
 func extractPostContent(raw json.RawMessage) (text string, imageKeys []string) {
-	// Try direct format: {"title":"...", "content":[...]}
 	var direct struct {
 		Title   string          `json:"title"`
 		Content json.RawMessage `json:"content"`
@@ -180,8 +341,6 @@ func extractPostContent(raw json.RawMessage) (text string, imageKeys []string) {
 		t, imgs := parsePostContentArray(direct.Content)
 		return joinText(direct.Title, t), imgs
 	}
-
-	// Try language-keyed format: {"zh_cn": {"title":"...", "content":[...]}}
 	var langKeyed map[string]struct {
 		Title   string          `json:"title"`
 		Content json.RawMessage `json:"content"`
@@ -192,11 +351,10 @@ func extractPostContent(raw json.RawMessage) (text string, imageKeys []string) {
 			return joinText(body.Title, t), imgs
 		}
 	}
-
 	return "", nil
 }
 
-func parsePostContentArray(raw json.RawMessage) (text string, imageKeys []string) {
+func parsePostContentArray(raw json.RawMessage) (string, []string) {
 	var lines [][]struct {
 		Tag      string `json:"tag"`
 		Text     string `json:"text"`
@@ -205,8 +363,8 @@ func parsePostContentArray(raw json.RawMessage) (text string, imageKeys []string
 	if err := json.Unmarshal(raw, &lines); err != nil {
 		return "", nil
 	}
-
 	var texts []string
+	var imageKeys []string
 	for _, line := range lines {
 		var lineTexts []string
 		for _, elem := range line {
@@ -225,7 +383,6 @@ func parsePostContentArray(raw json.RawMessage) (text string, imageKeys []string
 			texts = append(texts, strings.Join(lineTexts, ""))
 		}
 	}
-
 	return strings.Join(texts, "\n"), imageKeys
 }
 
