@@ -117,6 +117,52 @@ func (a *Agent) HandleStream(ctx context.Context, chatID string, userMsg model.M
 	return ch
 }
 
+// HandleStreamQueued is the dispatcher entry point for pre-saved messages.
+// Unlike HandleStream, it does NOT save the user message (already in the DB)
+// and reconstructs the model.Message from the stored text content.
+func (a *Agent) HandleStreamQueued(ctx context.Context, chatID string, savedMsgID int64, userText string) <-chan Event {
+	ch := make(chan Event, 16)
+
+	go func() {
+		defer close(ch)
+
+		ctx = tool.WithChatID(ctx, chatID)
+
+		// Load history (excluding the current message to avoid duplication).
+		history, err := a.loadHistory(ctx, chatID, savedMsgID)
+		if err != nil {
+			ch <- Event{Type: EventError, Payload: ErrorPayload{Err: err}}
+			return
+		}
+
+		// Reconstruct a simple text message from the stored content.
+		userMsg := model.NewTextMessage(model.RoleUser, userText)
+
+		// Phase 1: Orchestration.
+		toolResults, finishSummary := a.runOrchestrator(ctx, ch, userMsg, userText, history)
+
+		// Signal transition.
+		ch <- Event{Type: EventComposing}
+
+		// Phase 2: Synthesis.
+		reply := a.runSynthesizer(ctx, ch, userMsg, userText, history, toolResults, finishSummary)
+
+		// Save assistant reply.
+		if err := a.store.SaveMessage(ctx, &store.StoredMessage{
+			ChatID:  chatID,
+			Role:    string(model.RoleAssistant),
+			Content: reply,
+		}); err != nil {
+			ch <- Event{Type: EventError, Payload: ErrorPayload{Err: fmt.Errorf("save assistant reply: %w", err)}}
+			return
+		}
+
+		ch <- Event{Type: EventReply, Payload: ReplyPayload{Text: reply}}
+	}()
+
+	return ch
+}
+
 // runOrchestrator is Phase 1: loops model calls + tool execution until finish_task.
 func (a *Agent) runOrchestrator(
 	ctx context.Context,

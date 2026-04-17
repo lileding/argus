@@ -435,3 +435,138 @@ func (s *PostgresStore) FailedTranscriptions(ctx context.Context) ([]StoredMessa
 	}
 	return msgs, nil
 }
+
+// --- QueueStore (message pipeline) ---
+
+func (s *PostgresStore) SaveMessageQueued(ctx context.Context, msg *StoredMessage) error {
+	status := "received"
+	msg.ReplyStatus = &status
+	err := s.db.QueryRowContext(ctx, `
+		INSERT INTO messages (chat_id, role, content, tool_name, tool_call_id,
+			source_im, channel, source_ts, msg_type, file_paths, sender_id,
+			reply_status, trigger_msg_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		RETURNING id, created_at
+	`, msg.ChatID, msg.Role, msg.Content, msg.ToolName, msg.ToolCallID,
+		msg.SourceIM, msg.Channel, msg.SourceTS, msg.MsgType,
+		pq.Array(msg.FilePaths), msg.SenderID,
+		status, msg.TriggerMsgID,
+	).Scan(&msg.ID, &msg.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("save queued message: %w", err)
+	}
+	return nil
+}
+
+func (s *PostgresStore) UpdateMessageContent(ctx context.Context, msgID int64, content string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE messages SET content = $1 WHERE id = $2`, content, msgID)
+	return err
+}
+
+func (s *PostgresStore) SetReplyStatus(ctx context.Context, msgID int64, status string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE messages SET reply_status = $1 WHERE id = $2`, status, msgID)
+	return err
+}
+
+func (s *PostgresStore) AckReply(ctx context.Context, msgID int64, replyChannelID string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE messages SET reply_status = 'ready', reply_channel_id = $1 WHERE id = $2
+	`, replyChannelID, msgID)
+	return err
+}
+
+func (s *PostgresStore) ClaimNextReply(ctx context.Context, chatID string) (*StoredMessage, error) {
+	var m StoredMessage
+	var replyStatus sql.NullString
+	var replyChannelID, triggerMsgID sql.NullString
+	err := s.db.QueryRowContext(ctx, `
+		UPDATE messages SET reply_status = 'processing'
+		WHERE id = (
+			SELECT id FROM messages
+			WHERE chat_id = $1 AND reply_status = 'ready'
+			ORDER BY created_at
+			LIMIT 1
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING id, chat_id, role, content, source_im, channel, msg_type,
+			file_paths, sender_id, created_at,
+			reply_status, reply_channel_id, trigger_msg_id
+	`, chatID).Scan(
+		&m.ID, &m.ChatID, &m.Role, &m.Content, &m.SourceIM, &m.Channel, &m.MsgType,
+		pq.Array(&m.FilePaths), &m.SenderID, &m.CreatedAt,
+		&replyStatus, &replyChannelID, &triggerMsgID,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("claim next reply: %w", err)
+	}
+	if replyStatus.Valid {
+		m.ReplyStatus = &replyStatus.String
+	}
+	m.ReplyChannelID = replyChannelID.String
+	m.TriggerMsgID = triggerMsgID.String
+	return &m, nil
+}
+
+func (s *PostgresStore) FinishReply(ctx context.Context, msgID int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE messages SET reply_status = 'done' WHERE id = $1`, msgID)
+	return err
+}
+
+func (s *PostgresStore) RecoverQueue(ctx context.Context) (recovered int, unacked []StoredMessage, err error) {
+	// processing → ready (crash during agent run)
+	res, err := s.db.ExecContext(ctx, `UPDATE messages SET reply_status = 'ready' WHERE reply_status = 'processing'`)
+	if err != nil {
+		return 0, nil, fmt.Errorf("recover processing: %w", err)
+	}
+	n1, _ := res.RowsAffected()
+
+	// filtering → received (crash during media download)
+	res, err = s.db.ExecContext(ctx, `UPDATE messages SET reply_status = 'received' WHERE reply_status = 'filtering'`)
+	if err != nil {
+		return 0, nil, fmt.Errorf("recover filtering: %w", err)
+	}
+	n2, _ := res.RowsAffected()
+	recovered = int(n1 + n2)
+
+	// Return received rows for Filter re-processing.
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, chat_id, content, msg_type, source_im, trigger_msg_id, created_at
+		FROM messages WHERE reply_status = 'received' ORDER BY created_at
+	`)
+	if err != nil {
+		return recovered, nil, fmt.Errorf("query received: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var m StoredMessage
+		var triggerMsgID sql.NullString
+		if err := rows.Scan(&m.ID, &m.ChatID, &m.Content, &m.MsgType, &m.SourceIM, &triggerMsgID, &m.CreatedAt); err != nil {
+			return recovered, nil, fmt.Errorf("scan received: %w", err)
+		}
+		m.TriggerMsgID = triggerMsgID.String
+		unacked = append(unacked, m)
+	}
+	return recovered, unacked, nil
+}
+
+func (s *PostgresStore) PendingChats(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT chat_id FROM messages WHERE reply_status = 'ready'
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var chats []string
+	for rows.Next() {
+		var chatID string
+		if err := rows.Scan(&chatID); err != nil {
+			return nil, err
+		}
+		chats = append(chats, chatID)
+	}
+	return chats, nil
+}

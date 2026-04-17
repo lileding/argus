@@ -20,6 +20,12 @@ type StoredMessage struct {
 	FilePaths  []string   // paths to saved media files
 	SenderID   string     // user identity from source IM
 	CreatedAt  time.Time
+
+	// Queue fields — only meaningful for user messages in the pipeline.
+	// NULL reply_status means the message is not part of the queue.
+	ReplyStatus    *string // received / filtering / ready / processing / done
+	ReplyChannelID string  // IM-abstract handle for updating the reply card
+	TriggerMsgID   string  // IM trigger message ID (reply thread root)
 }
 
 // Store is the base interface — all implementations must support this.
@@ -52,6 +58,31 @@ type Memory struct {
 	Active    bool
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+// QueueStore manages per-chat reply serialization on the messages table.
+// MQTT QoS=1 semantics: store first (received), ACK second (ready).
+// Pipeline: received → filtering → ready → processing → done.
+type QueueStore interface {
+	// SaveMessageQueued inserts a user message with reply_status='received'.
+	SaveMessageQueued(ctx context.Context, msg *StoredMessage) error
+	// UpdateMessageContent overwrites the content field (Filter → processed text).
+	UpdateMessageContent(ctx context.Context, msgID int64, content string) error
+	// SetReplyStatus transitions a message to a new pipeline status.
+	SetReplyStatus(ctx context.Context, msgID int64, status string) error
+	// AckReply transitions to 'ready' and records the IM-abstract reply channel ID.
+	AckReply(ctx context.Context, msgID int64, replyChannelID string) error
+	// ClaimNextReply atomically picks the oldest 'ready' message for chatID
+	// and marks it 'processing'. Returns nil if nothing queued.
+	ClaimNextReply(ctx context.Context, chatID string) (*StoredMessage, error)
+	// FinishReply marks a message as 'done'.
+	FinishReply(ctx context.Context, msgID int64) error
+	// RecoverQueue runs at startup: resets processing→ready, filtering→received.
+	// Returns the number of rows recovered and any 'received' messages that need
+	// Filter re-processing (thinking card was never sent).
+	RecoverQueue(ctx context.Context) (recovered int, unacked []StoredMessage, err error)
+	// PendingChats returns distinct chatIDs with 'ready' messages (for startup dispatch).
+	PendingChats(ctx context.Context) ([]string, error)
 }
 
 // DocumentStore manages document ingestion and RAG.
