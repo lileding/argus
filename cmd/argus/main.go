@@ -273,7 +273,7 @@ func runServer(cfg *config.Config) {
 	dispatchCh := make(chan string, 256)
 
 	// Dispatcher: per-chat serial agent processing.
-	dispatcher := feishu.NewDispatcher(qs, ag, adapter, dispatchCh)
+	dispatcher := feishu.NewDispatcher(qs, ag, adapter, feishuClient, dispatchCh)
 	dispatcher.Start(ctx)
 	defer dispatcher.Stop()
 

@@ -135,27 +135,14 @@ func (f *FeishuFilter) Process(ctx context.Context, msg *store.StoredMessage) er
 		return fmt.Errorf("update content: %w", err)
 	}
 
-	// ACK: send thinking card (visual confirmation to user).
-	lang := quickDetectLang(processedText)
-	replyChannelID := ""
-	if msg.TriggerMsgID != "" {
-		cardJSON := ThinkingCard(lang)
-		if id, err := f.client.ReplyRichWithID(msg.TriggerMsgID, "interactive", cardJSON); err != nil {
-			slog.Warn("filter: send thinking card", "msg_id", msg.ID, "err", err)
-		} else {
-			replyChannelID = id
-		}
+	// Transition to ready. The thinking card is NOT sent here — it's sent
+	// by the Dispatcher when it actually starts processing this message.
+	// This ensures at most one active card per chat at any time.
+	if err := f.store.SetReplyStatus(ctx, msg.ID, "ready"); err != nil {
+		return fmt.Errorf("set ready: %w", err)
 	}
 
-	// Transition to ready + store reply channel ID.
-	if err := f.store.AckReply(ctx, msg.ID, replyChannelID); err != nil {
-		return fmt.Errorf("ack reply: %w", err)
-	}
-
-	slog.Info("filter: message ready",
-		"msg_id", msg.ID, "chat_id", msg.ChatID,
-		"reply_channel_id", replyChannelID,
-	)
+	slog.Info("filter: message ready", "msg_id", msg.ID, "chat_id", msg.ChatID)
 
 	// Notify Dispatcher.
 	select {

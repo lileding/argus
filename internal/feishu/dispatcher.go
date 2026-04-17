@@ -14,10 +14,14 @@ import (
 // parallel; within a single chat, messages are processed one at a time in
 // FIFO order. The messages table (via QueueStore) is the source of truth;
 // an in-memory channel + periodic scan provides low-latency notification.
+//
+// The Dispatcher also sends the thinking card (ACK) when it claims a
+// message — not earlier. This guarantees at most one active card per chat.
 type Dispatcher struct {
 	store   store.QueueStore
 	agent   *agent.Agent
 	adapter *Adapter
+	client  *Client // for sending thinking card on claim
 
 	active sync.Map      // chatID → struct{}: at most one goroutine per chat
 	notify <-chan string // chatID notification from upstream (Filter)
@@ -27,11 +31,12 @@ type Dispatcher struct {
 
 // NewDispatcher creates a Dispatcher. notify is the channel that upstream
 // (Filter) sends chatID notifications on when a message becomes 'ready'.
-func NewDispatcher(st store.QueueStore, ag *agent.Agent, adapter *Adapter, notify <-chan string) *Dispatcher {
+func NewDispatcher(st store.QueueStore, ag *agent.Agent, adapter *Adapter, client *Client, notify <-chan string) *Dispatcher {
 	return &Dispatcher{
 		store:   st,
 		agent:   ag,
 		adapter: adapter,
+		client:  client,
 		notify:  notify,
 		quit:    make(chan struct{}),
 	}
@@ -125,8 +130,24 @@ func (d *Dispatcher) processChat(chatID string) {
 			"content_preview", truncateForLog(msg.Content, 60),
 		)
 
+		// Send thinking card NOW (not in Filter) — ensures at most one card per chat.
+		replyChannelID := ""
+		if msg.TriggerMsgID != "" {
+			lang := quickDetectLang(msg.Content)
+			cardJSON := ThinkingCard(lang)
+			if id, cardErr := d.client.ReplyRichWithID(msg.TriggerMsgID, "interactive", cardJSON); cardErr != nil {
+				slog.Warn("dispatcher: send thinking card", "msg_id", msg.ID, "err", cardErr)
+			} else {
+				replyChannelID = id
+			}
+			// Store reply_channel_id for adapter to use.
+			if replyChannelID != "" {
+				d.store.AckReply(ctx, msg.ID, replyChannelID)
+			}
+		}
+
 		ch := d.agent.HandleStreamQueued(ctx, chatID, msg.ID, msg.Content)
-		d.adapter.HandleEvents(ch, msg.TriggerMsgID, msg.ReplyChannelID, msg.Content)
+		d.adapter.HandleEvents(ch, msg.TriggerMsgID, replyChannelID, msg.Content)
 
 		if err := d.store.FinishReply(ctx, msg.ID); err != nil {
 			slog.Error("dispatcher: finish reply", "msg_id", msg.ID, "err", err)
