@@ -162,8 +162,10 @@ Images are saved to `workspace/.files/`. When building history context, messages
 ```
 Feishu audio → download → save .opus to .files/
     → Whisper v3 transcription (with domain vocabulary prompt)
-    → LLM post-processing (add punctuation, fix domain terms)
-    → corrected text sent to orchestrator
+    → confidence check (avg_logprob > -0.15 = high quality)
+    → IF low confidence: LLM post-processing (punctuation, fix terms)
+    → IF high confidence: skip LLM correction (saves ~5-10s)
+    → text sent to orchestrator
 ```
 
 The transcription prompt includes hints for:
@@ -233,11 +235,58 @@ models. Argus enforces hard limits at the harness layer:
 |-----------|---------|--------|
 | **Per-tool budget** | `search`≤3, `fetch`≤4, `db`≤6 calls per turn | Harness rejects further calls without dispatching; returns error "budget exhausted, call finish_task NOW" |
 | **Cumulative rejection strike-out** | 5 budget-exhausted rejections in a turn | Force-exit orchestrator, pass gathered materials to synthesizer |
-| **Tool-only retry** | First iteration produces text without tool calls | Inject "You MUST call a tool" user message, retry once |
+| **Text-only early abort** | Streaming detects >80 tokens of text without tool calls | Cancel stream immediately (~1s), retry with enforcement prompt instead of waiting 10-30s for full generation |
+| **Tool-only retry** | First iteration produces no tool calls after early abort | Inject "You MUST call a tool" user message, retry once |
 | **Text fallback** | Still no tool calls after retry | Use model text as synthesis summary |
 | **Max iterations** | Configurable ceiling (default 10) | Force-exit with gathered materials |
 
-Worst-case wall-clock is thus bounded: `maxIterations × (model_latency + tool_latency)`, not unbounded retry.
+Worst-case wall-clock is bounded by budgets + early abort. A model that
+ignores the tool-only rule is detected in ~1s (not 30s), retried once,
+then force-synthesized with whatever materials exist.
+
+---
+
+## Performance Optimizations
+
+### Parallel Tool Execution
+
+When the orchestrator receives multiple tool calls in a single model
+response (e.g. 2 searches + 1 fetch), they execute concurrently via
+goroutines + `sync.WaitGroup`. Results are appended to the context in
+the original order for deterministic history. `finish_task` is
+pre-scanned before dispatch; budget checks run serially (shared state).
+
+Latency: `max(tool_time)` instead of `Σ(tool_time)`.
+
+### ChatWithEarlyAbort (Streaming Phase 1)
+
+The orchestrator uses `ChatWithEarlyAbort` instead of blocking `Chat`.
+This method opens an SSE stream and accumulates both `delta.content`
+AND `delta.tool_calls` (OpenAI streaming format). Two exit paths:
+
+- **Model calls tools**: tool_call deltas appear in the stream →
+  accumulate until stream completes → return full Response with ToolCalls.
+  Behaves identically to blocking Chat.
+- **Model outputs text only** (ignored tool-only rule): content text
+  exceeds 80 estimated tokens with no tool_call delta seen → cancel
+  context immediately → return partial text → orchestrator retries.
+  Saves 10-30s of wasted generation.
+
+### Confidence-Based Transcription Skip
+
+Whisper `avg_logprob > -0.15` indicates high-quality transcription. The
+LLM correction step is skipped entirely, saving one model call (~5-10s)
+per confident audio message. Threshold derived from production data:
+`-0.104` (clear speech, skip) vs `-0.239` (noisy/proper-noun-heavy,
+correct).
+
+### Dynamic Streaming Throttle
+
+Phase 2 card updates use a burst + throttle pattern:
+- First 3 updates: sent immediately (user sees first tokens instantly)
+- Subsequent updates: throttled to one per 500ms (Feishu rate-limit safe)
+
+Perceived first-token latency drops from 500ms to ~0ms.
 
 ---
 
@@ -248,14 +297,10 @@ Phase 2 (synthesizer) streams its output via Server-Sent Events:
 - `model.Client.ChatStream` returns `<-chan StreamChunk` with incremental
   deltas from an OpenAI-compatible streaming endpoint
 - Agent emits `EventReplyDelta` with accumulated text on each chunk
-- Feishu adapter throttles card updates to at most one per 500 ms
-  (Feishu rate-limit friendly)
+- Feishu adapter uses burst + throttle (see above)
 - During streaming, LaTeX rendering is skipped — partial `$...$` would
   break parsing. The final `EventReply` triggers full processing
   (LaTeX → PNG upload → `![](image_key)` embedding)
-
-Users see the answer appear progressively instead of waiting 30–60 s
-in silence behind a static "thinking" card.
 
 ---
 
@@ -304,7 +349,7 @@ All agent output is delivered as **Feishu interactive cards** (`msg_type: "inter
 1. **Thinking card** — sent by Dispatcher on pop ("💭 正在思考…")
 2. **Tool status card** — humanized per tool (e.g. `🔍 正在搜索: X`)
 3. **Composing card** — Phase 1→2 transition ("✍️ 正在撰写回复…")
-4. **Streaming reply card** — markdown content updated every ~500 ms
+4. **Streaming reply card** — first 3 updates instant, then ~500 ms throttle
 5. **Final reply card** — full markdown + LaTeX images
 
 All cards are PATCHed onto the same `reply_channel_id` created by the
@@ -627,8 +672,11 @@ internal/
     event.go                 Event type definitions
     dedup.go                 Event ID deduplication
   model/
-    model.go                 Client interface: Chat + ChatStream + Transcribe
-    openai.go                OpenAI-compatible impl (JSON + SSE + multipart)
+    model.go                 Client interface: Chat + ChatStream +
+                             ChatWithEarlyAbort + Transcribe
+    openai.go                OpenAI-compatible impl (JSON + SSE + multipart);
+                             ChatWithEarlyAbort parses tool_call deltas
+                             from SSE for early text-only abort
     types.go                 Message (multimodal), ToolCall, Response, Usage
   render/
     renderer.go              Processor: markdown → LaTeX images → markers
@@ -691,7 +739,7 @@ third_party/ratex/           Embedded Rust LaTeX renderer (CGo)
 | Web Search | DuckDuckGo HTML (no API key) |
 | LaTeX | RaTeX (Rust, CGo-embedded) → PNG → Feishu image |
 | Output Format | Feishu interactive cards (schema 2.0, update_multi) |
-| Streaming | SSE from model → throttled card PATCH (500 ms) |
+| Streaming | SSE from model → burst first 3 tokens + throttled 500ms |
 | Skills | SKILL.md files (Agent Skills standard) + compiled builtins |
 | Deployment | Single binary, `--workspace` flag, `docker-compose.yaml` for PostgreSQL |
 
