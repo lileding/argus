@@ -120,35 +120,48 @@ func TestMarkdownToCard_CodeBlockSplit(t *testing.T) {
 	json.Unmarshal([]byte(card), &m)
 	body := m["body"].(map[string]any)
 	elements := body["elements"].([]any)
-	// Expect: "Hello" (markdown), "python:" (markdown label), code (div+plain_text), "Done" (markdown)
-	if len(elements) < 3 {
-		t.Fatalf("expected at least 3 elements, got %d", len(elements))
+	// Expect: "Hello" (markdown), collapsible_panel (code), "Done" (markdown)
+	if len(elements) != 3 {
+		t.Fatalf("expected 3 elements, got %d\ncard: %s", len(elements), card)
 	}
 
-	// First element should be "Hello"
-	first := elements[0].(map[string]any)["content"].(string)
-	if !strings.Contains(first, "Hello") {
-		t.Errorf("first element should contain Hello, got: %s", first)
+	// First element: markdown with "Hello"
+	first := elements[0].(map[string]any)
+	if first["tag"] != "markdown" || !strings.Contains(first["content"].(string), "Hello") {
+		t.Errorf("first element should be markdown with Hello, got: %v", first)
 	}
 
-	// There should be a div element with plain_text containing the code
-	foundDiv := false
-	for _, el := range elements {
-		e := el.(map[string]any)
-		if e["tag"] == "div" {
-			text := e["text"].(map[string]any)
-			if text["tag"] == "plain_text" && strings.Contains(text["content"].(string), "print") {
-				foundDiv = true
-			}
-		}
+	// Second element: collapsible_panel with expanded=true
+	panel := elements[1].(map[string]any)
+	if panel["tag"] != "collapsible_panel" {
+		t.Fatalf("second element should be collapsible_panel, got tag=%v", panel["tag"])
 	}
-	if !foundDiv {
-		t.Errorf("expected a div+plain_text element with code content\ncard: %s", card)
+	if panel["expanded"] != true {
+		t.Error("collapsible_panel should have expanded=true")
+	}
+	// Panel header should contain language name
+	header := panel["header"].(map[string]any)
+	title := header["title"].(map[string]any)
+	if title["content"] != "python" {
+		t.Errorf("panel title should be 'python', got %v", title["content"])
+	}
+	// Panel elements should contain div+plain_text with code
+	panelElements := panel["elements"].([]any)
+	div := panelElements[0].(map[string]any)
+	text := div["text"].(map[string]any)
+	if !strings.Contains(text["content"].(string), "print('world')") {
+		t.Errorf("panel content should contain code, got: %v", text["content"])
 	}
 
-	// Code should NOT appear as markdown triple-backtick (it's in plain_text now)
+	// Third element: markdown with "Done"
+	last := elements[2].(map[string]any)
+	if last["tag"] != "markdown" || !strings.Contains(last["content"].(string), "Done") {
+		t.Errorf("third element should be markdown with Done, got: %v", last)
+	}
+
+	// Code should NOT appear as markdown triple-backtick
 	if strings.Contains(card, "```python") {
-		t.Error("code block should be converted to plain_text, not left as markdown fenced block")
+		t.Error("code block should be in collapsible_panel, not left as markdown fenced block")
 	}
 }
 

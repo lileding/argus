@@ -207,32 +207,43 @@ func buildCardMulti(segments []string) string {
 	var elements []any
 	for _, seg := range segments {
 		if strings.HasPrefix(seg, "```") {
-			// Extract language and code body from fenced block.
 			m := codeBlockRe.FindStringSubmatch(seg)
 			if m != nil {
 				lang := m[1]
-				code := m[2]
-				// Use a div + plain_text element for code. Feishu won't
-				// collapse plain_text — all lines are always visible.
+				code := strings.TrimRight(m[2], "\n")
 				label := "Code"
 				if lang != "" {
 					label = lang
 				}
-				elements = append(elements,
-					map[string]any{
-						"tag":     "markdown",
-						"content": fmt.Sprintf("**%s:**", label),
-					},
-					map[string]any{
-						"tag": "div",
-						"text": map[string]any{
+				// Use collapsible_panel (Feishu 7.9+) with expanded=true.
+				// Shows all code by default; user can manually collapse.
+				// Avoids the broken 5-line collapse in markdown code blocks.
+				elements = append(elements, map[string]any{
+					"tag":      "collapsible_panel",
+					"expanded": true,
+					"header": map[string]any{
+						"title": map[string]any{
 							"tag":     "plain_text",
-							"content": strings.TrimRight(code, "\n"),
+							"content": label,
+						},
+						"vertical_align": "center",
+					},
+					"border": map[string]any{
+						"color":         "grey",
+						"corner_radius": "5px",
+					},
+					"background_color": "grey",
+					"elements": []any{
+						map[string]any{
+							"tag": "div",
+							"text": map[string]any{
+								"tag":     "plain_text",
+								"content": code,
+							},
 						},
 					},
-				)
+				})
 			} else {
-				// Malformed code block — render as markdown fallback.
 				elements = append(elements, map[string]any{
 					"tag":     "markdown",
 					"content": seg,
