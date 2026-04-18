@@ -198,6 +198,47 @@ func (d *Dispatcher) processChat(chatID string, ch chan QueuedMessage) {
 		}
 
 		slog.Info("dispatcher: done", "chat_id", chatID, "msg_id", claimed.ID)
+
+		// Drain: try to claim more ready messages from DB before blocking
+		// on the channel. This handles the crash-recovery case where
+		// requeueReady pushed only one trigger but multiple messages are
+		// ready in the DB.
+		d.drainReady(ctx, chatID)
+	}
+}
+
+// drainReady processes all remaining 'ready' messages for chatID without
+// waiting on the channel. Each gets its own thinking card since ReadyCh
+// was already closed (pre-processed content in DB).
+func (d *Dispatcher) drainReady(ctx context.Context, chatID string) {
+	for {
+		claimed, err := d.store.ClaimNextReply(ctx, chatID)
+		if err != nil || claimed == nil {
+			return
+		}
+
+		slog.Info("dispatcher: drain-processing",
+			"chat_id", chatID, "msg_id", claimed.ID,
+			"content_preview", truncateForLog(claimed.Content, 60),
+		)
+
+		replyChannelID := ""
+		if claimed.TriggerMsgID != "" {
+			lang := quickDetectLang(claimed.Content)
+			cardJSON := ThinkingCard(lang)
+			if id, err := d.client.ReplyRichWithID(claimed.TriggerMsgID, "interactive", cardJSON); err == nil {
+				replyChannelID = id
+				d.store.AckReply(ctx, claimed.ID, replyChannelID)
+			}
+		}
+
+		agentCh := d.agent.HandleStreamQueued(ctx, chatID, claimed.ID, claimed.Content)
+		d.adapter.HandleEvents(agentCh, claimed.TriggerMsgID, replyChannelID, claimed.Content)
+
+		if err := d.store.FinishReply(ctx, claimed.ID); err != nil {
+			slog.Error("dispatcher: drain finish", "msg_id", claimed.ID, "err", err)
+		}
+		slog.Info("dispatcher: drain-done", "chat_id", chatID, "msg_id", claimed.ID)
 	}
 }
 

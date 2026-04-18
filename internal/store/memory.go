@@ -93,8 +93,7 @@ func (s *MemoryStore) AckReply(_ context.Context, msgID int64, replyChannelID st
 	defer s.mu.Unlock()
 	for i := range s.messages {
 		if s.messages[i].ID == msgID {
-			status := "ready"
-			s.messages[i].ReplyStatus = &status
+			// Only store reply_channel_id, don't change status.
 			s.messages[i].ReplyChannelID = replyChannelID
 			return nil
 		}

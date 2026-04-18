@@ -23,13 +23,12 @@ type Agent struct {
 	toolRegistry  *tool.Registry
 	skillIndex    *skill.SkillIndex
 	embedder      *embedding.Client
-	basePrompt    string
 	workspaceDir  string
 	contextWindow int
 	maxIterations int
 }
 
-func New(modelClient model.Client, st store.Store, toolReg *tool.Registry, skillIdx *skill.SkillIndex, embedder *embedding.Client, basePrompt, workspaceDir string, contextWindow, maxIterations int) *Agent {
+func New(modelClient model.Client, st store.Store, toolReg *tool.Registry, skillIdx *skill.SkillIndex, embedder *embedding.Client, workspaceDir string, contextWindow, maxIterations int) *Agent {
 	if maxIterations == 0 {
 		maxIterations = 10
 	}
@@ -40,7 +39,6 @@ func New(modelClient model.Client, st store.Store, toolReg *tool.Registry, skill
 		skillIndex:    skillIdx,
 		embedder:      embedder,
 		workspaceDir:  workspaceDir,
-		basePrompt:    basePrompt,
 		contextWindow: contextWindow,
 		maxIterations: maxIterations,
 	}
@@ -189,9 +187,13 @@ func (a *Agent) runOrchestrator(
 	// Small budgets for expensive/noisy tools like search; unrestricted tools
 	// (not listed) can be called freely.
 	toolBudgets := map[string]int{
-		"search": 3,
-		"fetch":  4,
-		"db":     6,
+		"search":     3,
+		"fetch":      4,
+		"db":         6,
+		"cli":        5,
+		"write_file": 3,
+		"db_exec":    5,
+		"remember":   3,
 	}
 	toolCounts := map[string]int{}
 

@@ -135,7 +135,7 @@ func runCLI(cfg *config.Config) {
 	memStore := store.NewMemoryStore()
 	sb := buildSandbox(cfg)
 	toolReg := buildToolRegistry(cfg, sb, loader, nil, memStore)
-	ag := agent.New(modelClient, memStore, toolReg, loader.Index(), nil, cfg.Agent.SystemPrompt, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
+	ag := agent.New(modelClient, memStore, toolReg, loader.Index(), nil, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
 
 	chatID := "cli:local"
 	ctx := context.Background()
@@ -242,7 +242,7 @@ func runServer(cfg *config.Config) {
 
 	sb := buildSandbox(cfg)
 	toolReg := buildToolRegistry(cfg, sb, loader, db, st)
-	ag := agent.New(modelClient, st, toolReg, loader.Index(), embedClient, cfg.Agent.SystemPrompt, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
+	ag := agent.New(modelClient, st, toolReg, loader.Index(), embedClient, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
 
 	feishuClient := feishu.NewClient(cfg.Feishu)
 	processor := render.NewProcessor(feishuClient)

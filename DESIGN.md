@@ -31,7 +31,7 @@ Message processing has two components. The `messages.reply_status` column
 is the DB-side state machine:
 
 ```
-notReady → ready → processing → done
+received → ready → processing → done
 ```
 
 ```
@@ -39,7 +39,7 @@ IM message arrives
     ↓
 HANDLER (fully reentrant, sub-millisecond)
   ├─ parse webhook
-  ├─ INSERT raw message JSON → status=notReady
+  ├─ INSERT raw message JSON → status=received
   ├─ push QueuedMessage{ReadyCh} to Dispatcher's per-chat channel
   └─ go ProcessMedia(msg, readyCh)
        ├─ download media / transcribe audio / LLM correction
@@ -86,7 +86,7 @@ sub-millisecond time. The Dispatcher drains them strictly FIFO.
 
 On startup, `Dispatcher.Recover`:
 1. `processing → ready` in DB (agent was mid-run → re-process)
-2. `notReady` messages → re-spawn `ProcessMedia` goroutines
+2. `received` messages → re-spawn `ProcessMedia` goroutines
    (media download was interrupted → retry from scratch)
 3. `ready` messages → push to chat channels with pre-closed ReadyCh
 
@@ -233,7 +233,7 @@ models. Argus enforces hard limits at the harness layer:
 
 | Safeguard | Trigger | Action |
 |-----------|---------|--------|
-| **Per-tool budget** | `search`≤3, `fetch`≤4, `db`≤6 calls per turn | Harness rejects further calls without dispatching; returns error "budget exhausted, call finish_task NOW" |
+| **Per-tool budget** | `search`≤3, `fetch`≤4, `db`≤6, `cli`≤5, `write_file`≤3, `db_exec`≤5, `remember`≤3 per turn | Harness rejects further calls without dispatching; returns error "budget exhausted, call finish_task NOW" |
 | **Cumulative rejection strike-out** | 5 budget-exhausted rejections in a turn | Force-exit orchestrator, pass gathered materials to synthesizer |
 | **Text-only early abort** | Streaming detects >80 tokens of text without tool calls | Cancel stream immediately (~1s), retry with enforcement prompt instead of waiting 10-30s for full generation |
 | **Tool-only retry** | First iteration produces no tool calls after early abort | Inject "You MUST call a tool" user message, retry once |
@@ -539,7 +539,7 @@ CREATE TABLE messages (
     embedding   vector(768),                      -- nullable; async-filled
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     -- Pipeline queue (user messages only; NULL for assistant/tool msgs)
-    reply_status     TEXT,                        -- notReady/ready/processing/done
+    reply_status     TEXT,                        -- received/ready/processing/done
     reply_channel_id TEXT,                        -- IM-abstract card handle (set on ACK)
     trigger_msg_id   TEXT                         -- IM trigger message ID (reply thread root)
 );
@@ -742,6 +742,49 @@ third_party/ratex/           Embedded Rust LaTeX renderer (CGo)
 | Streaming | SSE from model → burst first 3 tokens + throttled 500ms |
 | Skills | SKILL.md files (Agent Skills standard) + compiled builtins |
 | Deployment | Single binary, `--workspace` flag, `docker-compose.yaml` for PostgreSQL |
+
+---
+
+## Deployment Constraints
+
+- **Single instance only.** Per-chat serialization relies on in-memory
+  `sync.Map` + goroutine-per-chat. The DB uses `FOR UPDATE SKIP LOCKED`
+  which is multi-process-safe at the claim level, but the thinking card
+  lifecycle and ReadyCh coordination assume a single server process. To
+  support horizontal scaling, the per-chat "only one consumer" guarantee
+  would need to be promoted to a DB advisory lock or lease mechanism.
+
+- **Webhook security.** The Handler currently parses the Feishu webhook
+  envelope and deduplicates by event ID, but does not verify the
+  `verification_token` or decrypt `encrypt_key`. Suitable for trusted
+  networks / development. Before exposing to the public internet,
+  signature verification must be implemented as a blocking requirement.
+
+---
+
+## Future Work
+
+- **Group Silent Listening.** DESIGN.md lists this as an interaction mode
+  but it is not implemented — group messages without @mention are silently
+  dropped. Future implementation needs to decide: should silent messages
+  enter the same timeline? Be embedded for semantic recall? How to handle
+  privacy / group-chat permission boundaries?
+
+- **Document RAG retrieval.** The `docindex` ingester chunks and embeds
+  uploaded files into the `chunks` table, but the agent has no explicit
+  retrieval path — `loadHistory` only searches message embeddings, not
+  chunk embeddings. Two options: (a) add chunk search to `loadHistory`
+  for automatic context injection, (b) provide a `search_documents` tool
+  for the Orchestrator. Option (b) is more controllable and avoids
+  injecting irrelevant chunks into every query.
+
+- **Multi-modal image re-injection.** Current implementation scans
+  `.files/` and matches filenames via `strings.Contains(content, name)`.
+  This is fragile (false positives on substring matches, O(n) directory
+  scan). A cleaner approach: `ProcessMedia` populates
+  `StoredMessage.FilePaths`, and `curateHistory` re-injects images
+  strictly from that field. This also enables proper cleanup of expired
+  files and per-message attachment tracking.
 
 ---
 

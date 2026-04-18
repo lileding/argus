@@ -469,8 +469,14 @@ func (s *PostgresStore) SetReplyStatus(ctx context.Context, msgID int64, status 
 }
 
 func (s *PostgresStore) AckReply(ctx context.Context, msgID int64, replyChannelID string) error {
+	// Only stores the reply channel ID. Does NOT change reply_status —
+	// the caller is responsible for status transitions. Previously this
+	// set status='ready' which was correct when called by Filter, but
+	// after the refactor the Dispatcher calls it post-claim (status is
+	// already 'processing') and resetting to 'ready' was a bug that
+	// could cause duplicate claims.
 	_, err := s.db.ExecContext(ctx, `
-		UPDATE messages SET reply_status = 'ready', reply_channel_id = $1 WHERE id = $2
+		UPDATE messages SET reply_channel_id = $1 WHERE id = $2
 	`, replyChannelID, msgID)
 	return err
 }
@@ -523,13 +529,7 @@ func (s *PostgresStore) RecoverQueue(ctx context.Context) (recovered int, unacke
 	}
 	n1, _ := res.RowsAffected()
 
-	// filtering → received (crash during media download)
-	res, err = s.db.ExecContext(ctx, `UPDATE messages SET reply_status = 'received' WHERE reply_status = 'filtering'`)
-	if err != nil {
-		return 0, nil, fmt.Errorf("recover filtering: %w", err)
-	}
-	n2, _ := res.RowsAffected()
-	recovered = int(n1 + n2)
+	recovered = int(n1)
 
 	// Return received rows for Filter re-processing.
 	rows, err := s.db.QueryContext(ctx, `
