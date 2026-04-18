@@ -20,7 +20,8 @@ type OpenAIClient struct {
 	apiKey             string
 	modelName          string
 	transcriptionModel string
-	maxTokens          int
+	maxTokens          int // Phase 1 (orchestrator)
+	maxReplyTokens     int // Phase 2 (synthesizer)
 	client             *http.Client
 }
 
@@ -31,6 +32,7 @@ func NewOpenAIClient(cfg config.ModelConfig) *OpenAIClient {
 		modelName:          cfg.ModelName,
 		transcriptionModel: cfg.TranscriptionModel,
 		maxTokens:          cfg.MaxTokens,
+		maxReplyTokens:     cfg.MaxReplyTokens,
 		client:             &http.Client{Timeout: cfg.Timeout},
 	}
 }
@@ -292,10 +294,12 @@ func (c *OpenAIClient) ChatWithEarlyAbort(ctx context.Context, messages []Messag
 // The channel is closed after a chunk with Done=true. On error, a final chunk
 // with Done=true and Err set is sent.
 func (c *OpenAIClient) ChatStream(ctx context.Context, messages []Message, tools []ToolDef) (<-chan StreamChunk, error) {
+	// Phase 2 (synthesizer) uses maxReplyTokens — typically much larger
+	// than maxTokens to allow long final replies.
 	reqBody := chatRequest{
 		Model:     c.modelName,
 		Messages:  messages,
-		MaxTokens: c.maxTokens,
+		MaxTokens: c.maxReplyTokens,
 		Stream:    true,
 	}
 	if len(tools) > 0 {

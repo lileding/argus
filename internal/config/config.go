@@ -53,7 +53,8 @@ type ModelConfig struct {
 	BaseURL            string        `yaml:"base_url"`
 	ModelName          string        `yaml:"model_name"`
 	APIKey             string        `yaml:"api_key"`
-	MaxTokens          int           `yaml:"max_tokens"`
+	MaxTokens          int           `yaml:"max_tokens"`       // Phase 1 (orchestrator) token limit
+	MaxReplyTokens     int           `yaml:"max_reply_tokens"` // Phase 2 (synthesizer) token limit
 	Timeout            time.Duration `yaml:"timeout"`
 	TranscriptionModel string        `yaml:"transcription_model"`
 }
@@ -108,6 +109,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Model.MaxTokens == 0 {
 		c.Model.MaxTokens = 4096
+	}
+	if c.Model.MaxReplyTokens == 0 {
+		c.Model.MaxReplyTokens = 16384
 	}
 	if c.Model.Timeout == 0 {
 		c.Model.Timeout = 120 * time.Second
