@@ -56,6 +56,85 @@ func TestToolStatusCard_ReadFile(t *testing.T) {
 	}
 }
 
+func TestSplitAtCodeBlocks(t *testing.T) {
+	cases := []struct {
+		name     string
+		input    string
+		wantN    int // expected number of segments
+		wantCode bool // at least one segment should contain ```
+	}{
+		{
+			name:  "no code blocks",
+			input: "just plain text",
+			wantN: 1,
+		},
+		{
+			name:     "one code block",
+			input:    "before\n\n```python\nprint('hi')\n```\n\nafter",
+			wantN:    3, // before, code, after
+			wantCode: true,
+		},
+		{
+			name:     "code block only",
+			input:    "```go\nfmt.Println()\n```",
+			wantN:    1,
+			wantCode: true,
+		},
+		{
+			name:     "two code blocks",
+			input:    "text1\n```a\nx\n```\ntext2\n```b\ny\n```\ntext3",
+			wantN:    5,
+			wantCode: true,
+		},
+		{
+			name:  "unclosed code block",
+			input: "start\n```python\ncode without close",
+			wantN: 2, // "start", rest as code
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			segs := splitAtCodeBlocks(tc.input)
+			if len(segs) != tc.wantN {
+				t.Errorf("got %d segments, want %d\nsegments: %v", len(segs), tc.wantN, segs)
+			}
+			if tc.wantCode {
+				hasCode := false
+				for _, s := range segs {
+					if strings.Contains(s, "```") {
+						hasCode = true
+					}
+				}
+				if !hasCode {
+					t.Error("expected at least one code segment")
+				}
+			}
+		})
+	}
+}
+
+func TestMarkdownToCard_CodeBlockSplit(t *testing.T) {
+	md := "Hello\n\n```python\nprint('world')\nprint('foo')\nprint('bar')\n```\n\nDone"
+	card := MarkdownToCard(md)
+	var m map[string]any
+	json.Unmarshal([]byte(card), &m)
+	body := m["body"].(map[string]any)
+	elements := body["elements"].([]any)
+	if len(elements) != 3 {
+		t.Fatalf("expected 3 elements (text, code, text), got %d", len(elements))
+	}
+	// First element should be "Hello"
+	first := elements[0].(map[string]any)["content"].(string)
+	if !strings.Contains(first, "Hello") {
+		t.Errorf("first element should contain Hello, got: %s", first)
+	}
+	// Second element should contain the code block
+	second := elements[1].(map[string]any)["content"].(string)
+	if !strings.Contains(second, "```") {
+		t.Errorf("second element should contain code block, got: %s", second)
+	}
+}
+
 func TestDetectLang(t *testing.T) {
 	if detectLang("你好世界") != "zh" {
 		t.Error("expected zh")

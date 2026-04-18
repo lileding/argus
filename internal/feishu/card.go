@@ -4,14 +4,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strings"
 )
 
 var imgMarkerRe = regexp.MustCompile(`\[\[IMG:([^\]]+)\]\]`)
 
 // MarkdownToCard builds a Feishu interactive card from markdown content.
+// Code blocks are split into separate markdown elements to work around a
+// Feishu client bug where code blocks in a single markdown element are
+// collapsed to ~5 lines with a broken expand button (especially after
+// multiple PATCH updates via update_multi).
 func MarkdownToCard(md string) string {
 	content := imgMarkerRe.ReplaceAllString(md, "![]($1)")
-	return buildCard(content)
+	segments := splitAtCodeBlocks(content)
+	if len(segments) <= 1 {
+		return buildCard(content)
+	}
+	return buildCardMulti(segments)
 }
 
 // ThinkingCard builds a "thinking" status card in the appropriate language.
@@ -144,6 +153,72 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max] + "..."
+}
+
+// splitAtCodeBlocks splits markdown at triple-backtick code fence
+// boundaries, returning alternating text/code segments. Each segment
+// becomes a separate card element so Feishu's client renders code
+// blocks independently (avoiding the 5-line collapse bug).
+func splitAtCodeBlocks(md string) []string {
+	var segments []string
+	rest := md
+	for {
+		// Find opening ```
+		idx := strings.Index(rest, "```")
+		if idx < 0 {
+			break
+		}
+		// Text before the code block.
+		before := strings.TrimSpace(rest[:idx])
+		if before != "" {
+			segments = append(segments, before)
+		}
+		// Find closing ``` (after the opening line).
+		afterOpen := rest[idx+3:]
+		// Skip to end of opening line (language tag).
+		nlIdx := strings.Index(afterOpen, "\n")
+		if nlIdx < 0 {
+			// Malformed: no newline after opening ```. Treat rest as text.
+			break
+		}
+		closeIdx := strings.Index(afterOpen[nlIdx+1:], "```")
+		if closeIdx < 0 {
+			// Unclosed code block — include everything remaining.
+			segments = append(segments, rest[idx:])
+			rest = ""
+			break
+		}
+		// closeIdx is relative to afterOpen[nlIdx+1:].
+		endPos := idx + 3 + nlIdx + 1 + closeIdx + 3
+		segments = append(segments, rest[idx:endPos])
+		rest = rest[endPos:]
+	}
+	trailing := strings.TrimSpace(rest)
+	if trailing != "" {
+		segments = append(segments, trailing)
+	}
+	return segments
+}
+
+func buildCardMulti(segments []string) string {
+	elements := make([]any, len(segments))
+	for i, seg := range segments {
+		elements[i] = map[string]any{
+			"tag":     "markdown",
+			"content": seg,
+		}
+	}
+	card := map[string]any{
+		"schema": "2.0",
+		"config": map[string]any{
+			"update_multi": true,
+		},
+		"body": map[string]any{
+			"elements": elements,
+		},
+	}
+	data, _ := json.Marshal(card)
+	return string(data)
 }
 
 func buildCard(markdownContent string) string {
