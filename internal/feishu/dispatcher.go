@@ -190,12 +190,7 @@ func (d *Dispatcher) processChat(chatID string, ch chan QueuedMessage) {
 			"content_preview", truncateForLog(claimed.Content, 60),
 		)
 
-		agentCh := d.agent.HandleStreamQueued(ctx, chatID, claimed.ID, claimed.Content)
-		d.adapter.HandleEvents(agentCh, claimed.TriggerMsgID, replyChannelID, claimed.Content)
-
-		if err := d.store.FinishReply(ctx, claimed.ID); err != nil {
-			slog.Error("dispatcher: finish reply", "msg_id", claimed.ID, "err", err)
-		}
+		d.processAndTrace(ctx, chatID, claimed, replyChannelID)
 
 		slog.Info("dispatcher: done", "chat_id", chatID, "msg_id", claimed.ID)
 
@@ -217,11 +212,7 @@ func (d *Dispatcher) drainReady(ctx context.Context, chatID string) {
 			return
 		}
 
-		slog.Info("dispatcher: drain-processing",
-			"chat_id", chatID, "msg_id", claimed.ID,
-			"content_preview", truncateForLog(claimed.Content, 60),
-		)
-
+		// Send thinking card for this drain message.
 		replyChannelID := ""
 		if claimed.TriggerMsgID != "" {
 			lang := quickDetectLang(claimed.Content)
@@ -232,13 +223,106 @@ func (d *Dispatcher) drainReady(ctx context.Context, chatID string) {
 			}
 		}
 
-		agentCh := d.agent.HandleStreamQueued(ctx, chatID, claimed.ID, claimed.Content)
-		d.adapter.HandleEvents(agentCh, claimed.TriggerMsgID, replyChannelID, claimed.Content)
-
-		if err := d.store.FinishReply(ctx, claimed.ID); err != nil {
-			slog.Error("dispatcher: drain finish", "msg_id", claimed.ID, "err", err)
-		}
+		d.processAndTrace(ctx, chatID, claimed, replyChannelID)
 		slog.Info("dispatcher: drain-done", "chat_id", chatID, "msg_id", claimed.ID)
+	}
+}
+
+// processAndTrace runs the agent, forwards events to the adapter for UI,
+// and collects trace data from the event stream for persistence.
+func (d *Dispatcher) processAndTrace(ctx context.Context, chatID string, msg *store.StoredMessage, replyChannelID string) {
+	start := time.Now()
+
+	// Create trace record.
+	trace := &store.Trace{MessageID: msg.ID, ChatID: chatID}
+	if ts, ok := d.store.(store.TraceStore); ok {
+		if err := ts.CreateTrace(ctx, trace); err != nil {
+			slog.Warn("dispatcher: create trace", "err", err)
+		}
+	}
+
+	// Run agent and tee events: adapter gets UI events, we collect trace data.
+	agentCh := d.agent.HandleStreamQueued(ctx, chatID, msg.ID, msg.Content)
+	adapterCh := make(chan agent.Event, 16)
+
+	var toolCalls []store.ToolCallRecord
+	// Map iteration:seq → arguments (from ToolCall events, paired with ToolResult).
+	toolArgs := map[[2]int]string{}
+	var composing *agent.ComposingPayload
+	var replyPayload *agent.ReplyPayload
+
+	go func() {
+		defer close(adapterCh)
+		for ev := range agentCh {
+			switch ev.Type {
+			case agent.EventToolCall:
+				p := ev.Payload.(agent.ToolCallPayload)
+				toolArgs[[2]int{p.Iteration, p.Seq}] = p.Arguments
+			case agent.EventToolResult:
+				p := ev.Payload.(agent.ToolResultPayload)
+				toolCalls = append(toolCalls, store.ToolCallRecord{
+					TraceID:    trace.ID,
+					Iteration:  p.Iteration,
+					Seq:        p.Seq,
+					ToolName:   p.Name,
+					Arguments:  toolArgs[[2]int{p.Iteration, p.Seq}],
+					Result:     p.FullResult,
+					IsError:    p.IsError,
+					DurationMs: p.DurationMs,
+				})
+			case agent.EventComposing:
+				if p, ok := ev.Payload.(agent.ComposingPayload); ok {
+					composing = &p
+				}
+			case agent.EventReply:
+				if p, ok := ev.Payload.(agent.ReplyPayload); ok {
+					replyPayload = &p
+				}
+			}
+			adapterCh <- ev
+		}
+	}()
+
+	// Adapter consumes the forwarded channel.
+	d.adapter.HandleEvents(adapterCh, msg.TriggerMsgID, replyChannelID, msg.Content)
+
+	// Finish reply in queue.
+	if err := d.store.FinishReply(ctx, msg.ID); err != nil {
+		slog.Error("dispatcher: finish reply", "msg_id", msg.ID, "err", err)
+	}
+
+	// Persist trace data.
+	if ts, ok := d.store.(store.TraceStore); ok && trace.ID > 0 {
+		// Fill in trace-level stats.
+		if composing != nil {
+			trace.Iterations = composing.Iterations
+			trace.Summary = composing.Summary
+			trace.TotalPromptTokens = composing.TotalPromptTokens
+			trace.TotalCompletionTokens = composing.TotalCompletionTokens
+		}
+		if replyPayload != nil {
+			trace.SynthPromptTokens = replyPayload.PromptTokens
+			trace.SynthCompletionTokens = replyPayload.CompletionTokens
+		}
+		trace.DurationMs = int(time.Since(start).Milliseconds())
+
+		if err := ts.FinishTrace(ctx, trace); err != nil {
+			slog.Warn("dispatcher: finish trace", "err", err)
+		}
+
+		// Save tool calls. Fill in arguments from ToolCall events.
+		if len(toolCalls) > 0 {
+			if err := ts.SaveToolCalls(ctx, toolCalls); err != nil {
+				slog.Warn("dispatcher: save tool calls", "err", err)
+			}
+		}
+
+		slog.Info("trace saved",
+			"trace_id", trace.ID, "msg_id", msg.ID,
+			"iterations", trace.Iterations,
+			"tool_calls", len(toolCalls),
+			"duration_ms", trace.DurationMs,
+		)
 	}
 }
 

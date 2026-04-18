@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"argus/internal/embedding"
 	"argus/internal/model"
@@ -51,6 +52,13 @@ type toolCallRecord struct {
 	Result    string
 }
 
+// orchestratorStats captures metrics from Phase 1 for trace recording.
+type orchestratorStats struct {
+	Iterations            int
+	TotalPromptTokens     int
+	TotalCompletionTokens int
+}
+
 // HandleStream processes a user message in two phases: orchestration (tool calling)
 // then synthesis (final reply generation). Returns a channel of events for UI updates.
 func (a *Agent) HandleStream(ctx context.Context, chatID string, userMsg model.Message) <-chan Event {
@@ -92,13 +100,18 @@ func (a *Agent) HandleStream(ctx context.Context, chatID string, userMsg model.M
 		userText := userMsg.TextContent()
 
 		// Phase 1: Orchestration — collect materials via tool calls.
-		toolResults, finishSummary := a.runOrchestrator(ctx, ch, userMsg, userText, history)
+		toolResults, finishSummary, orchStats := a.runOrchestrator(ctx, ch, userMsg, userText, history)
 
-		// Signal transition: orchestrator done, synthesizer starting.
-		ch <- Event{Type: EventComposing}
+		// Signal transition with orchestrator stats for trace recording.
+		ch <- Event{Type: EventComposing, Payload: ComposingPayload{
+			Iterations:            orchStats.Iterations,
+			Summary:               finishSummary,
+			TotalPromptTokens:     orchStats.TotalPromptTokens,
+			TotalCompletionTokens: orchStats.TotalCompletionTokens,
+		}}
 
 		// Phase 2: Synthesis — compose final answer from materials.
-		reply := a.runSynthesizer(ctx, ch, userMsg, userText, history, toolResults, finishSummary)
+		reply, synthPT, synthCT := a.runSynthesizer(ctx, ch, userMsg, userText, history, toolResults, finishSummary)
 
 		// Save assistant reply.
 		if err := a.store.SaveMessage(ctx, &store.StoredMessage{
@@ -110,7 +123,9 @@ func (a *Agent) HandleStream(ctx context.Context, chatID string, userMsg model.M
 			return
 		}
 
-		ch <- Event{Type: EventReply, Payload: ReplyPayload{Text: reply}}
+		ch <- Event{Type: EventReply, Payload: ReplyPayload{
+			Text: reply, PromptTokens: synthPT, CompletionTokens: synthCT,
+		}}
 	}()
 
 	return ch
@@ -138,13 +153,18 @@ func (a *Agent) HandleStreamQueued(ctx context.Context, chatID string, savedMsgI
 		userMsg := model.NewTextMessage(model.RoleUser, userText)
 
 		// Phase 1: Orchestration.
-		toolResults, finishSummary := a.runOrchestrator(ctx, ch, userMsg, userText, history)
+		toolResults, finishSummary, orchStats := a.runOrchestrator(ctx, ch, userMsg, userText, history)
 
-		// Signal transition.
-		ch <- Event{Type: EventComposing}
+		// Signal transition with orchestrator stats for trace recording.
+		ch <- Event{Type: EventComposing, Payload: ComposingPayload{
+			Iterations:            orchStats.Iterations,
+			Summary:               finishSummary,
+			TotalPromptTokens:     orchStats.TotalPromptTokens,
+			TotalCompletionTokens: orchStats.TotalCompletionTokens,
+		}}
 
 		// Phase 2: Synthesis.
-		reply := a.runSynthesizer(ctx, ch, userMsg, userText, history, toolResults, finishSummary)
+		reply, synthPT, synthCT := a.runSynthesizer(ctx, ch, userMsg, userText, history, toolResults, finishSummary)
 
 		// Save assistant reply.
 		if err := a.store.SaveMessage(ctx, &store.StoredMessage{
@@ -156,7 +176,9 @@ func (a *Agent) HandleStreamQueued(ctx context.Context, chatID string, savedMsgI
 			return
 		}
 
-		ch <- Event{Type: EventReply, Payload: ReplyPayload{Text: reply}}
+		ch <- Event{Type: EventReply, Payload: ReplyPayload{
+			Text: reply, PromptTokens: synthPT, CompletionTokens: synthCT,
+		}}
 	}()
 
 	return ch
@@ -169,7 +191,7 @@ func (a *Agent) runOrchestrator(
 	userMsg model.Message,
 	userText string,
 	history []model.Message,
-) (results []toolCallRecord, summary string) {
+) (results []toolCallRecord, summary string, stats orchestratorStats) {
 	// Build orchestrator system prompt.
 	sysPrompt := a.buildOrchestratorPrompt()
 
@@ -212,6 +234,10 @@ func (a *Agent) runOrchestrator(
 			summary = fmt.Sprintf("Orchestrator error: %v", err)
 			return
 		}
+
+		stats.Iterations = i + 1
+		stats.TotalPromptTokens += resp.Usage.PromptTokens
+		stats.TotalCompletionTokens += resp.Usage.CompletionTokens
 
 		slog.Info("orchestrator response",
 			"iteration", i,
@@ -264,10 +290,12 @@ func (a *Agent) runOrchestrator(
 		// Pre-check budgets (serial — modifies shared state) and build
 		// the list of tools to actually execute.
 		type toolSlot struct {
-			tc       model.ToolCall
-			rejected bool   // budget exhausted
-			errMsg   string // rejection message
-			result   string // filled by execution
+			tc         model.ToolCall
+			rejected   bool   // budget exhausted
+			errMsg     string // rejection message
+			result     string // filled by execution (truncated)
+			fullResult string // full result for trace
+			durationMs int    // execution time
 		}
 		slots := make([]toolSlot, len(resp.ToolCalls))
 		forceStop := false
@@ -295,44 +323,56 @@ func (a *Agent) runOrchestrator(
 		}
 
 		// Emit EventToolCall for non-rejected tools.
-		for i := range slots {
-			if !slots[i].rejected {
+		seq := 0
+		for idx := range slots {
+			if !slots[idx].rejected {
 				ch <- Event{Type: EventToolCall, Payload: ToolCallPayload{
-					Name: slots[i].tc.Function.Name, Arguments: slots[i].tc.Function.Arguments, CallID: slots[i].tc.ID,
+					Name: slots[idx].tc.Function.Name, Arguments: slots[idx].tc.Function.Arguments,
+					CallID: slots[idx].tc.ID, Iteration: i, Seq: seq,
 				}}
+				seq++
 			}
 		}
 
 		// Execute non-rejected tools in parallel.
 		var wg sync.WaitGroup
-		for i := range slots {
-			if slots[i].rejected {
+		for idx := range slots {
+			if slots[idx].rejected {
 				continue
 			}
 			wg.Add(1)
 			go func(s *toolSlot) {
 				defer wg.Done()
 				slog.Info("tool call", "tool", s.tc.Function.Name, "arguments", s.tc.Function.Arguments)
-				s.result = truncateResult(a.executeTool(ctx, s.tc), maxToolResultBytes)
-				slog.Info("tool result", "tool", s.tc.Function.Name, "result_len", len(s.result))
-			}(&slots[i])
+				start := time.Now()
+				raw := a.executeTool(ctx, s.tc)
+				s.durationMs = int(time.Since(start).Milliseconds())
+				s.fullResult = raw
+				s.result = truncateResult(raw, maxToolResultBytes)
+				slog.Info("tool result", "tool", s.tc.Function.Name, "result_len", len(s.result), "duration_ms", s.durationMs)
+			}(&slots[idx])
 		}
 		wg.Wait()
 
 		// Append results to messages and records in original order.
-		for i := range slots {
-			s := &slots[i]
+		resultSeq := 0
+		for idx := range slots {
+			s := &slots[idx]
 			if s.rejected {
 				ch <- Event{Type: EventToolResult, Payload: ToolResultPayload{
 					Name: s.tc.Function.Name, CallID: s.tc.ID,
-					Result: truncateResult(s.errMsg, 200), IsError: true,
+					Result: truncateResult(s.errMsg, 200), FullResult: s.errMsg,
+					IsError: true, Iteration: i, Seq: resultSeq,
 				}}
 				messages = append(messages, model.Message{Role: model.RoleTool, Content: s.errMsg, ToolCallID: s.tc.ID})
 			} else {
 				ch <- Event{Type: EventToolResult, Payload: ToolResultPayload{
 					Name: s.tc.Function.Name, CallID: s.tc.ID,
-					Result:  truncateResult(s.result, 200),
-					IsError: strings.HasPrefix(s.result, "error:"),
+					Result:     truncateResult(s.result, 200),
+					FullResult: s.fullResult,
+					IsError:    strings.HasPrefix(s.result, "error:"),
+					DurationMs: s.durationMs,
+					Iteration:  i, Seq: resultSeq,
 				}}
 				results = append(results, toolCallRecord{
 					Name:      s.tc.Function.Name,
@@ -341,6 +381,7 @@ func (a *Agent) runOrchestrator(
 				})
 				messages = append(messages, model.Message{Role: model.RoleTool, Content: s.result, ToolCallID: s.tc.ID})
 			}
+			resultSeq++
 		}
 
 		if forceStop {
@@ -371,7 +412,7 @@ func (a *Agent) runSynthesizer(
 	history []model.Message,
 	toolResults []toolCallRecord,
 	summary string,
-) string {
+) (text string, promptTokens, completionTokens int) {
 	// Build synthesizer prompt with environment info.
 	sysPrompt := a.buildSynthesizerPrompt()
 
@@ -410,9 +451,9 @@ func (a *Agent) runSynthesizer(
 		// Fallback to non-streaming.
 		resp, fallbackErr := a.model.Chat(ctx, messages, nil)
 		if fallbackErr != nil {
-			return fmt.Sprintf("Error generating response: %v", fallbackErr)
+			return fmt.Sprintf("Error generating response: %v", fallbackErr), 0, 0
 		}
-		return resp.Content
+		return resp.Content, resp.Usage.PromptTokens, resp.Usage.CompletionTokens
 	}
 
 	var full strings.Builder
@@ -427,7 +468,7 @@ func (a *Agent) runSynthesizer(
 			if chunk.Err != nil {
 				slog.Error("synthesizer stream error", "err", chunk.Err)
 				if full.Len() == 0 {
-					return fmt.Sprintf("Error generating response: %v", chunk.Err)
+					return fmt.Sprintf("Error generating response: %v", chunk.Err), 0, 0
 				}
 			}
 		}
@@ -439,7 +480,7 @@ func (a *Agent) runSynthesizer(
 		"content_len", full.Len(),
 	)
 
-	return full.String()
+	return full.String(), finalUsage.PromptTokens, finalUsage.CompletionTokens
 }
 
 // Handle is the synchronous compatibility wrapper.

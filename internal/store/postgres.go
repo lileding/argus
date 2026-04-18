@@ -436,6 +436,50 @@ func (s *PostgresStore) FailedTranscriptions(ctx context.Context) ([]StoredMessa
 	return msgs, nil
 }
 
+// --- TraceStore ---
+
+func (s *PostgresStore) CreateTrace(ctx context.Context, t *Trace) error {
+	return s.db.QueryRowContext(ctx, `
+		INSERT INTO traces (message_id, chat_id) VALUES ($1, $2)
+		RETURNING id, created_at
+	`, t.MessageID, t.ChatID).Scan(&t.ID, &t.CreatedAt)
+}
+
+func (s *PostgresStore) FinishTrace(ctx context.Context, t *Trace) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE traces SET
+			reply_id = $1, iterations = $2, summary = $3,
+			total_prompt_tokens = $4, total_completion_tokens = $5,
+			synth_prompt_tokens = $6, synth_completion_tokens = $7,
+			duration_ms = $8
+		WHERE id = $9
+	`, t.ReplyID, t.Iterations, t.Summary,
+		t.TotalPromptTokens, t.TotalCompletionTokens,
+		t.SynthPromptTokens, t.SynthCompletionTokens,
+		t.DurationMs, t.ID)
+	return err
+}
+
+func (s *PostgresStore) SaveToolCalls(ctx context.Context, calls []ToolCallRecord) error {
+	if len(calls) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	for _, c := range calls {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO tool_calls (trace_id, iteration, seq, tool_name, arguments, result, is_error, duration_ms)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		`, c.TraceID, c.Iteration, c.Seq, c.ToolName, c.Arguments, c.Result, c.IsError, c.DurationMs); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // --- QueueStore (message pipeline) ---
 
 func (s *PostgresStore) SaveMessageQueued(ctx context.Context, msg *StoredMessage) error {

@@ -27,21 +27,36 @@ type ToolCallPayload struct {
 	Name      string
 	Arguments string
 	CallID    string
+	Iteration int // orchestrator iteration (0-based)
+	Seq       int // sequence within iteration (for parallel calls)
 }
 
 type ToolResultPayload struct {
-	Name    string
-	CallID  string
-	Result  string // truncated summary
-	IsError bool
+	Name       string
+	CallID     string
+	Result     string // truncated for UI display
+	FullResult string // full result for trace storage
+	IsError    bool
+	DurationMs int // tool execution time
+	Iteration  int
+	Seq        int
+}
+
+// ComposingPayload carries orchestrator summary stats for trace recording.
+type ComposingPayload struct {
+	Iterations            int
+	Summary               string
+	TotalPromptTokens     int
+	TotalCompletionTokens int
 }
 
 type ReplyPayload struct {
-	Text string
+	Text                string
+	PromptTokens        int // synthesizer token usage
+	CompletionTokens    int
 }
 
 // ReplyDeltaPayload carries the accumulated (not incremental) reply text so far.
-// Downstream consumers receive the full current string — simpler for card updates.
 type ReplyDeltaPayload struct {
 	Text string
 }

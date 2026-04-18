@@ -85,6 +85,40 @@ type QueueStore interface {
 	PendingChats(ctx context.Context) ([]string, error)
 }
 
+// TraceStore records the full processing trace for each message.
+type TraceStore interface {
+	CreateTrace(ctx context.Context, t *Trace) error
+	FinishTrace(ctx context.Context, t *Trace) error
+	SaveToolCalls(ctx context.Context, calls []ToolCallRecord) error
+}
+
+type Trace struct {
+	ID                     int64
+	MessageID              int64
+	ReplyID                int64
+	ChatID                 string
+	Iterations             int
+	Summary                string
+	TotalPromptTokens      int
+	TotalCompletionTokens  int
+	SynthPromptTokens      int
+	SynthCompletionTokens  int
+	DurationMs             int
+	CreatedAt              time.Time
+}
+
+type ToolCallRecord struct {
+	ID         int64
+	TraceID    int64
+	Iteration  int
+	Seq        int
+	ToolName   string
+	Arguments  string
+	Result     string
+	IsError    bool
+	DurationMs int
+}
+
 // DocumentStore manages document ingestion and RAG.
 type DocumentStore interface {
 	SaveDocument(ctx context.Context, doc *Document) error
