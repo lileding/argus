@@ -88,12 +88,6 @@ func humanizeToolCall(toolName, argsJSON, lang string) string {
 			return "🕐 获取当前时间"
 		}
 		return "🕐 Getting current time"
-	case "save_skill":
-		n := args["name"]
-		if zh {
-			return fmt.Sprintf("💾 正在保存技能: **%s**", n)
-		}
-		return fmt.Sprintf("💾 Saving skill: **%s**", n)
 	case "activate_skill":
 		n := args["name"]
 		if zh {
@@ -109,17 +103,36 @@ func humanizeToolCall(toolName, argsJSON, lang string) string {
 	case "forget":
 		return fmt.Sprintf("🗑️ forget id=%s", args["id"])
 	case "db":
-		sql := truncate(args["sql"], 60)
-		if zh {
-			return fmt.Sprintf("🔎 查询数据库: `%s`", sql)
+		cmd := truncate(args["command"], 60)
+		// Extract verb from command for appropriate emoji.
+		verb := strings.SplitN(cmd, " ", 2)[0]
+		switch verb {
+		case "query", "describe", "list", "count":
+			if zh {
+				return fmt.Sprintf("🔎 查询数据: `%s`", cmd)
+			}
+			return fmt.Sprintf("🔎 Data query: `%s`", cmd)
+		case "insert":
+			if zh {
+				return fmt.Sprintf("📝 写入数据: `%s`", cmd)
+			}
+			return fmt.Sprintf("📝 Data insert: `%s`", cmd)
+		case "update":
+			if zh {
+				return fmt.Sprintf("✏️ 更新数据: `%s`", cmd)
+			}
+			return fmt.Sprintf("✏️ Data update: `%s`", cmd)
+		case "create":
+			if zh {
+				return fmt.Sprintf("🗂️ 创建表: `%s`", cmd)
+			}
+			return fmt.Sprintf("🗂️ Create table: `%s`", cmd)
+		default:
+			if zh {
+				return fmt.Sprintf("🔎 数据操作: `%s`", cmd)
+			}
+			return fmt.Sprintf("🔎 Data: `%s`", cmd)
 		}
-		return fmt.Sprintf("🔎 DB query: `%s`", sql)
-	case "db_exec":
-		sql := truncate(args["sql"], 60)
-		if zh {
-			return fmt.Sprintf("💾 写入数据库: `%s`", sql)
-		}
-		return fmt.Sprintf("💾 DB write: `%s`", sql)
 	case "finish_task":
 		if zh {
 			return "✅ 整理回复中..."
