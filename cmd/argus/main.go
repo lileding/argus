@@ -109,8 +109,7 @@ func buildToolRegistry(cfg *config.Config, sb sandbox.Sandbox, loader *skill.Fil
 	registry.Register(tool.NewCurrentTimeTool())
 	registry.Register(tool.NewFinishTaskTool())
 
-	skillsDir := filepath.Join(cfg.Agent.WorkspaceDir, cfg.Agent.SkillsDir)
-	registry.Register(tool.NewSaveSkillTool(skillsDir, loader.Rebuild))
+	// save_skill removed — skills are authored by humans, not the model.
 	registry.Register(tool.NewActivateSkillTool(loader.Index()))
 
 	if db != nil {

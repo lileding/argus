@@ -128,14 +128,14 @@ func NewWriteFileTool(workspaceDir string) *WriteFileTool {
 func (t *WriteFileTool) Name() string { return "write_file" }
 
 func (t *WriteFileTool) Description() string {
-	return "Write content to a file in the workspace. Creates the file and any parent directories if they don't exist. Use this to save results, create scripts, or write reports."
+	return "Write content to a file. Files are saved under the .users/ directory in the workspace. Use this to save results, create scripts, or write reports."
 }
 
 func (t *WriteFileTool) Parameters() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
 		"properties": {
-			"path": {"type": "string", "description": "File path relative to workspace"},
+			"path": {"type": "string", "description": "File path (will be placed under .users/ directory)"},
 			"content": {"type": "string", "description": "Content to write"}
 		},
 		"required": ["path", "content"]
@@ -153,7 +153,14 @@ func (t *WriteFileTool) Execute(_ context.Context, arguments string) (string, er
 		return "", fmt.Errorf("parse arguments: %w", err)
 	}
 
-	fullPath, err := workspacePath(t.workspaceDir, args.Path)
+	// Force all writes into .users/ directory — model cannot write to
+	// .skills/, .files/, or other workspace directories.
+	writePath := args.Path
+	if !strings.HasPrefix(writePath, ".users/") && !strings.HasPrefix(writePath, ".users\\") {
+		writePath = filepath.Join(".users", writePath)
+	}
+
+	fullPath, err := workspacePath(t.workspaceDir, writePath)
 	if err != nil {
 		return "", err
 	}
@@ -165,5 +172,5 @@ func (t *WriteFileTool) Execute(_ context.Context, arguments string) (string, er
 	if err := os.WriteFile(fullPath, []byte(args.Content), 0644); err != nil {
 		return "", fmt.Errorf("write file: %w", err)
 	}
-	return fmt.Sprintf("wrote %d bytes to %s", len(args.Content), args.Path), nil
+	return fmt.Sprintf("wrote %d bytes to %s", len(args.Content), writePath), nil
 }
