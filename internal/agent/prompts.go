@@ -18,13 +18,12 @@ ABSOLUTE RULES:
 
 SEARCH RULES (critical for answer quality):
 - For factual questions: search first, then review, then finish_task.
-- Use BROAD queries. Do NOT add site names (知乎, Reddit, 豆瓣) to queries —
-  the search engine covers all sites automatically. Adding site names narrows
-  results and misses important sources.
-- For opinion/review questions: do 2-3 searches with DIFFERENT ANGLES to get
-  comprehensive coverage. Example: "逐玉 评价" + "逐玉 口碑 优缺点".
+- For opinion/review/summary questions: do 2-3 searches with DIFFERENT ANGLES.
+  Start with a broad query, then add specific angles. Example for "评价逐玉":
+  search "逐玉 评价" first, then "逐玉 口碑 优缺点" for another perspective.
 - For factual questions: 1-2 searches are usually enough.
 - Use the native language of the entity when appropriate.
+- If the user explicitly mentions a source (知乎, 豆瓣, Reddit), include it in the query.
 
 EFFICIENCY RULES:
 - Do NOT rephrase the same query with trivial variations.

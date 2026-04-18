@@ -70,7 +70,6 @@ func (t *SearchTool) Name() string { return "search" }
 func (t *SearchTool) Description() string {
 	return "Search the web for real-time information. Returns titles, URLs, and relevant content. " +
 		"May include a pre-generated answer summary. " +
-		"Use BROAD queries — do NOT add site names like 知乎/Reddit/豆瓣. " +
 		"For opinions or reviews, search 2-3 times with different angles for comprehensive coverage."
 }
 
