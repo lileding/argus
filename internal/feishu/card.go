@@ -200,12 +200,49 @@ func splitAtCodeBlocks(md string) []string {
 	return segments
 }
 
+// codeBlockRe matches a fenced code block: ```lang\n...\n```
+var codeBlockRe = regexp.MustCompile("(?s)```(\\w*)\\n(.*?)```")
+
 func buildCardMulti(segments []string) string {
-	elements := make([]any, len(segments))
-	for i, seg := range segments {
-		elements[i] = map[string]any{
-			"tag":     "markdown",
-			"content": seg,
+	var elements []any
+	for _, seg := range segments {
+		if strings.HasPrefix(seg, "```") {
+			// Extract language and code body from fenced block.
+			m := codeBlockRe.FindStringSubmatch(seg)
+			if m != nil {
+				lang := m[1]
+				code := m[2]
+				// Use a div + plain_text element for code. Feishu won't
+				// collapse plain_text — all lines are always visible.
+				label := "Code"
+				if lang != "" {
+					label = lang
+				}
+				elements = append(elements,
+					map[string]any{
+						"tag":     "markdown",
+						"content": fmt.Sprintf("**%s:**", label),
+					},
+					map[string]any{
+						"tag": "div",
+						"text": map[string]any{
+							"tag":     "plain_text",
+							"content": strings.TrimRight(code, "\n"),
+						},
+					},
+				)
+			} else {
+				// Malformed code block — render as markdown fallback.
+				elements = append(elements, map[string]any{
+					"tag":     "markdown",
+					"content": seg,
+				})
+			}
+		} else {
+			elements = append(elements, map[string]any{
+				"tag":     "markdown",
+				"content": seg,
+			})
 		}
 	}
 	card := map[string]any{

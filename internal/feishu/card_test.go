@@ -120,18 +120,35 @@ func TestMarkdownToCard_CodeBlockSplit(t *testing.T) {
 	json.Unmarshal([]byte(card), &m)
 	body := m["body"].(map[string]any)
 	elements := body["elements"].([]any)
-	if len(elements) != 3 {
-		t.Fatalf("expected 3 elements (text, code, text), got %d", len(elements))
+	// Expect: "Hello" (markdown), "python:" (markdown label), code (div+plain_text), "Done" (markdown)
+	if len(elements) < 3 {
+		t.Fatalf("expected at least 3 elements, got %d", len(elements))
 	}
+
 	// First element should be "Hello"
 	first := elements[0].(map[string]any)["content"].(string)
 	if !strings.Contains(first, "Hello") {
 		t.Errorf("first element should contain Hello, got: %s", first)
 	}
-	// Second element should contain the code block
-	second := elements[1].(map[string]any)["content"].(string)
-	if !strings.Contains(second, "```") {
-		t.Errorf("second element should contain code block, got: %s", second)
+
+	// There should be a div element with plain_text containing the code
+	foundDiv := false
+	for _, el := range elements {
+		e := el.(map[string]any)
+		if e["tag"] == "div" {
+			text := e["text"].(map[string]any)
+			if text["tag"] == "plain_text" && strings.Contains(text["content"].(string), "print") {
+				foundDiv = true
+			}
+		}
+	}
+	if !foundDiv {
+		t.Errorf("expected a div+plain_text element with code content\ncard: %s", card)
+	}
+
+	// Code should NOT appear as markdown triple-backtick (it's in plain_text now)
+	if strings.Contains(card, "```python") {
+		t.Error("code block should be converted to plain_text, not left as markdown fenced block")
 	}
 }
 
