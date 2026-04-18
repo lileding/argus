@@ -114,17 +114,19 @@ func (a *Agent) HandleStream(ctx context.Context, chatID string, userMsg model.M
 		reply, synthPT, synthCT := a.runSynthesizer(ctx, ch, userMsg, userText, history, toolResults, finishSummary)
 
 		// Save assistant reply.
-		if err := a.store.SaveMessage(ctx, &store.StoredMessage{
+		savedReply := &store.StoredMessage{
 			ChatID:  chatID,
 			Role:    string(model.RoleAssistant),
 			Content: reply,
-		}); err != nil {
+		}
+		if err := a.store.SaveMessage(ctx, savedReply); err != nil {
 			ch <- Event{Type: EventError, Payload: ErrorPayload{Err: fmt.Errorf("save assistant reply: %w", err)}}
 			return
 		}
 
 		ch <- Event{Type: EventReply, Payload: ReplyPayload{
-			Text: reply, PromptTokens: synthPT, CompletionTokens: synthCT,
+			Text: reply, ReplyMsgID: savedReply.ID,
+			PromptTokens: synthPT, CompletionTokens: synthCT,
 		}}
 	}()
 
@@ -167,17 +169,19 @@ func (a *Agent) HandleStreamQueued(ctx context.Context, chatID string, savedMsgI
 		reply, synthPT, synthCT := a.runSynthesizer(ctx, ch, userMsg, userText, history, toolResults, finishSummary)
 
 		// Save assistant reply.
-		if err := a.store.SaveMessage(ctx, &store.StoredMessage{
+		savedReply := &store.StoredMessage{
 			ChatID:  chatID,
 			Role:    string(model.RoleAssistant),
 			Content: reply,
-		}); err != nil {
+		}
+		if err := a.store.SaveMessage(ctx, savedReply); err != nil {
 			ch <- Event{Type: EventError, Payload: ErrorPayload{Err: fmt.Errorf("save assistant reply: %w", err)}}
 			return
 		}
 
 		ch <- Event{Type: EventReply, Payload: ReplyPayload{
-			Text: reply, PromptTokens: synthPT, CompletionTokens: synthCT,
+			Text: reply, ReplyMsgID: savedReply.ID,
+			PromptTokens: synthPT, CompletionTokens: synthCT,
 		}}
 	}()
 
@@ -214,7 +218,6 @@ func (a *Agent) runOrchestrator(
 		"db":         6,
 		"cli":        5,
 		"write_file": 3,
-		"db_exec":    5,
 		"remember":   3,
 	}
 	toolCounts := map[string]int{}

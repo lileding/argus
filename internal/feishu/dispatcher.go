@@ -301,6 +301,7 @@ func (d *Dispatcher) processAndTrace(ctx context.Context, chatID string, msg *st
 			trace.TotalCompletionTokens = composing.TotalCompletionTokens
 		}
 		if replyPayload != nil {
+			trace.ReplyID = replyPayload.ReplyMsgID
 			trace.SynthPromptTokens = replyPayload.PromptTokens
 			trace.SynthCompletionTokens = replyPayload.CompletionTokens
 		}

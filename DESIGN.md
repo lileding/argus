@@ -465,7 +465,11 @@ update food_log 42 {"calories": 550}
 ```
 
 7 verbs: `list`, `describe`, `create`, `query`, `count`, `insert`, `update`.
-No `delete` / `drop` / `truncate` — data only grows.
+No `delete` / `drop` / `truncate`. Data is append-only with in-place
+correction: records are never removed, but `update` can modify field
+values (e.g. correcting a calorie estimate). Every update sets
+`updated_at` automatically, providing a basic audit trail. Full audit
+history (storing every version of a row) is a future consideration.
 
 **Namespace isolation**: the tool prepends `argus_` to all table names
 internally. The model writes `food_log`; PG sees `argus_food_log`. System

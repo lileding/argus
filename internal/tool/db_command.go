@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -122,10 +123,22 @@ func ParseDBCommand(input string) (*DBCommand, error) {
 	}
 }
 
-func parseCreate(rest string) (*DBCommand, error) {
+func parseTableName(rest, verb, example string) (string, string, error) {
 	table, remainder := splitFirst(rest)
 	if table == "" {
-		return nil, parseErr("create requires a table name and column definitions", `create food_log {"name": "text!", "value": "number"}`)
+		return "", "", parseErr(verb+" requires a table name", example)
+	}
+	table = strings.ToLower(table)
+	if err := validateIdentifier(table, "table"); err != nil {
+		return "", "", err
+	}
+	return table, remainder, nil
+}
+
+func parseCreate(rest string) (*DBCommand, error) {
+	table, remainder, err := parseTableName(rest, "create", `create food_log {"name": "text!", "value": "number"}`)
+	if err != nil {
+		return nil, err
 	}
 	jsonStr := strings.TrimSpace(remainder)
 	if jsonStr == "" || jsonStr[0] != '{' {
@@ -135,8 +148,11 @@ func parseCreate(rest string) (*DBCommand, error) {
 	if err := json.Unmarshal([]byte(jsonStr), &cols); err != nil {
 		return nil, parseErr(fmt.Sprintf("invalid column definitions: %v", err), `create food_log {"name": "text!", "value": "number"}`)
 	}
-	// Validate types.
+	// Validate column names and types.
 	for name, typ := range cols {
+		if err := validateIdentifier(strings.ToLower(name), "column"); err != nil {
+			return nil, err
+		}
 		base := strings.TrimSuffix(typ, "!")
 		if !isValidType(base) {
 			return nil, parseErr(
@@ -149,27 +165,27 @@ func parseCreate(rest string) (*DBCommand, error) {
 }
 
 func parseQuery(rest string) (*DBCommand, error) {
-	table, remainder := splitFirst(rest)
-	if table == "" {
-		return nil, parseErr("query requires a table name", "query food_log where {...} sort created_at desc limit 20")
+	table, remainder, err := parseTableName(rest, "query", "query food_log where {...} sort created_at desc limit 20")
+	if err != nil {
+		return nil, err
 	}
 	cmd := &DBCommand{Verb: "query", Table: table, Limit: defaultLimit}
 	return parseClauses(cmd, remainder)
 }
 
 func parseCount(rest string) (*DBCommand, error) {
-	table, remainder := splitFirst(rest)
-	if table == "" {
-		return nil, parseErr("count requires a table name", `count food_log group_by ["meal_date"] sum ["calories"]`)
+	table, remainder, err := parseTableName(rest, "count", `count food_log group_by ["meal_date"] sum ["calories"]`)
+	if err != nil {
+		return nil, err
 	}
 	cmd := &DBCommand{Verb: "count", Table: table, Aggregates: map[string][]string{}}
 	return parseClauses(cmd, remainder)
 }
 
 func parseInsert(rest string) (*DBCommand, error) {
-	table, remainder := splitFirst(rest)
-	if table == "" {
-		return nil, parseErr("insert requires a table name and data", `insert food_log {"name": "test", "value": 42}`)
+	table, remainder, err := parseTableName(rest, "insert", `insert food_log {"name": "test", "value": 42}`)
+	if err != nil {
+		return nil, err
 	}
 	jsonStr := strings.TrimSpace(remainder)
 	if jsonStr == "" {
@@ -199,9 +215,9 @@ func parseInsert(rest string) (*DBCommand, error) {
 }
 
 func parseUpdate(rest string) (*DBCommand, error) {
-	table, remainder := splitFirst(rest)
-	if table == "" {
-		return nil, parseErr("update requires table, id, and data", `update food_log 42 {"calories": 550}`)
+	table, remainder, err := parseTableName(rest, "update", `update food_log 42 {"calories": 550}`)
+	if err != nil {
+		return nil, err
 	}
 	idStr, remainder := splitFirst(remainder)
 	id := parseInt(idStr)
@@ -412,7 +428,7 @@ func (e *DBExecutor) execDescribe(ctx context.Context, table string) (string, er
 }
 
 func (e *DBExecutor) execCreate(ctx context.Context, cmd *DBCommand) (string, error) {
-	pgTable := dbPrefix + cmd.Table
+	pgTable := quoteIdent(dbPrefix + cmd.Table)
 
 	// Build column definitions.
 	var colDefs []string
@@ -434,7 +450,7 @@ func (e *DBExecutor) execCreate(ctx context.Context, cmd *DBCommand) (string, er
 		if required {
 			notNull = " NOT NULL"
 		}
-		colDefs = append(colDefs, fmt.Sprintf("%s %s%s", name, pgType, notNull))
+		colDefs = append(colDefs, fmt.Sprintf("%s %s%s", quoteIdent(name), pgType, notNull))
 	}
 
 	colDefs = append(colDefs,
@@ -452,7 +468,7 @@ func (e *DBExecutor) execCreate(ctx context.Context, cmd *DBCommand) (string, er
 }
 
 func (e *DBExecutor) execQuery(ctx context.Context, cmd *DBCommand) (string, error) {
-	pgTable := dbPrefix + cmd.Table
+	pgTable := quoteIdent(dbPrefix + cmd.Table)
 	limit := cmd.Limit
 	if limit <= 0 {
 		limit = defaultLimit
@@ -469,7 +485,7 @@ func (e *DBExecutor) execQuery(ctx context.Context, cmd *DBCommand) (string, err
 	if len(cmd.Sort) > 0 {
 		var parts []string
 		for _, s := range cmd.Sort {
-			parts = append(parts, fmt.Sprintf("%s %s", s.Field, strings.ToUpper(s.Order)))
+			parts = append(parts, fmt.Sprintf("%s %s", quoteIdent(s.Field), strings.ToUpper(s.Order)))
 		}
 		orderBy = "ORDER BY " + strings.Join(parts, ", ")
 	}
@@ -486,7 +502,7 @@ func (e *DBExecutor) execQuery(ctx context.Context, cmd *DBCommand) (string, err
 }
 
 func (e *DBExecutor) execCount(ctx context.Context, cmd *DBCommand) (string, error) {
-	pgTable := dbPrefix + cmd.Table
+	pgTable := quoteIdent(dbPrefix + cmd.Table)
 	args := []any{}
 	where, args := buildWhere(cmd.Where, args)
 
@@ -502,19 +518,21 @@ func (e *DBExecutor) execCount(ctx context.Context, cmd *DBCommand) (string, err
 
 	// Grouped aggregation.
 	var selectParts []string
+	var quotedGroupBy []string
 	for _, g := range cmd.GroupBy {
-		selectParts = append(selectParts, g)
+		selectParts = append(selectParts, quoteIdent(g))
+		quotedGroupBy = append(quotedGroupBy, quoteIdent(g))
 	}
 	selectParts = append(selectParts, "COUNT(*) AS _count")
 	for fn, fields := range cmd.Aggregates {
 		for _, f := range fields {
-			selectParts = append(selectParts, fmt.Sprintf("%s(%s) AS %s_%s", strings.ToUpper(fn), f, fn, f))
+			selectParts = append(selectParts, fmt.Sprintf("%s(%s) AS %s_%s", strings.ToUpper(fn), quoteIdent(f), fn, f))
 		}
 	}
 
 	groupBy := ""
-	if len(cmd.GroupBy) > 0 {
-		groupBy = " GROUP BY " + strings.Join(cmd.GroupBy, ", ")
+	if len(quotedGroupBy) > 0 {
+		groupBy = " GROUP BY " + strings.Join(quotedGroupBy, ", ")
 	}
 
 	query := fmt.Sprintf("SELECT %s FROM %s%s%s ORDER BY 1",
@@ -530,7 +548,7 @@ func (e *DBExecutor) execCount(ctx context.Context, cmd *DBCommand) (string, err
 }
 
 func (e *DBExecutor) execInsert(ctx context.Context, cmd *DBCommand) (string, error) {
-	pgTable := dbPrefix + cmd.Table
+	pgTable := quoteIdent(dbPrefix + cmd.Table)
 	rows := cmd.Rows
 	if cmd.Data != nil {
 		rows = []map[string]any{cmd.Data}
@@ -547,15 +565,17 @@ func (e *DBExecutor) execInsert(ctx context.Context, cmd *DBCommand) (string, er
 	var ids []int64
 	for _, row := range rows {
 		cols := sortedKeys(row)
+		quotedCols := make([]string, len(cols))
 		placeholders := make([]string, len(cols))
 		vals := make([]any, len(cols))
 		for i, c := range cols {
+			quotedCols[i] = quoteIdent(c)
 			placeholders[i] = fmt.Sprintf("$%d", i+1)
 			vals[i] = row[c]
 		}
 
 		query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) RETURNING id",
-			pgTable, strings.Join(cols, ", "), strings.Join(placeholders, ", "))
+			pgTable, strings.Join(quotedCols, ", "), strings.Join(placeholders, ", "))
 
 		var id int64
 		if err := tx.QueryRowContext(ctx, query, vals...).Scan(&id); err != nil {
@@ -574,7 +594,7 @@ func (e *DBExecutor) execInsert(ctx context.Context, cmd *DBCommand) (string, er
 }
 
 func (e *DBExecutor) execUpdate(ctx context.Context, cmd *DBCommand) (string, error) {
-	pgTable := dbPrefix + cmd.Table
+	pgTable := quoteIdent(dbPrefix + cmd.Table)
 	if cmd.ID <= 0 {
 		return "", execErr("update requires a valid id", "update food_log 42 {...}")
 	}
@@ -583,7 +603,7 @@ func (e *DBExecutor) execUpdate(ctx context.Context, cmd *DBCommand) (string, er
 	setParts := make([]string, len(cols)+1)
 	args := make([]any, len(cols)+1)
 	for i, c := range cols {
-		setParts[i] = fmt.Sprintf("%s = $%d", c, i+1)
+		setParts[i] = fmt.Sprintf("%s = $%d", quoteIdent(c), i+1)
 		args[i] = cmd.Data[c]
 	}
 	setParts[len(cols)] = fmt.Sprintf("updated_at = $%d", len(cols)+1)
@@ -655,24 +675,25 @@ func buildWhere(filters []DBFilter, args []any) (string, []any) {
 	var parts []string
 	for _, f := range filters {
 		idx := len(args) + 1
+		qf := quoteIdent(f.Field)
 		switch f.Op {
 		case "eq":
-			parts = append(parts, fmt.Sprintf("%s = $%d", f.Field, idx))
+			parts = append(parts, fmt.Sprintf("%s = $%d", qf, idx))
 		case "gt":
-			parts = append(parts, fmt.Sprintf("%s > $%d", f.Field, idx))
+			parts = append(parts, fmt.Sprintf("%s > $%d", qf, idx))
 		case "gte":
-			parts = append(parts, fmt.Sprintf("%s >= $%d", f.Field, idx))
+			parts = append(parts, fmt.Sprintf("%s >= $%d", qf, idx))
 		case "lt":
-			parts = append(parts, fmt.Sprintf("%s < $%d", f.Field, idx))
+			parts = append(parts, fmt.Sprintf("%s < $%d", qf, idx))
 		case "lte":
-			parts = append(parts, fmt.Sprintf("%s <= $%d", f.Field, idx))
+			parts = append(parts, fmt.Sprintf("%s <= $%d", qf, idx))
 		case "neq":
-			parts = append(parts, fmt.Sprintf("%s != $%d", f.Field, idx))
+			parts = append(parts, fmt.Sprintf("%s != $%d", qf, idx))
 		case "contains":
-			parts = append(parts, fmt.Sprintf("%s ILIKE $%d", f.Field, idx))
+			parts = append(parts, fmt.Sprintf("%s ILIKE $%d", qf, idx))
 			f.Value = fmt.Sprintf("%%%v%%", f.Value)
 		default:
-			parts = append(parts, fmt.Sprintf("%s = $%d", f.Field, idx))
+			parts = append(parts, fmt.Sprintf("%s = $%d", qf, idx))
 		}
 		args = append(args, f.Value)
 	}
@@ -776,6 +797,23 @@ func isValidType(t string) bool {
 		return true
 	}
 	return false
+}
+
+// identifierRe restricts table/column names to a safe subset: lowercase
+// alpha start, then alphanumeric + underscore, max 63 chars (PG limit).
+var identifierRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`)
+
+// validateIdentifier checks that a name is a safe SQL identifier.
+func validateIdentifier(name, kind string) error {
+	if !identifierRe.MatchString(name) {
+		return fmt.Errorf("Error: invalid %s name %q — must match [a-z][a-z0-9_]{0,62}\nExample: food_log", kind, name)
+	}
+	return nil
+}
+
+// quoteIdent wraps a validated identifier in double quotes for safe SQL splicing.
+func quoteIdent(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
 func sortedKeys(m map[string]any) []string {

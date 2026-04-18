@@ -51,9 +51,10 @@ type ComposingPayload struct {
 }
 
 type ReplyPayload struct {
-	Text                string
-	PromptTokens        int // synthesizer token usage
-	CompletionTokens    int
+	Text             string
+	ReplyMsgID       int64 // saved assistant message ID (for trace)
+	PromptTokens     int   // synthesizer token usage
+	CompletionTokens int
 }
 
 // ReplyDeltaPayload carries the accumulated (not incremental) reply text so far.
