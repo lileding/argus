@@ -33,6 +33,11 @@ import (
 // table/index identifiers.
 const DefaultPrefix = "argus_"
 
+// MaxSelectLimit is injected into SELECT statements that have no LIMIT
+// clause (or a LIMIT larger than this). Prevents the model from doing
+// accidental full-table scans on large tables.
+const MaxSelectLimit = 200
+
 // Rewrite parses sql, prefixes every user-level table/index reference,
 // and returns the transformed SQL. Returns a descriptive error if the
 // SQL is multi-statement, schema-qualified, already prefixed, or fails
@@ -135,11 +140,66 @@ func Rewrite(sql, prefix string) (string, error) {
 		return "", firstErr
 	}
 
+	// Pass 3 — inject LIMIT on top-level SELECT without one (or with one
+	// exceeding MaxSelectLimit). Prevents accidental full-table scans.
+	injectSelectLimit(tree)
+
 	out, err := pg_query.Deparse(tree)
 	if err != nil {
 		return "", fmt.Errorf("sql deparse error: %w", err)
 	}
 	return out, nil
+}
+
+// injectSelectLimit adds or caps LIMIT on the top-level SELECT statement.
+// Subqueries and CTEs are not touched — only the outermost query matters
+// for result-set size.
+func injectSelectLimit(tree *pg_query.ParseResult) {
+	if len(tree.Stmts) == 0 {
+		return
+	}
+	node := tree.Stmts[0].Stmt
+	if node == nil {
+		return
+	}
+	sel, ok := node.Node.(*pg_query.Node_SelectStmt)
+	if !ok || sel.SelectStmt == nil {
+		return
+	}
+	st := sel.SelectStmt
+
+	// UNION/INTERSECT/EXCEPT: the LimitCount lives on the wrapper node,
+	// but the outermost SelectStmt is the one with Op != SETOP_NONE.
+	// For simplicity, only inject on simple selects (Op == SETOP_NONE).
+	if st.Op != pg_query.SetOperation_SETOP_NONE {
+		return
+	}
+
+	limitNode := func(n int32) *pg_query.Node {
+		return &pg_query.Node{
+			Node: &pg_query.Node_AConst{
+				AConst: &pg_query.A_Const{
+					Val: &pg_query.A_Const_Ival{Ival: &pg_query.Integer{Ival: n}},
+				},
+			},
+		}
+	}
+
+	if st.LimitCount == nil {
+		// No LIMIT → inject one.
+		st.LimitCount = limitNode(MaxSelectLimit)
+		st.LimitOption = pg_query.LimitOption_LIMIT_OPTION_COUNT
+		return
+	}
+
+	// Has LIMIT — cap it if it's a constant larger than MaxSelectLimit.
+	if ac, ok := st.LimitCount.Node.(*pg_query.Node_AConst); ok && ac.AConst != nil {
+		if iv, ok := ac.AConst.Val.(*pg_query.A_Const_Ival); ok && iv.Ival != nil {
+			if iv.Ival.Ival > MaxSelectLimit {
+				iv.Ival.Ival = MaxSelectLimit
+			}
+		}
+	}
 }
 
 // StripPrefix removes occurrences of prefix from user-visible text such as

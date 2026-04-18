@@ -130,6 +130,24 @@ func TestRewrite_Accepts(t *testing.T) {
 			// must not prefix the function name
 			mustNotContain: []string{"argus_generate"},
 		},
+		// LIMIT injection tests
+		{
+			name:  "SELECT without LIMIT gets capped",
+			in:    "SELECT * FROM food_log",
+			wants: []string{"LIMIT 200", "argus_food_log"},
+		},
+		{
+			name:  "SELECT with small LIMIT preserved",
+			in:    "SELECT * FROM food_log LIMIT 5",
+			wants: []string{"LIMIT 5"},
+			mustNotContain: []string{"LIMIT 200"},
+		},
+		{
+			name:  "SELECT with huge LIMIT capped",
+			in:    "SELECT * FROM food_log LIMIT 50000",
+			wants: []string{"LIMIT 200"},
+			mustNotContain: []string{"LIMIT 50000"},
+		},
 	}
 
 	for _, tc := range cases {
