@@ -470,9 +470,9 @@ func (s *PostgresStore) SaveToolCalls(ctx context.Context, calls []ToolCallRecor
 	}
 	for _, c := range calls {
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO tool_calls (trace_id, iteration, seq, tool_name, arguments, result, is_error, duration_ms)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		`, c.TraceID, c.Iteration, c.Seq, c.ToolName, c.Arguments, c.Result, c.IsError, c.DurationMs); err != nil {
+			INSERT INTO tool_calls (trace_id, iteration, seq, tool_name, arguments, normalized_args, result, is_error, duration_ms)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		`, c.TraceID, c.Iteration, c.Seq, c.ToolName, c.Arguments, c.NormalizedArgs, c.Result, c.IsError, c.DurationMs); err != nil {
 			tx.Rollback()
 			return err
 		}

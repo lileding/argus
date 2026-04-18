@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     iteration     INT NOT NULL,           -- orchestrator iteration (0-based)
     seq           INT NOT NULL DEFAULT 0, -- sequence within iteration (for parallel calls)
     tool_name     TEXT NOT NULL,
-    arguments     TEXT NOT NULL DEFAULT '',
+    arguments     TEXT NOT NULL DEFAULT '',   -- raw model-issued args
+    normalized_args TEXT NOT NULL DEFAULT '', -- deterministic parsed form
     result        TEXT,
     is_error      BOOLEAN NOT NULL DEFAULT FALSE,
     duration_ms   INT,

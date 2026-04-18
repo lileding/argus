@@ -108,15 +108,16 @@ type Trace struct {
 }
 
 type ToolCallRecord struct {
-	ID         int64
-	TraceID    int64
-	Iteration  int
-	Seq        int
-	ToolName   string
-	Arguments  string
-	Result     string
-	IsError    bool
-	DurationMs int
+	ID             int64
+	TraceID        int64
+	Iteration      int
+	Seq            int
+	ToolName       string
+	Arguments      string // raw model-issued arguments
+	NormalizedArgs string // deterministic parsed form (for skill induction)
+	Result         string
+	IsError        bool
+	DurationMs     int
 }
 
 // DocumentStore manages document ingestion and RAG.

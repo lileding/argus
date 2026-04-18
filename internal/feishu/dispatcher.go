@@ -2,12 +2,14 @@ package feishu
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"sync"
 	"time"
 
 	"argus/internal/agent"
 	"argus/internal/store"
+	"argus/internal/tool"
 )
 
 // QueuedMessage is pushed into a per-chat channel by the Handler.
@@ -260,15 +262,28 @@ func (d *Dispatcher) processAndTrace(ctx context.Context, chatID string, msg *st
 				toolArgs[[2]int{p.Iteration, p.Seq}] = p.Arguments
 			case agent.EventToolResult:
 				p := ev.Payload.(agent.ToolResultPayload)
+				rawArgs := toolArgs[[2]int{p.Iteration, p.Seq}]
+				// Compute normalized form for db tool commands.
+				normalizedArgs := rawArgs
+				if p.Name == "db" {
+					var parsed struct{ Command string }
+					if json.Unmarshal([]byte(rawArgs), &parsed) == nil && parsed.Command != "" {
+						cmd, err := tool.ParseDBCommand(parsed.Command)
+						if err == nil {
+							normalizedArgs = cmd.Normalize()
+						}
+					}
+				}
 				toolCalls = append(toolCalls, store.ToolCallRecord{
-					TraceID:    trace.ID,
-					Iteration:  p.Iteration,
-					Seq:        p.Seq,
-					ToolName:   p.Name,
-					Arguments:  toolArgs[[2]int{p.Iteration, p.Seq}],
-					Result:     p.FullResult,
-					IsError:    p.IsError,
-					DurationMs: p.DurationMs,
+					TraceID:        trace.ID,
+					Iteration:      p.Iteration,
+					Seq:            p.Seq,
+					ToolName:       p.Name,
+					Arguments:      rawArgs,
+					NormalizedArgs: normalizedArgs,
+					Result:         p.FullResult,
+					IsError:        p.IsError,
+					DurationMs:     p.DurationMs,
 				})
 			case agent.EventComposing:
 				if p, ok := ev.Payload.(agent.ComposingPayload); ok {

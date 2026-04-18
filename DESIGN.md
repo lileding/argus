@@ -304,6 +304,54 @@ Phase 2 (synthesizer) streams its output via Server-Sent Events:
 
 ---
 
+## Request Tracing
+
+Every message processing is recorded in `traces` + `tool_calls` tables.
+The Dispatcher tees the agent event stream — one path to the Adapter
+(UI), one path to the trace collector (DB).
+
+`traces`: one row per user-message → reply cycle. Fields: `message_id`,
+`reply_id`, `chat_id`, `iterations`, `summary`, prompt/completion tokens
+for both phases, `duration_ms`.
+
+`tool_calls`: one row per tool invocation. Fields: `trace_id`, `iteration`,
+`seq`, `tool_name`, `arguments` (raw), `normalized_args` (parsed),
+`result`, `is_error`, `duration_ms`.
+
+### Normalized Args Schema
+
+For the `db` tool, `normalized_args` is the deterministic output of
+`Command.Normalize()` — a JSON object with stable key ordering:
+
+```json
+{
+  "verb": "query",
+  "table": "food_log",
+  "where": [
+    {"field": "meal_date", "op": "gte", "value": "2026-04-16"},
+    {"field": "calories", "op": "gt", "value": 500}
+  ],
+  "sort": [{"field": "created_at", "order": "desc"}],
+  "limit": 20
+}
+```
+
+`where` is expanded from the `__` suffix syntax to explicit `{field, op,
+value}` triples. This is the input format for future skill induction —
+patterns like "user asks about food → verb=query, table=food_log,
+where includes meal_date" can be extracted directly without re-parsing
+the raw command string.
+
+For non-db tools, `normalized_args` equals `arguments` (pass-through).
+
+### Query defaults
+
+`query` without `limit` defaults to 50 rows. Hard cap is 200 (enforced
+by the tool regardless of what the model passes). `query` without `sort`
+defaults to `created_at desc`.
+
+---
+
 ## Model Strategy
 
 All messages are handled by a local LLM via an OpenAI-compatible endpoint (omlx, vLLM, or similar). No routing layer — the orchestrator decides implicitly through tool calling what capabilities to use.
@@ -805,6 +853,30 @@ third_party/ratex/           Embedded Rust LaTeX renderer (CGo)
 
 Considered and rejected. Documenting the reasoning so future contributors
 don't re-propose them without new evidence.
+
+**Raw SQL tools (db / db\_exec).** The original design exposed raw SQL to
+the model via `db` (read-only) and `db_exec` (write) tools, with an
+AST-based `sqlsandbox` rewriter (libpg_query) to enforce table-name
+prefixing. This was abandoned for three reasons:
+
+1. *Model unreliability.* Local LLMs (Gemma 4, Qwen 3.5) consistently
+   used wrong column names (`date` vs `meal_date`), invented SQL
+   syntax, and looped on failed queries with trivial variations. The
+   schema-hint-on-error mechanism mitigated but didn't solve this.
+2. *Security surface.* Even with AST rewriting, SQL identifiers (table
+   names, column names) were spliced into queries. The rewriter handled
+   known patterns (RangeVar, IndexStmt, DropStmt) but the attack
+   surface was large — every new SQL feature required new AST handlers.
+3. *Trace opacity.* Raw SQL strings are hard to analyze programmatically.
+   Building a skill-induction system on top of SQL traces would require
+   another SQL parser, re-introducing the same complexity we wanted to
+   avoid.
+
+Replaced with a single structured `db` tool (CLI+JSON syntax, 7 verbs).
+The model describes intent (`query food_log where {"meal_date": "..."}`);
+the tool generates parameterized SQL internally. Identifiers are validated
+against a strict regex + double-quoted in SQL. The `sqlsandbox` package
+and `pg_query_go` dependency were deleted entirely.
 
 **Semantic recall query rewriting.** A lightweight LLM call could rewrite
 pronoun-heavy queries ("那个文件", "它") into self-contained search terms
