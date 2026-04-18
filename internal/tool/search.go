@@ -5,22 +5,70 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
+	"argus/internal/config"
+
 	"golang.org/x/net/html"
 )
 
-type SearchTool struct{}
+// --- Search provider interface ---
 
-func NewSearchTool() *SearchTool { return &SearchTool{} }
+type SearchProvider interface {
+	Search(ctx context.Context, query string, maxResults int) ([]SearchResult, string, error)
+	// Returns (results, answer, error). answer is empty for providers that don't support it.
+}
+
+type SearchResult struct {
+	Title   string  `json:"title"`
+	URL     string  `json:"url"`
+	Content string  `json:"content"` // cleaned relevant paragraph (Tavily) or snippet (DDG)
+	Score   float64 `json:"score"`   // 0-1 relevance (Tavily); 0 for DDG
+}
+
+// --- Search tool (router) ---
+
+type SearchTool struct {
+	primary    SearchProvider
+	fallback   SearchProvider
+	maxResults int
+}
+
+func NewSearchTool() *SearchTool {
+	ddg := &DuckDuckGoProvider{}
+	return &SearchTool{primary: ddg, fallback: nil, maxResults: 5}
+}
+
+func NewSearchToolWithConfig(cfg config.SearchConfig) *SearchTool {
+	ddg := &DuckDuckGoProvider{}
+
+	var primary SearchProvider = ddg
+	var fallback SearchProvider
+
+	if cfg.Provider == "tavily" && cfg.TavilyAPIKey != "" {
+		primary = NewTavilyProvider(cfg.TavilyAPIKey, cfg.IncludeAnswer)
+		fallback = ddg
+		slog.Info("search: using Tavily (DuckDuckGo fallback)")
+	} else {
+		slog.Info("search: using DuckDuckGo")
+	}
+
+	maxResults := cfg.MaxResults
+	if maxResults <= 0 {
+		maxResults = 5
+	}
+
+	return &SearchTool{primary: primary, fallback: fallback, maxResults: maxResults}
+}
 
 func (t *SearchTool) Name() string { return "search" }
 
 func (t *SearchTool) Description() string {
-	return "Search the web for real-time information. Returns titles, URLs, and snippets from search results."
+	return "Search the web for real-time information. Returns titles, URLs, and relevant content from search results. May include a pre-generated answer summary."
 }
 
 func (t *SearchTool) Parameters() json.RawMessage {
@@ -37,125 +85,169 @@ type searchArgs struct {
 	Query string `json:"query"`
 }
 
-type searchResult struct {
-	Title   string
-	URL     string
-	Snippet string
-}
-
 func (t *SearchTool) Execute(ctx context.Context, arguments string) (string, error) {
 	var args searchArgs
 	if err := json.Unmarshal([]byte(arguments), &args); err != nil {
 		return "", fmt.Errorf("parse arguments: %w", err)
 	}
 
-	results, err := duckduckgoSearch(ctx, args.Query, 5)
+	query := strings.TrimSpace(args.Query)
+	if query == "" {
+		return "", fmt.Errorf("empty search query")
+	}
+
+	results, answer, err := t.primary.Search(ctx, query, t.maxResults)
+	if err != nil && t.fallback != nil {
+		slog.Warn("search: primary failed, using fallback", "err", err)
+		results, answer, err = t.fallback.Search(ctx, query, t.maxResults)
+	}
 	if err != nil {
 		return "", fmt.Errorf("search failed: %w", err)
 	}
 
-	if len(results) == 0 {
-		return "No results found.", nil
-	}
-
-	var sb strings.Builder
-	for i, r := range results {
-		sb.WriteString(fmt.Sprintf("%d. %s\n   %s\n   %s\n\n", i+1, r.Title, r.URL, r.Snippet))
-	}
-	return sb.String(), nil
+	return formatSearchResults(results, answer), nil
 }
 
-func duckduckgoSearch(ctx context.Context, query string, maxResults int) ([]searchResult, error) {
+func formatSearchResults(results []SearchResult, answer string) string {
+	var sb strings.Builder
+
+	if answer != "" {
+		sb.WriteString("Answer: ")
+		sb.WriteString(answer)
+		sb.WriteString("\n\nSources:\n")
+	}
+
+	for i, r := range results {
+		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, r.Title))
+		sb.WriteString(fmt.Sprintf("   %s\n", r.URL))
+		if r.Content != "" {
+			sb.WriteString(fmt.Sprintf("   %s\n", r.Content))
+		}
+		sb.WriteString("\n")
+	}
+
+	if len(results) == 0 && answer == "" {
+		return "No results found."
+	}
+
+	return sb.String()
+}
+
+// --- DuckDuckGo provider (free fallback) ---
+
+type DuckDuckGoProvider struct{}
+
+func (p *DuckDuckGoProvider) Search(ctx context.Context, query string, maxResults int) ([]SearchResult, string, error) {
 	searchURL := "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(query)
 
 	client := &http.Client{Timeout: 15 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, "GET", searchURL, nil)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; Argus/1.0)")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer resp.Body.Close()
 
-	return parseDDGResults(resp.Body, maxResults)
-}
-
-func parseDDGResults(r io.Reader, maxResults int) ([]searchResult, error) {
-	doc, err := html.Parse(r)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
-	var results []searchResult
+	results := parseDDGResults(string(body), maxResults)
+	return results, "", nil
+}
+
+func parseDDGResults(htmlBody string, max int) []SearchResult {
+	doc, err := html.Parse(strings.NewReader(htmlBody))
+	if err != nil {
+		return nil
+	}
+
+	var results []SearchResult
 	var walk func(*html.Node)
 	walk = func(n *html.Node) {
-		if len(results) >= maxResults {
+		if len(results) >= max {
 			return
 		}
-
-		// DuckDuckGo results are in <a class="result__a"> for title/link
-		// and <a class="result__snippet"> for snippet
-		if n.Type == html.ElementNode && n.Data == "a" {
-			class := getAttr(n, "class")
-			if strings.Contains(class, "result__a") {
-				href := getAttr(n, "href")
-				title := textContent(n)
-				if title != "" && href != "" {
-					// DDG wraps URLs in a redirect, extract actual URL
-					actualURL := extractDDGURL(href)
-					results = append(results, searchResult{
-						Title: strings.TrimSpace(title),
-						URL:   actualURL,
-					})
-				}
-			}
-			if strings.Contains(class, "result__snippet") {
-				snippet := strings.TrimSpace(textContent(n))
-				if snippet != "" && len(results) > 0 {
-					results[len(results)-1].Snippet = snippet
+		if n.Type == html.ElementNode && n.Data == "div" {
+			for _, attr := range n.Attr {
+				if attr.Key == "class" && strings.Contains(attr.Val, "result__body") {
+					r := extractDDGResult(n)
+					if r.Title != "" && r.URL != "" {
+						results = append(results, r)
+					}
+					return
 				}
 			}
 		}
-
 		for c := n.FirstChild; c != nil; c = c.NextSibling {
 			walk(c)
 		}
 	}
 	walk(doc)
-
-	return results, nil
+	return results
 }
 
-func extractDDGURL(href string) string {
-	// DDG HTML wraps links as //duckduckgo.com/l/?uddg=<encoded_url>&...
-	if u, err := url.Parse(href); err == nil {
-		if uddg := u.Query().Get("uddg"); uddg != "" {
-			return uddg
+func extractDDGResult(node *html.Node) SearchResult {
+	var r SearchResult
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode {
+			for _, attr := range n.Attr {
+				if attr.Key == "class" {
+					switch {
+					case strings.Contains(attr.Val, "result__a"):
+						r.Title = textContent(n)
+						for _, a := range n.Attr {
+							if a.Key == "href" {
+								r.URL = cleanDDGURL(a.Val)
+							}
+						}
+					case strings.Contains(attr.Val, "result__snippet"):
+						r.Content = textContent(n)
+					}
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
 		}
 	}
-	return href
-}
-
-func getAttr(n *html.Node, key string) string {
-	for _, a := range n.Attr {
-		if a.Key == key {
-			return a.Val
-		}
-	}
-	return ""
+	walk(node)
+	return r
 }
 
 func textContent(n *html.Node) string {
-	if n.Type == html.TextNode {
-		return n.Data
-	}
 	var sb strings.Builder
-	for c := n.FirstChild; c != nil; c = c.NextSibling {
-		sb.WriteString(textContent(c))
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.TextNode {
+			sb.WriteString(n.Data)
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
 	}
-	return sb.String()
+	walk(n)
+	return strings.TrimSpace(sb.String())
+}
+
+func cleanDDGURL(raw string) string {
+	if strings.Contains(raw, "duckduckgo.com/l/") {
+		u, err := url.Parse(raw)
+		if err == nil {
+			if uddg := u.Query().Get("uddg"); uddg != "" {
+				return uddg
+			}
+		}
+	}
+	if strings.HasPrefix(raw, "//") {
+		return "https:" + raw
+	}
+	return raw
 }

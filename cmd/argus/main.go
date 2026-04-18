@@ -104,7 +104,7 @@ func buildToolRegistry(cfg *config.Config, sb sandbox.Sandbox, loader *skill.Fil
 	registry.Register(tool.NewReadFileTool(cfg.Agent.WorkspaceDir))
 	registry.Register(tool.NewWriteFileTool(cfg.Agent.WorkspaceDir))
 	registry.Register(tool.NewCLITool(sb))
-	registry.Register(tool.NewSearchTool())
+	registry.Register(tool.NewSearchToolWithConfig(cfg.Search))
 	registry.Register(tool.NewFetchTool())
 	registry.Register(tool.NewCurrentTimeTool())
 	registry.Register(tool.NewFinishTaskTool())

@@ -16,7 +16,15 @@ type Config struct {
 	Agent     AgentConfig     `yaml:"agent"`
 	Sandbox   SandboxConfig   `yaml:"sandbox"`
 	Embedding EmbeddingConfig `yaml:"embedding"`
+	Search    SearchConfig    `yaml:"search"`
 	Cron      CronConfig      `yaml:"cron"`
+}
+
+type SearchConfig struct {
+	Provider      string `yaml:"provider"`        // "tavily" or "duckduckgo" (default: auto-detect)
+	TavilyAPIKey  string `yaml:"tavily_api_key"`
+	MaxResults    int    `yaml:"max_results"`
+	IncludeAnswer bool   `yaml:"include_answer"`  // Tavily: include pre-generated answer
 }
 
 type EmbeddingConfig struct {
@@ -133,6 +141,17 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Agent.SkillRescan == 0 {
 		c.Agent.SkillRescan = 30 * time.Second
+	}
+	if c.Search.MaxResults == 0 {
+		c.Search.MaxResults = 5
+	}
+	// Auto-detect provider: use Tavily if API key is set.
+	if c.Search.Provider == "" {
+		if c.Search.TavilyAPIKey != "" {
+			c.Search.Provider = "tavily"
+		} else {
+			c.Search.Provider = "duckduckgo"
+		}
 	}
 	if c.Embedding.ModelName == "" {
 		c.Embedding.ModelName = "nomic-embed-text"
