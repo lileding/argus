@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 
 	"argus/internal/embedding"
 	"argus/internal/model"
@@ -203,7 +204,7 @@ func (a *Agent) runOrchestrator(
 	for i := 0; i < a.maxIterations; i++ {
 		slog.Info("orchestrator iteration", "iteration", i, "messages", len(messages), "tools", len(toolDefs))
 
-		resp, err := a.model.Chat(ctx, messages, toolDefs)
+		resp, err := a.model.ChatWithEarlyAbort(ctx, messages, toolDefs, 80)
 		if err != nil {
 			slog.Error("orchestrator chat failed", "err", err)
 			summary = fmt.Sprintf("Orchestrator error: %v", err)
@@ -224,7 +225,7 @@ func (a *Agent) runOrchestrator(
 				model.Message{Role: model.RoleAssistant, Content: resp.Content},
 				model.Message{Role: model.RoleUser, Content: "You MUST call a tool. Text output is ignored. Call search, fetch, read_file, or finish_task now."},
 			)
-			resp, err = a.model.Chat(ctx, messages, toolDefs)
+			resp, err = a.model.ChatWithEarlyAbort(ctx, messages, toolDefs, 80)
 			if err != nil {
 				summary = fmt.Sprintf("Orchestrator retry error: %v", err)
 				return
@@ -245,9 +246,8 @@ func (a *Agent) runOrchestrator(
 			ToolCalls: resp.ToolCalls,
 		})
 
-		// Execute tools (or detect finish_task).
+		// Pre-scan for finish_task — if present, exit immediately.
 		for _, tc := range resp.ToolCalls {
-			// Detect finish_task — signal to move to synthesis.
 			if tc.Function.Name == "finish_task" {
 				var args struct {
 					Summary string `json:"summary"`
@@ -257,69 +257,95 @@ func (a *Agent) runOrchestrator(
 				slog.Info("orchestrator done", "summary", truncateResult(summary, 200))
 				return
 			}
+		}
 
-			// Hard budget: reject at harness layer if exhausted.
+		// Pre-check budgets (serial — modifies shared state) and build
+		// the list of tools to actually execute.
+		type toolSlot struct {
+			tc       model.ToolCall
+			rejected bool   // budget exhausted
+			errMsg   string // rejection message
+			result   string // filled by execution
+		}
+		slots := make([]toolSlot, len(resp.ToolCalls))
+		forceStop := false
+		for i, tc := range resp.ToolCalls {
+			slots[i].tc = tc
 			if budget, has := toolBudgets[tc.Function.Name]; has {
 				if toolCounts[tc.Function.Name] >= budget {
 					budgetRejections++
-					errResult := fmt.Sprintf(
+					slots[i].rejected = true
+					slots[i].errMsg = fmt.Sprintf(
 						"error: %s budget exhausted (%d/%d calls already used). "+
-							"No further %s calls will be executed this turn. "+
-							"Call finish_task NOW with a summary based on the results you have already seen.",
-						tc.Function.Name, toolCounts[tc.Function.Name], budget, tc.Function.Name)
-					slog.Warn("tool budget exhausted, rejecting call",
+							"Call finish_task NOW with a summary.",
+						tc.Function.Name, toolCounts[tc.Function.Name], budget)
+					slog.Warn("tool budget exhausted",
 						"tool", tc.Function.Name,
-						"used", toolCounts[tc.Function.Name],
-						"budget", budget,
-						"total_rejections", budgetRejections,
+						"rejections", budgetRejections,
 					)
-					ch <- Event{Type: EventToolResult, Payload: ToolResultPayload{
-						Name: tc.Function.Name, CallID: tc.ID,
-						Result: truncateResult(errResult, 200), IsError: true,
-					}}
-					messages = append(messages, model.Message{Role: model.RoleTool, Content: errResult, ToolCallID: tc.ID})
-
-					// If the model keeps ignoring budget rejections, force synthesis.
 					if budgetRejections >= maxBudgetRejections {
-						slog.Warn("too many budget rejections, forcing synthesis",
-							"rejections", budgetRejections,
-							"results_gathered", len(results),
-						)
-						summary = fmt.Sprintf(
-							"(Orchestrator force-stopped: model ignored %d budget-exhausted rejections. "+
-								"Synthesizing from %d materials gathered so far.)",
-							budgetRejections, len(results))
-						return
+						forceStop = true
 					}
 					continue
 				}
 				toolCounts[tc.Function.Name]++
 			}
+		}
 
-			ch <- Event{Type: EventToolCall, Payload: ToolCallPayload{
-				Name: tc.Function.Name, Arguments: tc.Function.Arguments, CallID: tc.ID,
-			}}
+		// Emit EventToolCall for non-rejected tools.
+		for i := range slots {
+			if !slots[i].rejected {
+				ch <- Event{Type: EventToolCall, Payload: ToolCallPayload{
+					Name: slots[i].tc.Function.Name, Arguments: slots[i].tc.Function.Arguments, CallID: slots[i].tc.ID,
+				}}
+			}
+		}
 
-			slog.Info("tool call", "tool", tc.Function.Name, "arguments", tc.Function.Arguments)
+		// Execute non-rejected tools in parallel.
+		var wg sync.WaitGroup
+		for i := range slots {
+			if slots[i].rejected {
+				continue
+			}
+			wg.Add(1)
+			go func(s *toolSlot) {
+				defer wg.Done()
+				slog.Info("tool call", "tool", s.tc.Function.Name, "arguments", s.tc.Function.Arguments)
+				s.result = truncateResult(a.executeTool(ctx, s.tc), maxToolResultBytes)
+				slog.Info("tool result", "tool", s.tc.Function.Name, "result_len", len(s.result))
+			}(&slots[i])
+		}
+		wg.Wait()
 
-			result := a.executeTool(ctx, tc)
-			result = truncateResult(result, maxToolResultBytes)
+		// Append results to messages and records in original order.
+		for i := range slots {
+			s := &slots[i]
+			if s.rejected {
+				ch <- Event{Type: EventToolResult, Payload: ToolResultPayload{
+					Name: s.tc.Function.Name, CallID: s.tc.ID,
+					Result: truncateResult(s.errMsg, 200), IsError: true,
+				}}
+				messages = append(messages, model.Message{Role: model.RoleTool, Content: s.errMsg, ToolCallID: s.tc.ID})
+			} else {
+				ch <- Event{Type: EventToolResult, Payload: ToolResultPayload{
+					Name: s.tc.Function.Name, CallID: s.tc.ID,
+					Result:  truncateResult(s.result, 200),
+					IsError: strings.HasPrefix(s.result, "error:"),
+				}}
+				results = append(results, toolCallRecord{
+					Name:      s.tc.Function.Name,
+					Arguments: s.tc.Function.Arguments,
+					Result:    s.result,
+				})
+				messages = append(messages, model.Message{Role: model.RoleTool, Content: s.result, ToolCallID: s.tc.ID})
+			}
+		}
 
-			slog.Info("tool result", "tool", tc.Function.Name, "result_len", len(result))
-
-			ch <- Event{Type: EventToolResult, Payload: ToolResultPayload{
-				Name: tc.Function.Name, CallID: tc.ID,
-				Result:  truncateResult(result, 200),
-				IsError: strings.HasPrefix(result, "error:"),
-			}}
-
-			results = append(results, toolCallRecord{
-				Name:      tc.Function.Name,
-				Arguments: tc.Function.Arguments,
-				Result:    result,
-			})
-
-			messages = append(messages, model.Message{Role: model.RoleTool, Content: result, ToolCallID: tc.ID})
+		if forceStop {
+			slog.Warn("too many budget rejections, forcing synthesis",
+				"rejections", budgetRejections, "results_gathered", len(results))
+			summary = fmt.Sprintf("(Orchestrator force-stopped after %d budget rejections.)", budgetRejections)
+			return
 		}
 	}
 

@@ -237,11 +237,16 @@ func (h *Handler) buildProcessedContent(ctx context.Context, msg *store.StoredMe
 		transcript := result.Text
 		slog.Info("audio transcribed", "text", transcript, "confidence", result.Confidence)
 
-		if h.corrector != nil {
+		// Whisper confidence is avg_logprob: -0.0 (perfect) to -1.0+ (poor).
+		// Skip LLM correction when confidence is high — saves ~5-10s per message.
+		if h.corrector != nil && result.Confidence < -0.15 {
 			if corrected := h.correctTranscription(ctx, transcript); corrected != "" {
 				slog.Info("transcription corrected", "original", transcript, "corrected", corrected)
 				transcript = corrected
 			}
+		} else if h.corrector != nil {
+			slog.Info("transcription confident, skipping LLM correction",
+				"confidence", result.Confidence)
 		}
 		return fmt.Sprintf("[Voice message, %ds, saved at %s]\n%s", c.Duration/1000, filePath, transcript), nil
 

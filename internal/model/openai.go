@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -128,6 +129,163 @@ func (c *OpenAIClient) Chat(ctx context.Context, messages []Message, tools []Too
 	}
 
 	return result, nil
+}
+
+// ChatWithEarlyAbort streams a chat completion, accumulating the full response
+// including tool calls. If the model produces more than maxTextTokens of
+// content text WITHOUT any tool calls appearing, the stream is cancelled and
+// the partial text returned (FinishReason="early_abort"). This lets the
+// orchestrator detect "model ignored tool-only rule" in ~1s instead of
+// waiting 10-30s for full generation.
+//
+// When the model does call tools, the stream is consumed fully and a complete
+// Response (with ToolCalls) is returned — same as Chat().
+func (c *OpenAIClient) ChatWithEarlyAbort(ctx context.Context, messages []Message, tools []ToolDef, maxTextTokens int) (*Response, error) {
+	reqBody := chatRequest{
+		Model:     c.modelName,
+		Messages:  messages,
+		MaxTokens: c.maxTokens,
+		Stream:    true,
+	}
+	if len(tools) > 0 {
+		reqBody.Tools = tools
+	}
+
+	data, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	url := c.baseURL + "/chat/completions"
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("api error: status=%d body=%s", resp.StatusCode, body)
+	}
+
+	var content strings.Builder
+	toolCallAccum := map[int]*ToolCall{} // index → accumulated tool call
+	var finalUsage Usage
+	hasToolCalls := false
+	reader := bufio.NewReader(resp.Body)
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, fmt.Errorf("read stream: %w", err)
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" || !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := line[len("data: "):]
+		if payload == "[DONE]" {
+			break
+		}
+
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content   string `json:"content"`
+					ToolCalls []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+			Usage *Usage `json:"usage,omitempty"`
+		}
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			continue
+		}
+		if chunk.Usage != nil {
+			finalUsage = *chunk.Usage
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		delta := chunk.Choices[0].Delta
+
+		// Accumulate content.
+		if delta.Content != "" {
+			content.WriteString(delta.Content)
+		}
+
+		// Accumulate tool calls by index.
+		for _, tc := range delta.ToolCalls {
+			hasToolCalls = true
+			existing, ok := toolCallAccum[tc.Index]
+			if !ok {
+				existing = &ToolCall{}
+				toolCallAccum[tc.Index] = existing
+			}
+			if tc.ID != "" {
+				existing.ID = tc.ID
+			}
+			if tc.Function.Name != "" {
+				existing.Function.Name = tc.Function.Name
+			}
+			existing.Function.Arguments += tc.Function.Arguments
+		}
+
+		// Early abort: too much text content, no tool calls seen.
+		if !hasToolCalls && content.Len()/4 > maxTextTokens {
+			slog.Info("early abort: text-only response detected",
+				"tokens_estimate", content.Len()/4, "max", maxTextTokens)
+			cancel()
+			return &Response{
+				Content:      content.String(),
+				FinishReason: "early_abort",
+				Usage:        finalUsage,
+			}, nil
+		}
+	}
+
+	// Build final tool calls slice from accumulator.
+	var toolCalls []ToolCall
+	for i := 0; i < len(toolCallAccum); i++ {
+		if tc, ok := toolCallAccum[i]; ok {
+			toolCalls = append(toolCalls, *tc)
+		}
+	}
+
+	finishReason := "stop"
+	if len(toolCalls) > 0 {
+		finishReason = "tool_calls"
+	}
+
+	return &Response{
+		Content:      content.String(),
+		ToolCalls:    toolCalls,
+		FinishReason: finishReason,
+		Usage:        finalUsage,
+	}, nil
 }
 
 // ChatStream opens a streaming chat completion and returns a channel of chunks.

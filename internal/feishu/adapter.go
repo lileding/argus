@@ -9,9 +9,13 @@ import (
 )
 
 // streamUpdateMinInterval is the minimum time between Feishu card updates during
-// synthesizer streaming. Feishu rate-limits message updates and tiny updates
-// are wasteful; ~500ms is a good tradeoff between liveness and cost.
+// streamUpdateMinInterval is the steady-state throttle between card updates
+// during synthesizer streaming.
 const streamUpdateMinInterval = 500 * time.Millisecond
+
+// streamFirstBurst is the number of initial updates sent without throttling,
+// so the user sees the first tokens arrive instantly.
+const streamFirstBurst = 3
 
 // MarkdownProcessor processes markdown (e.g. LaTeX rendering) without IM-specific knowledge.
 type MarkdownProcessor interface {
@@ -36,6 +40,7 @@ func (a *Adapter) HandleEvents(ch <-chan agent.Event, triggerMessageID, existing
 	lang := detectLang(userText)
 	replyMsgID := existingReplyID
 	var lastStreamUpdate time.Time
+	var streamUpdateCount int
 
 	for ev := range ch {
 		switch ev.Type {
@@ -76,9 +81,11 @@ func (a *Adapter) HandleEvents(ch <-chan agent.Event, triggerMessageID, existing
 			if replyMsgID == "" {
 				continue
 			}
-			// Throttle: skip updates that fire faster than streamUpdateMinInterval.
-			// Final text is guaranteed to arrive via EventReply afterwards.
-			if time.Since(lastStreamUpdate) < streamUpdateMinInterval {
+			streamUpdateCount++
+			// First few updates are unthrottled so the user sees tokens instantly.
+			// After the burst, throttle to streamUpdateMinInterval.
+			if streamUpdateCount > streamFirstBurst &&
+				time.Since(lastStreamUpdate) < streamUpdateMinInterval {
 				continue
 			}
 			p := ev.Payload.(agent.ReplyDeltaPayload)
