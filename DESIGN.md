@@ -745,6 +745,38 @@ third_party/ratex/           Embedded Rust LaTeX renderer (CGo)
 
 ---
 
+## Design Trade-offs (Deliberate Non-Goals)
+
+Considered and rejected. Documenting the reasoning so future contributors
+don't re-propose them without new evidence.
+
+**Semantic recall query rewriting.** A lightweight LLM call could rewrite
+pronoun-heavy queries ("那个文件", "它") into self-contained search terms
+before the pgvector lookup. Rejected because each rewrite adds a full
+model round-trip (5-10s on local MoE) to every message — the latency cost
+exceeds the retrieval quality gain. The sliding window of recent messages
+already provides pronoun context for most practical cases. Revisit if a
+sub-100ms rewrite model becomes available locally.
+
+**Tool output dynamic summarization.** Instead of byte-truncating tool
+results at 16 KB, run a small model to summarize long outputs (web pages,
+large query results). Rejected for the same latency reason: an extra LLM
+call per tool result would add 5-10s per orchestrator iteration. The
+current truncation + schema-hint-on-error approach handles the common
+cases (wrong column name, empty result) without an extra model call.
+The 16 KB limit is large enough for most structured data; for web pages,
+the `fetch` tool already strips HTML to readable text before truncation.
+
+**Media download breakpoint resume.** Feishu media files are typically
+small (audio: 3-30 KB opus, images: 50-200 KB PNG). Download completes
+in under a second even on slow connections. Implementing HTTP range
+requests, partial-download state tracking, and resume logic would add
+significant complexity for negligible benefit. If Argus later supports
+an IM that transfers large files (video, multi-MB documents), this
+decision should be revisited.
+
+---
+
 ## Principles
 
 - No "sessions", only a timeline
