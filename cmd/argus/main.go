@@ -114,8 +114,7 @@ func buildToolRegistry(cfg *config.Config, sb sandbox.Sandbox, loader *skill.Fil
 	registry.Register(tool.NewActivateSkillTool(loader.Index()))
 
 	if db != nil {
-		registry.Register(tool.NewDBTool(db))
-		registry.Register(tool.NewDBExecTool(db))
+		registry.Register(tool.NewStructuredDBTool(db))
 	}
 
 	// Memory tools (available when store supports pinned memories).
