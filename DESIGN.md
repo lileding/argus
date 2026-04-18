@@ -233,7 +233,7 @@ models. Argus enforces hard limits at the harness layer:
 
 | Safeguard | Trigger | Action |
 |-----------|---------|--------|
-| **Per-tool budget** | `search`≤3, `fetch`≤4, `db`≤6, `cli`≤5, `write_file`≤3, `db_exec`≤5, `remember`≤3 per turn | Harness rejects further calls without dispatching; returns error "budget exhausted, call finish_task NOW" |
+| **Per-tool budget** | `search`≤3, `fetch`≤4, `db`≤6, `cli`≤5, `write_file`≤3, `remember`≤3 per turn | Harness rejects further calls without dispatching; returns error "budget exhausted, call finish_task NOW" |
 | **Cumulative rejection strike-out** | 5 budget-exhausted rejections in a turn | Force-exit orchestrator, pass gathered materials to synthesizer |
 | **Text-only early abort** | Streaming detects >80 tokens of text without tool calls | Cancel stream immediately (~1s), retry with enforcement prompt instead of waiting 10-30s for full generation |
 | **Tool-only retry** | First iteration produces no tool calls after early abort | Inject "You MUST call a tool" user message, retry once |
@@ -374,7 +374,11 @@ Skills follow the [Agent Skills open standard](https://agentskills.io) (same SKI
 
 **Builtin skills** — compiled into the binary, platform-conditional (`//go:build unix` / `windows`). Their full prompt is always injected into the orchestrator system prompt. Example: `posix-cli` teaches the model how to use grep, find, awk, sed, jq, pipelines, and enforces rules like "NEVER use `ls -R`, ALWAYS use `find`".
 
-**User skills** — SKILL.md files in `workspace/.skills/`, created by the agent via `save_skill` or by the user manually. Loaded at startup, background-rescanned every 30 s. Only name + description appear in the orchestrator's system prompt catalog; full prompt loaded via `activate_skill` tool on demand.
+**User skills** — SKILL.md files in `workspace/.skills/`, authored by humans
+(not the model). Loaded at startup, background-rescanned every 30 s. Only
+name + description appear in the orchestrator's system prompt catalog; full
+prompt loaded via `activate_skill` tool on demand. The model cannot create
+or modify skills — `save_skill` has been removed from the tool registry.
 
 User skills with the same name as a builtin override it.
 
@@ -393,90 +397,96 @@ workspace/.skills/
 
 ```yaml
 ---
-name: calorie
-description: "Track daily food intake and calories."
+name: food-tracker
+description: "记录、查询和分析每日饮食的热量与营养。"
 tools:
   - db
-  - db_exec
 ---
 
-## Calorie Tracking
+## 饮食记录与营养分析
 
-When the user mentions eating or drinking...
+(table schema, command examples, nutrition estimation rules...)
 ```
 
-### Skill Accumulation
+### Skill Lifecycle
 
-When the agent successfully completes a new type of recurring task, it uses `save_skill` to persist its approach as a reusable SKILL.md file. Over time, the agent's capabilities grow organically through use.
+Skills are authored and maintained by humans. The model can only read
+them (via `activate_skill`), not create or modify them. Future: a
+backend skill-induction system will analyze traces to propose new
+skills, but the final authoring remains human-controlled.
 
 ---
 
 ## Tools
 
-| Tool | Purpose | Availability |
-|------|---------|-------------|
-| `read_file` | Read file contents (workspace-relative paths) | Always |
-| `write_file` | Write file contents (auto-creates directories) | Always |
-| `cli` | Execute shell commands via sandbox | Always |
-| `search` | Web search (DuckDuckGo, no API key) — **budget 3/turn** | Always |
-| `fetch` | URL → readable text — **budget 4/turn** | Always |
-| `current_time` | Date/time with timezone support | Always |
-| `save_skill` | Create/update SKILL.md files | Always |
-| `activate_skill` | Load a skill's full instructions on demand | Always |
-| `finish_task` | Sentinel — signals orchestrator → synthesizer transition | Always |
-| `db` | Read-only SQL queries — **budget 6/turn**, sandboxed (see below) | When DB available |
-| `db_exec` | Write SQL (INSERT/UPDATE/CREATE TABLE), sandboxed (see below) | When DB available |
-| `remember` | Pin a persistent memory (pgvector indexed) | When DB available |
-| `forget` | Deactivate a pinned memory by ID | When DB available |
+| Tool | Purpose | Budget |
+|------|---------|--------|
+| `read_file` | Read file contents (anywhere in workspace) | — |
+| `write_file` | Write file (restricted to `.users/` directory) | 3/turn |
+| `cli` | Execute shell commands via sandbox | 5/turn |
+| `search` | Web search (DuckDuckGo, no API key) | 3/turn |
+| `fetch` | URL → readable text | 4/turn |
+| `current_time` | Date/time with timezone support | — |
+| `activate_skill` | Load a skill's full instructions on demand | — |
+| `finish_task` | Sentinel — signals orchestrator → synthesizer transition | — |
+| `db` | Structured data access (see below) | 6/turn |
+| `remember` | Pin a persistent memory (pgvector indexed) | 3/turn |
+| `forget` | Deactivate a pinned memory by ID | — |
+
+Removed tools: `save_skill` (skills are human-authored), `db_exec` (replaced
+by the structured `db` tool).
 
 ### Safety
 
-- `read_file` / `write_file`: paths restricted to workspace, `..` traversal blocked, `~` rejected with helpful error suggesting `cli` tool
-- `cli`: execution delegated to sandbox (local or Docker with network/memory/CPU limits)
-- `db` / `db_exec`: all model SQL passes through `internal/sqlsandbox` (see below)
-- Tool output truncated to 16 KB to prevent context overflow
-- All tool calls logged with full arguments before execution
+- `read_file`: can read anywhere in workspace. Binary files (images,
+  audio) return a description instead of raw bytes.
+- `write_file`: **restricted to `.users/` directory**. The tool silently
+  prepends `.users/` to any path. The model cannot overwrite skills
+  (`.skills/`), media (`.files/`), or config files.
+- `cli`: execution delegated to sandbox (local or Docker with resource limits).
+- `db`: structured CLI+JSON interface — the model never writes SQL.
+  See below.
+- Tool output truncated to 16 KB to prevent context overflow.
+- All tool calls logged with full arguments + normalized form for traces.
 
-### DB Sandboxing
+### Structured Data Access (db tool)
 
-The model never names a system table. Every SQL statement passed to `db` or
-`db_exec` is parsed by PostgreSQL's own parser (via libpg_query) and every
-user-level table/index identifier gets the hidden prefix `argus_`. The model
-writes `SELECT * FROM food_log`; the tool executes
-`SELECT * FROM argus_food_log`. Error messages are scrubbed on the way back
-so the model never sees the prefix.
+The model does not write SQL. Instead it sends CLI-style commands with
+JSON values through a single `db` tool:
 
-Three machine-enforced rules give the **non-collision guarantee**:
-
-1. System tables (`messages`, `schema_migrations`, `memories`, `documents`,
-   `chunks`) never start with `argus_` — the namespace is reserved. A guard
-   test walks `internal/store/migrations/*.sql` and fails CI if any future
-   migration reserves a model-namespace name.
-2. Every model-issued `RangeVar` is prefixed. Full AST coverage by
-   `sandbox_test.go` catches a stray unhandled case.
-3. Inputs that already contain an `argus_`-prefixed identifier are rejected
-   outright — closes the double-prefix escape.
-
-Additional rejections: schema-qualified references
-(`public.x`, `information_schema.*`, `pg_catalog.*`), multi-statement SQL
-(`SELECT 1; DROP TABLE messages`), and `DROP` of non-relation object types
-(schemas, functions, roles, …).
-
-The old `protectedTables` DROP-string-match is gone — the namespace split
-makes it redundant.
-
-**Upgrading from a pre-sandbox DB**: if a pre-sandbox deployment wrote
-tables under unprefixed names, a one-shot manual rename brings them into
-the new namespace:
-
-```sql
--- For each model-created table that used to exist unprefixed:
-ALTER TABLE food_log RENAME TO argus_food_log;
--- Indexes and sequences rename automatically with the table in PostgreSQL.
+```
+list                              — show all tables
+describe food_log                 — show columns and types
+create food_log {"meal_date": "date!", "calories": "number"}
+query food_log where {"meal_date": "2026-04-17"} sort created_at desc limit 10
+count food_log group_by ["meal_date"] sum ["calories"]
+insert food_log {"meal_date": "2026-04-17", "food_name": "牛排", "calories": 450}
+update food_log 42 {"calories": 550}
 ```
 
-Not automated because a shared PG instance may also host unrelated tables
-(e.g. Mattermost in the same cluster).
+7 verbs: `list`, `describe`, `create`, `query`, `count`, `insert`, `update`.
+No `delete` / `drop` / `truncate` — data only grows.
+
+**Namespace isolation**: the tool prepends `argus_` to all table names
+internally. The model writes `food_log`; PG sees `argus_food_log`. System
+tables (`messages`, `memories`, etc.) are unreachable because they don't
+carry the prefix. No SQL parser needed — prefix is applied at the tool
+layer before generating parameterized queries.
+
+**Column validation**: before execution, the tool checks all referenced
+column names against `information_schema.columns`. Unknown columns trigger
+a Levenshtein fuzzy match suggestion: `"calory" → did you mean "calories"?`
+
+**Query results**: returned as JSON arrays (preserving types), not
+tab-separated text. `create` is idempotent (IF NOT EXISTS + returns
+current schema). `update` only works by ID (no WHERE conditions).
+
+**Types**: `text`, `number` (DOUBLE PRECISION), `date`, `boolean`,
+`timestamp`, `json` (JSONB). Every table auto-gets `id` + `created_at` +
+`updated_at`.
+
+**Where operators**: exact match (default), `__gt`, `__gte`, `__lt`,
+`__lte`, `__contains` (ILIKE), `__neq`.
 
 ---
 
@@ -576,7 +586,10 @@ CREATE TABLE chunks (
 );
 ```
 
-IVFFlat cosine indexes on all three embedding columns. Agent-created business tables (e.g. `food_log`) live alongside these and are created dynamically via `db_exec`.
+IVFFlat cosine indexes on all three embedding columns. Agent-created
+business tables (e.g. `argus_food_log`) live alongside these and are
+created via the structured `db` tool's `create` verb. The `argus_` prefix
+is applied transparently by the tool layer.
 
 Database is optional — server mode falls back to memory store if PostgreSQL is unavailable, though semantic recall, pinned memories, and document RAG are disabled in that mode.
 
@@ -685,11 +698,7 @@ internal/
     sandbox.go               Sandbox interface: Exec(ctx, command, workDir)
     local.go                 Host execution (bash -c)
     docker.go                Container execution (docker run)
-  sqlsandbox/
-    sandbox.go               SQL rewriter: AST-walk, prefix RangeVars,
-                             reject schema-qualified / pre-prefixed /
-                             multi-statement inputs; StripPrefix for errors
-    sandbox_test.go          Accept/reject corpus + migrations invariant guard
+  # sqlsandbox/ — removed (replaced by structured db tool)
   skill/
     index.go                 SkillIndex: thread-safe catalog + prompt lookup
     loader.go                FileLoader: load builtins + rescan .skills/
@@ -709,13 +718,13 @@ internal/
   tool/
     tool.go                  Tool interface + ToolDef conversion
     registry.go              Registry with name lookup
-    file.go                  read_file + write_file (workspace-restricted)
+    file.go                  read_file (workspace) + write_file (.users/ only)
     cli.go                   Shell commands (delegates to sandbox)
     search.go                DuckDuckGo web search
     fetch.go                 URL fetcher with HTML-to-text conversion
     current_time.go          Date/time with timezone support
-    db.go / db_exec.go       Database read/write
-    save_skill.go            Create SKILL.md files
+    db_structured.go         Structured db tool (single CLI+JSON interface)
+    db_command.go            Parser, executor, validator, normalizer
     activate_skill.go        Load skill prompt on demand
     remember.go / forget.go  Pinned memory management
     finish_task.go           Sentinel tool (orchestrator exit signal)
