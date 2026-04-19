@@ -214,6 +214,46 @@ existing `messages.reply_status` queue during the first migration stage,
 but new async work should use `tasks` from day one so the two concepts do
 not collapse into one overloaded table.
 
+#### Outbox and Presentation Lock
+
+Async workers never call IM APIs directly. They append delivery requests
+to an `outbox_events` table. A per-chat presenter consumes those events
+and owns all card/message delivery for that chat.
+
+```sql
+CREATE TABLE outbox_events (
+    id          BIGSERIAL PRIMARY KEY,
+    chat_id     TEXT NOT NULL,
+    task_id     BIGINT REFERENCES tasks(id),
+    kind        TEXT NOT NULL, -- async_done / async_failed / reminder / notice
+    payload     JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    priority    INT NOT NULL DEFAULT 0,
+    error       TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    sent_at     TIMESTAMPTZ
+);
+```
+
+The presenter enforces a single rule: a chat can have only one active
+presentation owner. While a sync task is streaming or patching its reply
+card, async completion events for the same chat remain pending. When the
+sync card reaches its final update, the presenter drains pending outbox
+events in priority/created order.
+
+This keeps two concerns separate:
+
+- **Execution concurrency**: async tasks can run in parallel across all
+  chats and can continue while a sync task is active.
+- **User-visible ordering**: the chat receives one coherent sequence of
+  cards and messages, with no async completion overwriting or interleaving
+  with an unfinished sync reply card.
+
+The first implementation can keep the presentation lock in memory because
+Argus is currently single-instance. If horizontal scaling is introduced,
+the lock must move to a DB lease or advisory lock, matching the existing
+deployment constraint for per-chat FIFO.
+
 ---
 
 ## Multimodal Input
