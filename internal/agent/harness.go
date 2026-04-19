@@ -40,6 +40,7 @@ func (a *Agent) loadHistory(ctx context.Context, chatID string, excludeID int64,
 			if queryText != "" {
 				queryVec, err := a.embedder.EmbedOne(ctx, queryText)
 				if err == nil {
+					// Search conversation history.
 					similar, err := ss.SearchMessages(ctx, queryVec, chatID, 10)
 					if err == nil {
 						recalledIDs = make(map[int64]bool)
@@ -48,6 +49,22 @@ func (a *Agent) loadHistory(ctx context.Context, chatID string, excludeID int64,
 							recalled = append(recalled, model.Message{
 								Role:    model.Role(m.Role),
 								Content: m.Content,
+							})
+						}
+					}
+
+					// Search document chunks (RAG).
+					if ds, ok := a.store.(store.DocumentStore); ok {
+						chunks, err := ds.SearchChunks(ctx, queryVec, 3)
+						if err == nil && len(chunks) > 0 {
+							var sb strings.Builder
+							sb.WriteString("[Relevant document excerpts]\n")
+							for _, c := range chunks {
+								sb.WriteString(fmt.Sprintf("\n--- From: %s ---\n%s\n", c.DocFilename, c.Content))
+							}
+							recalled = append(recalled, model.Message{
+								Role:    model.RoleUser,
+								Content: sb.String(),
 							})
 						}
 					}
