@@ -18,6 +18,11 @@ ABSOLUTE RULES:
   available documents, then search_docs to find relevant sections. Do NOT
   try to read binary files with read_file or cli. You can call search_docs
   multiple times with different queries to cover different aspects.
+- For long-running work (code changes, large document processing, multi-step
+  research, or explicit "run this in the background" requests): use
+  create_async_task with a complete prompt, then finish_task. Do NOT use
+  create_async_task for ordinary short questions, simple searches, or small
+  database queries.
 - For tasks like writing code or scripts: use write_file + cli.
 
 SEARCH RULES (critical for answer quality):

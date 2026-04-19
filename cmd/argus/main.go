@@ -23,6 +23,7 @@ import (
 	"argus/internal/sandbox"
 	"argus/internal/skill"
 	"argus/internal/store"
+	"argus/internal/task"
 	"argus/internal/tool"
 )
 
@@ -122,6 +123,13 @@ func buildToolRegistry(cfg *config.Config, sb sandbox.Sandbox, loader *skill.Fil
 		registry.Register(tool.NewForgetTool(ps))
 	}
 
+	// Async task tools (available when the store supports durable tasks).
+	if ts, ok := st.(store.TaskStore); ok {
+		registry.Register(tool.NewCreateAsyncTaskTool(ts))
+		registry.Register(tool.NewGetTaskStatusTool(ts))
+		registry.Register(tool.NewCancelTaskTool(ts))
+	}
+
 	// Document search tools (available when store supports documents + embeddings available).
 	if ds, ok := st.(store.DocumentStore); ok && embedClient != nil {
 		registry.Register(tool.NewSearchDocsTool(ds, embedClient))
@@ -168,6 +176,11 @@ func runServer(cfg *config.Config) {
 				}
 				if msgs, err := rs.FailedTranscriptions(ctx); err == nil && len(msgs) > 0 {
 					slog.Warn("found messages with failed transcriptions", "count", len(msgs))
+				}
+			}
+			if ts, ok := st.(store.TaskStore); ok {
+				if n, err := ts.RecoverExpiredTasks(ctx, time.Now()); err == nil && n > 0 {
+					slog.Info("recovered expired async tasks", "count", n)
 				}
 			}
 		} else {
@@ -218,6 +231,12 @@ func runServer(cfg *config.Config) {
 	sb := buildSandbox(cfg)
 	toolReg := buildToolRegistry(cfg, sb, loader, db, st, embedClient)
 	ag := agent.New(orchClient, synthClient, st, toolReg, loader.Index(), embedClient, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.OrchestratorContextWindow, cfg.Agent.MaxIterations)
+
+	if ts, ok := st.(store.TaskStore); ok {
+		taskWorker := task.NewWorker(ts, ag, "argus-task-worker", 2*time.Second, 30*time.Minute)
+		taskWorker.Start()
+		defer taskWorker.Stop()
+	}
 
 	feishuClient := feishu.NewClient(cfg.Feishu)
 	processor := render.NewProcessor(feishuClient)

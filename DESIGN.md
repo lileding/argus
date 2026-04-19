@@ -316,7 +316,7 @@ simple searches, or small structured data queries.
 
 Implementation order:
 
-1. Add `tasks`, async worker leases, and basic `create_async_task`.
+1. ~~Add `tasks`, async worker leases, worker execution, and basic task tools.~~
 2. Add `outbox_events` and per-chat presentation serialization.
 3. Link traces to `task_id` / `parent_task_id`.
 4. Add `cron_schedules` and daily schedule execution.
@@ -757,9 +757,9 @@ skills, but the final authoring remains human-controlled.
 | `forget` | Deactivate a pinned memory by ID | — |
 | `search_docs` | Semantic search over indexed document chunks | — |
 | `list_docs` | List all indexed documents in knowledge base | — |
-| `create_async_task` | Create a durable background task (planned) | — |
-| `get_task_status` | Inspect background task state (planned) | — |
-| `cancel_task` | Cancel a queued/running background task (planned) | — |
+| `create_async_task` | Create a durable background task | 2/turn |
+| `get_task_status` | Inspect background task state | — |
+| `cancel_task` | Cancel a queued/running background task | — |
 | `create_cron` | Create a DB-backed schedule that emits async tasks (planned) | — |
 | `list_cron` | List schedules for the current user/chat (planned) | — |
 | `delete_cron` | Disable a schedule (planned) | — |
@@ -943,6 +943,12 @@ async tasks. The async task worker runs the Agent, records traces, and
 emits outbox events. This makes scheduled work visible, editable,
 recoverable, and consistent with user-created background tasks.
 
+Current async task status: `tasks` persistence, lease-based worker claim,
+`create_async_task`, `get_task_status`, and `cancel_task` are implemented.
+The worker executes queued task prompts through the existing Agent and
+stores the final result on the task row. Outbox delivery and Feishu
+completion notifications are the next step.
+
 ---
 
 ## Configuration
@@ -1096,6 +1102,9 @@ internal/
       001_init.sql           messages table
       002_memory_system.sql  pgvector + memories + documents + chunks
       003_message_queue.sql  reply_status + reply_channel_id + trigger_msg_id
+      005_async_tasks.sql    tasks + outbox_events
+  task/
+    worker.go                Lease-based async task worker
   tool/
     tool.go                  Tool interface + ToolDef conversion
     registry.go              Registry with name lookup
@@ -1109,6 +1118,7 @@ internal/
     activate_skill.go        Load skill prompt on demand
     remember.go / forget.go  Pinned memory management
     search_docs.go           Document search + list tools (knowledge base)
+    async_task.go            Create/status/cancel durable async tasks
     finish_task.go           Sentinel tool (orchestrator exit signal)
     context.go               ChatID context key for tools
 third_party/ratex/           Embedded Rust LaTeX renderer (CGo)

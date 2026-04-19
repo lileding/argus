@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/lib/pq"
 	pgvector "github.com/pgvector/pgvector-go"
@@ -508,6 +509,167 @@ func (s *PostgresStore) SaveToolCalls(ctx context.Context, calls []ToolCallRecor
 		}
 	}
 	return tx.Commit()
+}
+
+// --- TaskStore ---
+
+func (s *PostgresStore) CreateTask(ctx context.Context, task *Task) error {
+	if task.Kind == "" {
+		task.Kind = "async"
+	}
+	if task.Source == "" {
+		task.Source = "agent"
+	}
+	if task.Status == "" {
+		task.Status = "queued"
+	}
+	if len(task.Input) == 0 {
+		task.Input = []byte(`{}`)
+	}
+
+	err := s.db.QueryRowContext(ctx, `
+		INSERT INTO tasks (
+			kind, source, chat_id, user_id, parent_task_id, trigger_message_id,
+			status, priority, title, input
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+		RETURNING id, created_at
+	`, task.Kind, task.Source, task.ChatID, task.UserID, task.ParentTaskID,
+		task.TriggerMessageID, task.Status, task.Priority, task.Title, string(task.Input),
+	).Scan(&task.ID, &task.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("create task: %w", err)
+	}
+	return nil
+}
+
+func (s *PostgresStore) GetTask(ctx context.Context, taskID int64) (*Task, error) {
+	var t Task
+	var parentID, triggerID sql.NullInt64
+	var userID, leaseOwner sql.NullString
+	var leaseUntil, startedAt, finishedAt sql.NullTime
+	var input []byte
+
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, kind, source, chat_id, user_id, parent_task_id,
+			trigger_message_id, status, priority, title, input, result, error,
+			lease_owner, lease_until, created_at, started_at, finished_at
+		FROM tasks
+		WHERE id = $1
+	`, taskID).Scan(
+		&t.ID, &t.Kind, &t.Source, &t.ChatID, &userID, &parentID,
+		&triggerID, &t.Status, &t.Priority, &t.Title, &input, &t.Result, &t.Error,
+		&leaseOwner, &leaseUntil, &t.CreatedAt, &startedAt, &finishedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get task: %w", err)
+	}
+	t.Input = input
+	t.UserID = userID.String
+	if parentID.Valid {
+		t.ParentTaskID = &parentID.Int64
+	}
+	if triggerID.Valid {
+		t.TriggerMessageID = &triggerID.Int64
+	}
+	t.LeaseOwner = leaseOwner.String
+	if leaseUntil.Valid {
+		t.LeaseUntil = &leaseUntil.Time
+	}
+	if startedAt.Valid {
+		t.StartedAt = &startedAt.Time
+	}
+	if finishedAt.Valid {
+		t.FinishedAt = &finishedAt.Time
+	}
+	return &t, nil
+}
+
+func (s *PostgresStore) ClaimNextTask(ctx context.Context, workerID string, leaseUntil time.Time) (*Task, error) {
+	var taskID int64
+	err := s.db.QueryRowContext(ctx, `
+		UPDATE tasks
+		SET status = 'running',
+			lease_owner = $1,
+			lease_until = $2,
+			started_at = COALESCE(started_at, NOW())
+		WHERE id = (
+			SELECT id FROM tasks
+			WHERE status = 'queued'
+			ORDER BY priority DESC, created_at
+			LIMIT 1
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING id
+	`, workerID, leaseUntil).Scan(&taskID)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("claim next task: %w", err)
+	}
+	return s.GetTask(ctx, taskID)
+}
+
+func (s *PostgresStore) CompleteTask(ctx context.Context, taskID int64, result string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE tasks
+		SET status = 'succeeded',
+			result = $1,
+			error = '',
+			lease_owner = NULL,
+			lease_until = NULL,
+			finished_at = NOW()
+		WHERE id = $2 AND status = 'running'
+	`, result, taskID)
+	return err
+}
+
+func (s *PostgresStore) FailTask(ctx context.Context, taskID int64, errorMsg string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE tasks
+		SET status = 'failed',
+			error = $1,
+			lease_owner = NULL,
+			lease_until = NULL,
+			finished_at = NOW()
+		WHERE id = $2 AND status = 'running'
+	`, errorMsg, taskID)
+	return err
+}
+
+func (s *PostgresStore) CancelTask(ctx context.Context, taskID int64) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE tasks
+		SET status = 'cancelled',
+			lease_owner = NULL,
+			lease_until = NULL,
+			finished_at = NOW()
+		WHERE id = $1 AND status IN ('queued', 'running')
+	`, taskID)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+func (s *PostgresStore) RecoverExpiredTasks(ctx context.Context, now time.Time) (int, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE tasks
+		SET status = 'queued',
+			lease_owner = NULL,
+			lease_until = NULL
+		WHERE status = 'running' AND lease_until IS NOT NULL AND lease_until < $1
+	`, now)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }
 
 // --- QueueStore (message pipeline) ---

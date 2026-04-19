@@ -124,6 +124,38 @@ type ToolCallRecord struct {
 	DurationMs     int
 }
 
+// TaskStore manages durable background tasks.
+type TaskStore interface {
+	CreateTask(ctx context.Context, task *Task) error
+	GetTask(ctx context.Context, taskID int64) (*Task, error)
+	ClaimNextTask(ctx context.Context, workerID string, leaseUntil time.Time) (*Task, error)
+	CompleteTask(ctx context.Context, taskID int64, result string) error
+	FailTask(ctx context.Context, taskID int64, errorMsg string) error
+	CancelTask(ctx context.Context, taskID int64) (bool, error)
+	RecoverExpiredTasks(ctx context.Context, now time.Time) (int, error)
+}
+
+type Task struct {
+	ID               int64
+	Kind             string // "sync" or "async"
+	Source           string // "im", "cron", "agent"
+	ChatID           string
+	UserID           string
+	ParentTaskID     *int64
+	TriggerMessageID *int64
+	Status           string // queued / running / succeeded / failed / cancelled
+	Priority         int
+	Title            string
+	Input            []byte // JSON object
+	Result           string
+	Error            string
+	LeaseOwner       string
+	LeaseUntil       *time.Time
+	CreatedAt        time.Time
+	StartedAt        *time.Time
+	FinishedAt       *time.Time
+}
+
 // DocumentStore manages document ingestion and RAG.
 type DocumentStore interface {
 	SaveDocument(ctx context.Context, doc *Document) error
@@ -143,7 +175,7 @@ type Document struct {
 	Channel    string
 	Status     string // "pending", "processing", "ready", "error"
 	ErrorMsg   string
-	ChunkCount int    // populated by ListDocuments
+	ChunkCount int // populated by ListDocuments
 	CreatedAt  time.Time
 }
 

@@ -274,12 +274,13 @@ func (a *Agent) runOrchestrator(
 	// Small budgets for expensive/noisy tools like search; unrestricted tools
 	// (not listed) can be called freely.
 	toolBudgets := map[string]int{
-		"search":     3,
-		"fetch":      4,
-		"db":         6,
-		"cli":        5,
-		"write_file": 3,
-		"remember":   3,
+		"search":            3,
+		"fetch":             4,
+		"db":                6,
+		"cli":               5,
+		"write_file":        3,
+		"remember":          3,
+		"create_async_task": 2,
 	}
 	toolCounts := map[string]int{}
 

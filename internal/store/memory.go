@@ -11,10 +11,12 @@ type MemoryStore struct {
 	mu       sync.Mutex
 	messages []StoredMessage
 	nextID   int64
+	tasks    []Task
+	nextTask int64
 }
 
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{nextID: 1}
+	return &MemoryStore{nextID: 1, nextTask: 1}
 }
 
 func (s *MemoryStore) SaveMessage(_ context.Context, msg *StoredMessage) error {
@@ -156,4 +158,148 @@ func (s *MemoryStore) PendingChats(_ context.Context) ([]string, error) {
 		}
 	}
 	return chats, nil
+}
+
+// --- TaskStore (in-memory, for tests / no-DB mode) ---
+
+func (s *MemoryStore) CreateTask(_ context.Context, task *Task) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	task.ID = s.nextTask
+	s.nextTask++
+	if task.Kind == "" {
+		task.Kind = "async"
+	}
+	if task.Source == "" {
+		task.Source = "agent"
+	}
+	if task.Status == "" {
+		task.Status = "queued"
+	}
+	if len(task.Input) == 0 {
+		task.Input = []byte(`{}`)
+	}
+	if task.CreatedAt.IsZero() {
+		task.CreatedAt = time.Now()
+	}
+	s.tasks = append(s.tasks, *task)
+	return nil
+}
+
+func (s *MemoryStore) GetTask(_ context.Context, taskID int64) (*Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, t := range s.tasks {
+		if t.ID == taskID {
+			task := t
+			return &task, nil
+		}
+	}
+	return nil, nil
+}
+
+func (s *MemoryStore) ClaimNextTask(_ context.Context, workerID string, leaseUntil time.Time) (*Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bestIdx := -1
+	for i := range s.tasks {
+		if s.tasks[i].Status != "queued" {
+			continue
+		}
+		if bestIdx == -1 ||
+			s.tasks[i].Priority > s.tasks[bestIdx].Priority ||
+			(s.tasks[i].Priority == s.tasks[bestIdx].Priority && s.tasks[i].CreatedAt.Before(s.tasks[bestIdx].CreatedAt)) {
+			bestIdx = i
+		}
+	}
+	if bestIdx == -1 {
+		return nil, nil
+	}
+
+	now := time.Now()
+	s.tasks[bestIdx].Status = "running"
+	s.tasks[bestIdx].LeaseOwner = workerID
+	s.tasks[bestIdx].LeaseUntil = &leaseUntil
+	if s.tasks[bestIdx].StartedAt == nil {
+		s.tasks[bestIdx].StartedAt = &now
+	}
+	task := s.tasks[bestIdx]
+	return &task, nil
+}
+
+func (s *MemoryStore) CompleteTask(_ context.Context, taskID int64, result string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	for i := range s.tasks {
+		if s.tasks[i].ID == taskID && s.tasks[i].Status == "running" {
+			s.tasks[i].Status = "succeeded"
+			s.tasks[i].Result = result
+			s.tasks[i].Error = ""
+			s.tasks[i].LeaseOwner = ""
+			s.tasks[i].LeaseUntil = nil
+			s.tasks[i].FinishedAt = &now
+			return nil
+		}
+	}
+	return nil
+}
+
+func (s *MemoryStore) FailTask(_ context.Context, taskID int64, errorMsg string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	for i := range s.tasks {
+		if s.tasks[i].ID == taskID && s.tasks[i].Status == "running" {
+			s.tasks[i].Status = "failed"
+			s.tasks[i].Error = errorMsg
+			s.tasks[i].LeaseOwner = ""
+			s.tasks[i].LeaseUntil = nil
+			s.tasks[i].FinishedAt = &now
+			return nil
+		}
+	}
+	return nil
+}
+
+func (s *MemoryStore) CancelTask(_ context.Context, taskID int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	for i := range s.tasks {
+		if s.tasks[i].ID != taskID {
+			continue
+		}
+		if s.tasks[i].Status != "queued" && s.tasks[i].Status != "running" {
+			return false, nil
+		}
+		s.tasks[i].Status = "cancelled"
+		s.tasks[i].LeaseOwner = ""
+		s.tasks[i].LeaseUntil = nil
+		s.tasks[i].FinishedAt = &now
+		return true, nil
+	}
+	return false, nil
+}
+
+func (s *MemoryStore) RecoverExpiredTasks(_ context.Context, now time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	recovered := 0
+	for i := range s.tasks {
+		if s.tasks[i].Status == "running" && s.tasks[i].LeaseUntil != nil && s.tasks[i].LeaseUntil.Before(now) {
+			s.tasks[i].Status = "queued"
+			s.tasks[i].LeaseOwner = ""
+			s.tasks[i].LeaseUntil = nil
+			recovered++
+		}
+	}
+	return recovered, nil
 }
