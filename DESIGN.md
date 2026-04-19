@@ -135,6 +135,37 @@ Sandboxes are configurable:
 - `local` — direct host execution via `bash -c` (development)
 - `docker` — isolated container execution (production, image: `argus-sandbox`)
 
+### Async Task Architecture (Planned)
+
+The next architecture step is to separate immediate conversation turns
+from durable background work. The system becomes three layers:
+
+- **IM adapter layer**: Feishu/Slack/CLI adapters parse inbound messages,
+  download media, prepare normalized inputs, and render outbound events.
+  They do not decide how long-running work is scheduled.
+- **Agent engine layer**: the task scheduler, task workers, two-phase
+  Agent, tool registry, traces, and presentation queue live here. This
+  layer decides whether work runs synchronously or asynchronously.
+- **Model backend layer**: OpenAI/Anthropic/Gemini/local adapters expose
+  uniform chat, streaming, transcription, and embedding APIs. They know
+  nothing about IM cards, cron schedules, or task locking.
+
+Two task classes share the same Agent and tool infrastructure:
+
+- **Sync tasks** are user-visible conversation turns. They keep the
+  existing per-chat FIFO behavior: one active sync reply card per chat,
+  streaming updates, and immediate final answer.
+- **Async tasks** are durable background jobs. They can be triggered by
+  cron schedules or created by a sync task when the orchestrator detects
+  long-running work (code changes, large document processing, multi-step
+  research, or an explicit "run this in the background" request).
+
+Async task execution is parallel. Presentation is not. Completed async
+tasks write an outbound notification event, and a per-chat presenter
+serializes delivery so it never conflicts with an active sync reply card.
+This preserves the current chat UX while allowing background work to use
+all available worker capacity.
+
 ---
 
 ## Multimodal Input
