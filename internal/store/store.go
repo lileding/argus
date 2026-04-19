@@ -8,8 +8,8 @@ import (
 // StoredMessage represents a message persisted in the store.
 type StoredMessage struct {
 	ID         int64
-	ChatID     string     // composite key: "feishu:p2p:ou_xxx", "cli:local"
-	Role       string     // user / assistant / tool
+	ChatID     string // composite key: "feishu:p2p:ou_xxx", "cli:local"
+	Role       string // user / assistant / tool
 	Content    string
 	ToolName   *string
 	ToolCallID *string
@@ -95,20 +95,20 @@ type TraceStore interface {
 }
 
 type Trace struct {
-	ID                     int64
-	MessageID              int64
-	ReplyID                int64
-	ChatID                 string
-	OrchestratorModel      string
-	SynthesizerModel       string
-	Iterations             int
-	Summary                string
-	TotalPromptTokens      int
-	TotalCompletionTokens  int
-	SynthPromptTokens      int
-	SynthCompletionTokens  int
-	DurationMs             int
-	CreatedAt              time.Time
+	ID                    int64
+	MessageID             int64
+	ReplyID               int64
+	ChatID                string
+	OrchestratorModel     string
+	SynthesizerModel      string
+	Iterations            int
+	Summary               string
+	TotalPromptTokens     int
+	TotalCompletionTokens int
+	SynthPromptTokens     int
+	SynthCompletionTokens int
+	DurationMs            int
+	CreatedAt             time.Time
 }
 
 type ToolCallRecord struct {

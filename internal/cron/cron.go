@@ -9,7 +9,7 @@ import (
 // Job is a scheduled task.
 type Job struct {
 	Name     string
-	Schedule string        // cron-like: "HH:MM" for daily
+	Schedule string // cron-like: "HH:MM" for daily
 	Fn       func()
 	hour     int
 	minute   int

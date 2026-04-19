@@ -92,10 +92,18 @@ func whiteToTransparent(pngData []byte) ([]byte, error) {
 				rgba.SetNRGBA(x, y, color.NRGBA{0, 0, 0, 0})
 			} else {
 				rgba.SetNRGBA(x, y, color.NRGBA{0, 0, 0, alpha})
-				if x < minX { minX = x }
-				if y < minY { minY = y }
-				if x > maxX { maxX = x }
-				if y > maxY { maxY = y }
+				if x < minX {
+					minX = x
+				}
+				if y < minY {
+					minY = y
+				}
+				if x > maxX {
+					maxX = x
+				}
+				if y > maxY {
+					maxY = y
+				}
 			}
 		}
 	}

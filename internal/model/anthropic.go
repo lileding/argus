@@ -38,12 +38,12 @@ func NewAnthropicClient(apiKey, modelName string, maxTokens int, timeout time.Du
 // --- Anthropic API types ---
 
 type anthropicRequest struct {
-	Model     string            `json:"model"`
-	MaxTokens int               `json:"max_tokens"`
-	System    any               `json:"system,omitempty"` // string or []anthropicContentBlock (for cache_control)
-	Messages  []anthropicMsg    `json:"messages"`
-	Tools     []anthropicTool   `json:"tools,omitempty"`
-	Stream    bool              `json:"stream,omitempty"`
+	Model     string          `json:"model"`
+	MaxTokens int             `json:"max_tokens"`
+	System    any             `json:"system,omitempty"` // string or []anthropicContentBlock (for cache_control)
+	Messages  []anthropicMsg  `json:"messages"`
+	Tools     []anthropicTool `json:"tools,omitempty"`
+	Stream    bool            `json:"stream,omitempty"`
 }
 
 type anthropicMsg struct {
@@ -52,15 +52,15 @@ type anthropicMsg struct {
 }
 
 type anthropicContentBlock struct {
-	Type         string                 `json:"type"`
-	Text         string                 `json:"text,omitempty"`
-	ID           string                 `json:"id,omitempty"`
-	Name         string                 `json:"name,omitempty"`
-	Input        map[string]any         `json:"input,omitempty"`
-	ToolUseID    string                 `json:"tool_use_id,omitempty"`
-	Content      string                 `json:"content,omitempty"`
-	CacheControl map[string]string      `json:"cache_control,omitempty"`
-	Source       *anthropicImageSource  `json:"source,omitempty"` // for type="image"
+	Type         string                `json:"type"`
+	Text         string                `json:"text,omitempty"`
+	ID           string                `json:"id,omitempty"`
+	Name         string                `json:"name,omitempty"`
+	Input        map[string]any        `json:"input,omitempty"`
+	ToolUseID    string                `json:"tool_use_id,omitempty"`
+	Content      string                `json:"content,omitempty"`
+	CacheControl map[string]string     `json:"cache_control,omitempty"`
+	Source       *anthropicImageSource `json:"source,omitempty"` // for type="image"
 }
 
 type anthropicImageSource struct {
@@ -313,7 +313,7 @@ func (c *AnthropicClient) buildRequest(messages []Message, tools []ToolDef, stre
 				req.Messages = append(req.Messages, anthropicMsg{
 					Role:    "user",
 					Content: msg.TextContent(),
-			})
+				})
 			}
 
 		case RoleAssistant:

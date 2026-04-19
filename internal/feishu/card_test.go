@@ -60,7 +60,7 @@ func TestSplitAtCodeBlocks(t *testing.T) {
 	cases := []struct {
 		name     string
 		input    string
-		wantN    int // expected number of segments
+		wantN    int  // expected number of segments
 		wantCode bool // at least one segment should contain ```
 	}{
 		{

@@ -9,28 +9,28 @@ import (
 )
 
 type Config struct {
-	Server    ServerConfig                 `yaml:"server"`
-	Feishu    FeishuConfig                 `yaml:"feishu"`
-	Upstreams map[string]UpstreamConfig    `yaml:"upstreams"` // top-level upstream definitions
-	Model     ModelConfig                  `yaml:"model"`
-	Database  DatabaseConfig               `yaml:"database"`
-	Agent     AgentConfig                  `yaml:"agent"`
-	Sandbox   SandboxConfig                `yaml:"sandbox"`
-	Embedding EmbeddingConfig              `yaml:"embedding"`
-	Search    SearchConfig                 `yaml:"search"`
-	Cron      CronConfig                   `yaml:"cron"`
+	Server    ServerConfig              `yaml:"server"`
+	Feishu    FeishuConfig              `yaml:"feishu"`
+	Upstreams map[string]UpstreamConfig `yaml:"upstreams"` // top-level upstream definitions
+	Model     ModelConfig               `yaml:"model"`
+	Database  DatabaseConfig            `yaml:"database"`
+	Agent     AgentConfig               `yaml:"agent"`
+	Sandbox   SandboxConfig             `yaml:"sandbox"`
+	Embedding EmbeddingConfig           `yaml:"embedding"`
+	Search    SearchConfig              `yaml:"search"`
+	Cron      CronConfig                `yaml:"cron"`
 }
 
 type SearchConfig struct {
-	Provider      string `yaml:"provider"`        // "tavily" or "duckduckgo" (default: auto-detect)
+	Provider      string `yaml:"provider"` // "tavily" or "duckduckgo" (default: auto-detect)
 	TavilyAPIKey  string `yaml:"tavily_api_key"`
 	MaxResults    int    `yaml:"max_results"`
-	IncludeAnswer bool   `yaml:"include_answer"`  // Tavily: include pre-generated answer
+	IncludeAnswer bool   `yaml:"include_answer"` // Tavily: include pre-generated answer
 }
 
 type EmbeddingConfig struct {
 	Enabled   bool          `yaml:"enabled"`
-	Upstream  string        `yaml:"upstream"`   // which upstream to use (default: "local")
+	Upstream  string        `yaml:"upstream"` // which upstream to use (default: "local")
 	ModelName string        `yaml:"model_name"`
 	BatchSize int           `yaml:"batch_size"`
 	Interval  time.Duration `yaml:"interval"`
@@ -41,11 +41,11 @@ type CronConfig struct {
 }
 
 type CronJobConfig struct {
-	Name    string `yaml:"name"`
-	Hour    int    `yaml:"hour"`
-	Minute  int    `yaml:"minute"`
-	ChatID  string `yaml:"chat_id"` // target chat to send results
-	Prompt  string `yaml:"prompt"`  // prompt to send to the agent
+	Name   string `yaml:"name"`
+	Hour   int    `yaml:"hour"`
+	Minute int    `yaml:"minute"`
+	ChatID string `yaml:"chat_id"` // target chat to send results
+	Prompt string `yaml:"prompt"`  // prompt to send to the agent
 }
 
 type ServerConfig struct {
@@ -61,7 +61,7 @@ type FeishuConfig struct {
 
 // UpstreamConfig defines a model provider backend.
 type UpstreamConfig struct {
-	Type    string        `yaml:"type"`    // "openai", "anthropic", or "gemini"
+	Type    string        `yaml:"type"`     // "openai", "anthropic", or "gemini"
 	BaseURL string        `yaml:"base_url"` // openai only
 	APIKey  string        `yaml:"api_key"`  // openai / anthropic / gemini
 	Timeout time.Duration `yaml:"timeout"`
@@ -69,7 +69,7 @@ type UpstreamConfig struct {
 
 // RoleConfig selects an upstream + model for a specific agent role.
 type RoleConfig struct {
-	Upstream  string `yaml:"upstream"`   // key into Upstreams map
+	Upstream  string `yaml:"upstream"` // key into Upstreams map
 	ModelName string `yaml:"model_name"`
 	MaxTokens int    `yaml:"max_tokens"`
 }
@@ -77,9 +77,9 @@ type RoleConfig struct {
 // ModelConfig holds per-role model selection.
 // Upstreams are defined at Config level, not here.
 type ModelConfig struct {
-	Orchestrator  RoleConfig               `yaml:"orchestrator"`
-	Synthesizer   RoleConfig               `yaml:"synthesizer"`
-	Transcription RoleConfig               `yaml:"transcription"`
+	Orchestrator  RoleConfig `yaml:"orchestrator"`
+	Synthesizer   RoleConfig `yaml:"synthesizer"`
+	Transcription RoleConfig `yaml:"transcription"`
 
 	// Legacy fields (still supported for backward compatibility)
 	BaseURL            string        `yaml:"base_url"`
@@ -96,18 +96,18 @@ type DatabaseConfig struct {
 }
 
 type AgentConfig struct {
-	MaxIterations          int           `yaml:"max_iterations"`
-	ContextWindow          int           `yaml:"context_window"`           // synthesizer history window
-	OrchestratorContextWindow int        `yaml:"orchestrator_context_window"` // orchestrator history window (smaller)
-	SystemPrompt           string        `yaml:"system_prompt"`
-	WorkspaceDir  string        `yaml:"workspace_dir"`
-	SkillsDir     string        `yaml:"skills_dir"`
-	SkillRescan   time.Duration `yaml:"skill_rescan"`
+	MaxIterations             int           `yaml:"max_iterations"`
+	ContextWindow             int           `yaml:"context_window"`              // synthesizer history window
+	OrchestratorContextWindow int           `yaml:"orchestrator_context_window"` // orchestrator history window (smaller)
+	SystemPrompt              string        `yaml:"system_prompt"`
+	WorkspaceDir              string        `yaml:"workspace_dir"`
+	SkillsDir                 string        `yaml:"skills_dir"`
+	SkillRescan               time.Duration `yaml:"skill_rescan"`
 }
 
 type SandboxConfig struct {
-	Type        string        `yaml:"type"`         // "local" or "docker"
-	Image       string        `yaml:"image"`        // docker image name
+	Type        string        `yaml:"type"`  // "local" or "docker"
+	Image       string        `yaml:"image"` // docker image name
 	Timeout     time.Duration `yaml:"timeout"`
 	MemoryLimit string        `yaml:"memory_limit"` // docker only
 	Network     string        `yaml:"network"`      // docker only

@@ -143,7 +143,7 @@ func (ing *Ingester) extractText(ctx context.Context, doc store.Document) (strin
 }
 
 // shellQuote wraps s in POSIX single quotes, escaping any embedded single
-// quotes via the '\'' trick. Safe for arbitrary strings including ones
+// quotes via the '\” trick. Safe for arbitrary strings including ones
 // containing `;`, `$`, backticks, spaces, etc.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"

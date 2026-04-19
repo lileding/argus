@@ -20,8 +20,8 @@ type OpenAIClient struct {
 	apiKey             string
 	modelName          string
 	transcriptionModel string
-	maxTokens          int // Phase 1 (orchestrator)
-	maxReplyTokens     int // Phase 2 (synthesizer)
+	maxTokens          int  // Phase 1 (orchestrator)
+	maxReplyTokens     int  // Phase 2 (synthesizer)
 	useNewTokenField   bool // true = max_completion_tokens (GPT-5.x), false = max_tokens (local/legacy)
 	client             *http.Client
 }

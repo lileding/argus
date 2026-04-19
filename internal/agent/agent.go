@@ -21,8 +21,8 @@ import (
 )
 
 const (
-	maxImagesPerMessage = 4          // max images injected per message
-	maxImageBytes       = 1 << 20    // 1 MB per image file
+	maxImagesPerMessage = 4       // max images injected per message
+	maxImageBytes       = 1 << 20 // 1 MB per image file
 )
 
 // buildUserMessage creates a text or multimodal message from stored content.
@@ -70,12 +70,12 @@ func buildUserMessage(text string, filePaths []string, workspaceDir string) mode
 const maxToolResultBytes = 16 * 1024
 
 type Agent struct {
-	orchestrator  model.Client // Phase 1: tool calling
-	synthesizer   model.Client // Phase 2: answer generation
-	store         store.Store
-	toolRegistry  *tool.Registry
-	skillIndex    *skill.SkillIndex
-	embedder      *embedding.Client
+	orchestrator              model.Client // Phase 1: tool calling
+	synthesizer               model.Client // Phase 2: answer generation
+	store                     store.Store
+	toolRegistry              *tool.Registry
+	skillIndex                *skill.SkillIndex
+	embedder                  *embedding.Client
 	workspaceDir              string
 	contextWindow             int // synthesizer history window
 	orchestratorContextWindow int // orchestrator history window (smaller)
@@ -87,16 +87,16 @@ func New(orchestrator, synthesizer model.Client, st store.Store, toolReg *tool.R
 		maxIterations = 10
 	}
 	return &Agent{
-		orchestrator:  orchestrator,
-		synthesizer:   synthesizer,
-		store:         st,
-		toolRegistry:  toolReg,
-		skillIndex:    skillIdx,
-		embedder:      embedder,
+		orchestrator:              orchestrator,
+		synthesizer:               synthesizer,
+		store:                     st,
+		toolRegistry:              toolReg,
+		skillIndex:                skillIdx,
+		embedder:                  embedder,
 		workspaceDir:              workspaceDir,
 		contextWindow:             contextWindow,
 		orchestratorContextWindow: orchestratorContextWindow,
-		maxIterations: maxIterations,
+		maxIterations:             maxIterations,
 	}
 }
 

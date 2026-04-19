@@ -18,12 +18,12 @@ const (
 //   - string: plain text message
 //   - []ContentPart: multimodal message (text + images, OpenAI vision format)
 type Message struct {
-	Role       Role          `json:"role"`
-	Content    interface{}   `json:"content,omitempty"`
-	ToolCalls  []ToolCall    `json:"tool_calls,omitempty"`
-	ToolCallID string        `json:"tool_call_id,omitempty"`
-	ToolName   string        `json:"tool_name,omitempty"` // for RoleTool: the function name (needed by Gemini)
-	Meta       *MessageMeta  `json:"-"`
+	Role       Role         `json:"role"`
+	Content    interface{}  `json:"content,omitempty"`
+	ToolCalls  []ToolCall   `json:"tool_calls,omitempty"`
+	ToolCallID string       `json:"tool_call_id,omitempty"`
+	ToolName   string       `json:"tool_name,omitempty"` // for RoleTool: the function name (needed by Gemini)
+	Meta       *MessageMeta `json:"-"`
 }
 
 // MessageMeta carries source metadata for persistence.
@@ -38,7 +38,7 @@ type MessageMeta struct {
 
 // ContentPart is a part of a multimodal message (OpenAI vision API format).
 type ContentPart struct {
-	Type     string    `json:"type"`               // "text" or "image_url"
+	Type     string    `json:"type"`                // "text" or "image_url"
 	Text     string    `json:"text,omitempty"`      // for type "text"
 	ImageURL *ImageURL `json:"image_url,omitempty"` // for type "image_url"
 }

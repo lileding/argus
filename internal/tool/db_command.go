@@ -39,7 +39,7 @@ type DBCommand struct {
 
 type DBFilter struct {
 	Field string `json:"field"`
-	Op    string `json:"op"`    // eq, gt, gte, lt, lte, contains, neq
+	Op    string `json:"op"` // eq, gt, gte, lt, lte, contains, neq
 	Value any    `json:"value"`
 }
 

@@ -9,8 +9,8 @@ import (
 	"sort"
 	"strings"
 
-	pgvector "github.com/pgvector/pgvector-go"
 	"github.com/lib/pq"
+	pgvector "github.com/pgvector/pgvector-go"
 )
 
 //go:embed migrations/*.sql

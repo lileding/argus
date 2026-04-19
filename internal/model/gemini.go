@@ -35,10 +35,10 @@ func NewGeminiClient(_ context.Context, apiKey, modelName string, maxTokens int)
 // --- Gemini API types ---
 
 type geminiRequest struct {
-	Contents         []*geminiContent        `json:"contents"`
-	Tools            []*geminiTool           `json:"tools,omitempty"`
-	SystemInstruction *geminiContent         `json:"systemInstruction,omitempty"`
-	GenerationConfig *geminiGenerationConfig `json:"generationConfig,omitempty"`
+	Contents          []*geminiContent        `json:"contents"`
+	Tools             []*geminiTool           `json:"tools,omitempty"`
+	SystemInstruction *geminiContent          `json:"systemInstruction,omitempty"`
+	GenerationConfig  *geminiGenerationConfig `json:"generationConfig,omitempty"`
 }
 
 type geminiContent struct {
@@ -47,10 +47,10 @@ type geminiContent struct {
 }
 
 type geminiPart struct {
-	Text             string                `json:"text,omitempty"`
-	InlineData       *geminiBlob           `json:"inlineData,omitempty"`
-	FunctionCall     *geminiFunctionCall   `json:"functionCall,omitempty"`
-	FunctionResponse *geminiFunctionResp   `json:"functionResponse,omitempty"`
+	Text             string              `json:"text,omitempty"`
+	InlineData       *geminiBlob         `json:"inlineData,omitempty"`
+	FunctionCall     *geminiFunctionCall `json:"functionCall,omitempty"`
+	FunctionResponse *geminiFunctionResp `json:"functionResponse,omitempty"`
 }
 
 type geminiBlob struct {
@@ -73,8 +73,8 @@ type geminiTool struct {
 }
 
 type geminiFuncDecl struct {
-	Name        string       `json:"name"`
-	Description string       `json:"description"`
+	Name        string        `json:"name"`
+	Description string        `json:"description"`
 	Parameters  *geminiSchema `json:"parameters,omitempty"`
 }
 
@@ -92,8 +92,8 @@ type geminiGenerationConfig struct {
 }
 
 type geminiResponse struct {
-	Candidates    []*geminiCandidate    `json:"candidates"`
-	UsageMetadata *geminiUsageMetadata  `json:"usageMetadata,omitempty"`
+	Candidates    []*geminiCandidate   `json:"candidates"`
+	UsageMetadata *geminiUsageMetadata `json:"usageMetadata,omitempty"`
 }
 
 type geminiCandidate struct {
@@ -441,8 +441,8 @@ func convertGeminiResponse(resp *geminiResponse) *Response {
 		if part.FunctionCall != nil {
 			argsJSON, _ := json.Marshal(part.FunctionCall.Args)
 			result.ToolCalls = append(result.ToolCalls, ToolCall{
-				ID:   fmt.Sprintf("call_%s_%d", part.FunctionCall.Name, len(result.ToolCalls)),
-				Type: "function",
+				ID:       fmt.Sprintf("call_%s_%d", part.FunctionCall.Name, len(result.ToolCalls)),
+				Type:     "function",
 				Function: FunctionCall{Name: part.FunctionCall.Name, Arguments: string(argsJSON)},
 			})
 		}
