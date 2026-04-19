@@ -21,10 +21,10 @@ build: $(RATEX_LIB)
 	go build -o bin/argus ./cmd/argus
 
 run: build
-	./bin/argus --mode server --workspace ./workspace
+	./bin/argus --run-mode server --workspace ./workspace
 
 run-cli: build
-	./bin/argus --mode cli --workspace ./workspace
+	./bin/argus --run-mode cli --workspace ./workspace
 
 test: $(RATEX_LIB)
 	go test ./...

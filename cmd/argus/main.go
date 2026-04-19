@@ -29,7 +29,7 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "server", "run mode: server or cli")
+	mode := flag.String("run-mode", "server", "run mode: server or cli")
 	workspace := flag.String("workspace", ".", "workspace directory (contains config.yaml and .skills/)")
 	flag.Parse()
 
