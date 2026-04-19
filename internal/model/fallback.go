@@ -13,7 +13,7 @@ func isRetryable(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "status=429")
 }
 
-const retryDelay = 5 * time.Second
+const retryDelay = 30 * time.Second // Anthropic Tier 1 rate limit window is per-minute
 const maxRetries = 2
 
 // FallbackClient wraps a primary Client with a fallback. If the primary
