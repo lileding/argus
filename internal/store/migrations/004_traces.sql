@@ -6,6 +6,8 @@ CREATE TABLE IF NOT EXISTS traces (
     message_id               BIGINT NOT NULL,       -- user message (messages.id)
     reply_id                 BIGINT,                 -- assistant reply (messages.id, set after processing)
     chat_id                  TEXT NOT NULL,
+    orchestrator_model       TEXT NOT NULL DEFAULT '',
+    synthesizer_model        TEXT NOT NULL DEFAULT '',
     iterations               INT NOT NULL DEFAULT 0, -- orchestrator loop count
     summary                  TEXT,                    -- finish_task summary
     total_prompt_tokens      INT NOT NULL DEFAULT 0,

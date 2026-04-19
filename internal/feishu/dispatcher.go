@@ -28,10 +28,12 @@ type QueuedMessage struct {
 // When a message is popped, the Dispatcher opens the thinking card
 // immediately, then blocks on ReadyCh until the content is ready.
 type Dispatcher struct {
-	store   store.QueueStore
-	agent   *agent.Agent
-	adapter *Adapter
-	client  *Client
+	store             store.QueueStore
+	agent             *agent.Agent
+	adapter           *Adapter
+	client            *Client
+	orchestratorModel string // for trace logging
+	synthesizerModel  string // for trace logging
 
 	// Per-chat message channels. Created lazily on first push.
 	// Value type: chan QueuedMessage
@@ -40,12 +42,14 @@ type Dispatcher struct {
 	wg sync.WaitGroup
 }
 
-func NewDispatcher(st store.QueueStore, ag *agent.Agent, adapter *Adapter, client *Client) *Dispatcher {
+func NewDispatcher(st store.QueueStore, ag *agent.Agent, adapter *Adapter, client *Client, orchestratorModel, synthesizerModel string) *Dispatcher {
 	return &Dispatcher{
-		store:   st,
-		agent:   ag,
-		adapter: adapter,
-		client:  client,
+		store:             st,
+		agent:             ag,
+		adapter:           adapter,
+		client:            client,
+		orchestratorModel: orchestratorModel,
+		synthesizerModel:  synthesizerModel,
 	}
 }
 
@@ -236,7 +240,12 @@ func (d *Dispatcher) processAndTrace(ctx context.Context, chatID string, msg *st
 	start := time.Now()
 
 	// Create trace record.
-	trace := &store.Trace{MessageID: msg.ID, ChatID: chatID}
+	trace := &store.Trace{
+		MessageID:         msg.ID,
+		ChatID:            chatID,
+		OrchestratorModel: d.orchestratorModel,
+		SynthesizerModel:  d.synthesizerModel,
+	}
 	if ts, ok := d.store.(store.TraceStore); ok {
 		if err := ts.CreateTrace(ctx, trace); err != nil {
 			slog.Warn("dispatcher: create trace", "err", err)

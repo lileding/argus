@@ -97,6 +97,8 @@ type Trace struct {
 	MessageID              int64
 	ReplyID                int64
 	ChatID                 string
+	OrchestratorModel      string
+	SynthesizerModel       string
 	Iterations             int
 	Summary                string
 	TotalPromptTokens      int

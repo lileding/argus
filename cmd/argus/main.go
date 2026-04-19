@@ -239,7 +239,7 @@ func runServer(cfg *config.Config) {
 	}
 
 	// Dispatcher: per-chat serial agent processing (channel-per-chat).
-	dispatcher := feishu.NewDispatcher(qs, ag, adapter, feishuClient)
+	dispatcher := feishu.NewDispatcher(qs, ag, adapter, feishuClient, cfg.Model.Orchestrator.ModelName, cfg.Model.Synthesizer.ModelName)
 	defer dispatcher.Stop()
 
 	// Handler: inbound (store + push + spawn media goroutine).
