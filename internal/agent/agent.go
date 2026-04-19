@@ -19,7 +19,8 @@ import (
 const maxToolResultBytes = 16 * 1024
 
 type Agent struct {
-	model         model.Client
+	orchestrator  model.Client // Phase 1: tool calling
+	synthesizer   model.Client // Phase 2: answer generation
 	store         store.Store
 	toolRegistry  *tool.Registry
 	skillIndex    *skill.SkillIndex
@@ -29,12 +30,13 @@ type Agent struct {
 	maxIterations int
 }
 
-func New(modelClient model.Client, st store.Store, toolReg *tool.Registry, skillIdx *skill.SkillIndex, embedder *embedding.Client, workspaceDir string, contextWindow, maxIterations int) *Agent {
+func New(orchestrator, synthesizer model.Client, st store.Store, toolReg *tool.Registry, skillIdx *skill.SkillIndex, embedder *embedding.Client, workspaceDir string, contextWindow, maxIterations int) *Agent {
 	if maxIterations == 0 {
 		maxIterations = 10
 	}
 	return &Agent{
-		model:         modelClient,
+		orchestrator:  orchestrator,
+		synthesizer:   synthesizer,
 		store:         st,
 		toolRegistry:  toolReg,
 		skillIndex:    skillIdx,
@@ -231,7 +233,7 @@ func (a *Agent) runOrchestrator(
 	for i := 0; i < a.maxIterations; i++ {
 		slog.Info("orchestrator iteration", "iteration", i, "messages", len(messages), "tools", len(toolDefs))
 
-		resp, err := a.model.ChatWithEarlyAbort(ctx, messages, toolDefs, 80)
+		resp, err := a.orchestrator.ChatWithEarlyAbort(ctx, messages, toolDefs, 80)
 		if err != nil {
 			slog.Error("orchestrator chat failed", "err", err)
 			summary = fmt.Sprintf("Orchestrator error: %v", err)
@@ -256,7 +258,7 @@ func (a *Agent) runOrchestrator(
 				model.Message{Role: model.RoleAssistant, Content: resp.Content},
 				model.Message{Role: model.RoleUser, Content: "You MUST call a tool. Text output is ignored. Call search, fetch, read_file, or finish_task now."},
 			)
-			resp, err = a.model.ChatWithEarlyAbort(ctx, messages, toolDefs, 80)
+			resp, err = a.orchestrator.ChatWithEarlyAbort(ctx, messages, toolDefs, 80)
 			if err != nil {
 				summary = fmt.Sprintf("Orchestrator retry error: %v", err)
 				return
@@ -448,11 +450,11 @@ func (a *Agent) runSynthesizer(
 
 	slog.Info("synthesizer call", "materials_len", materials.Len(), "history_len", len(history))
 
-	stream, err := a.model.ChatStream(ctx, messages, nil) // no tools
+	stream, err := a.synthesizer.ChatStream(ctx, messages, nil) // no tools
 	if err != nil {
 		slog.Error("synthesizer stream start failed", "err", err)
 		// Fallback to non-streaming.
-		resp, fallbackErr := a.model.Chat(ctx, messages, nil)
+		resp, fallbackErr := a.synthesizer.Chat(ctx, messages, nil)
 		if fallbackErr != nil {
 			return fmt.Sprintf("Error generating response: %v", fallbackErr), 0, 0
 		}

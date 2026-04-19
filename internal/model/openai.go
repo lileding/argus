@@ -25,6 +25,7 @@ type OpenAIClient struct {
 	client             *http.Client
 }
 
+// NewOpenAIClient creates a client from legacy ModelConfig (backward compat).
 func NewOpenAIClient(cfg config.ModelConfig) *OpenAIClient {
 	return &OpenAIClient{
 		baseURL:            cfg.BaseURL,
@@ -34,6 +35,18 @@ func NewOpenAIClient(cfg config.ModelConfig) *OpenAIClient {
 		maxTokens:          cfg.MaxTokens,
 		maxReplyTokens:     cfg.MaxReplyTokens,
 		client:             &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// NewOpenAIClientFromUpstream creates a client from upstream + role config.
+func NewOpenAIClientFromUpstream(up config.UpstreamConfig, role config.RoleConfig) *OpenAIClient {
+	return &OpenAIClient{
+		baseURL:        up.BaseURL,
+		apiKey:         up.APIKey,
+		modelName:      role.ModelName,
+		maxTokens:      role.MaxTokens,
+		maxReplyTokens: role.MaxTokens, // same for non-synthesizer; factory sets correct value
+		client:         &http.Client{Timeout: up.Timeout},
 	}
 }
 

@@ -57,12 +57,39 @@ type FeishuConfig struct {
 	EncryptKey        string `yaml:"encrypt_key"`
 }
 
+// UpstreamConfig defines a model provider backend.
+type UpstreamConfig struct {
+	Type     string        `yaml:"type"`      // "openai" or "vertex_ai"
+	BaseURL  string        `yaml:"base_url"`  // openai only
+	APIKey   string        `yaml:"api_key"`   // openai / anthropic direct
+	Project  string        `yaml:"project"`   // vertex_ai only
+	Location string        `yaml:"location"`  // vertex_ai only
+	Timeout  time.Duration `yaml:"timeout"`
+}
+
+// RoleConfig selects an upstream + model for a specific agent role.
+type RoleConfig struct {
+	Upstream  string `yaml:"upstream"`   // key into Upstreams map
+	ModelName string `yaml:"model_name"`
+	MaxTokens int    `yaml:"max_tokens"`
+}
+
+// ModelConfig holds the multi-backend model configuration.
+// Supports both legacy (flat) and new (upstreams + roles) format.
 type ModelConfig struct {
+	// New: upstream map + per-role config
+	Upstreams    map[string]UpstreamConfig `yaml:"upstreams"`
+	Orchestrator RoleConfig                `yaml:"orchestrator"`
+	Synthesizer  RoleConfig                `yaml:"synthesizer"`
+	Fallback     RoleConfig                `yaml:"fallback"`
+	Transcription RoleConfig               `yaml:"transcription"`
+
+	// Legacy fields (still supported for backward compatibility)
 	BaseURL            string        `yaml:"base_url"`
 	ModelName          string        `yaml:"model_name"`
 	APIKey             string        `yaml:"api_key"`
-	MaxTokens          int           `yaml:"max_tokens"`       // Phase 1 (orchestrator) token limit
-	MaxReplyTokens     int           `yaml:"max_reply_tokens"` // Phase 2 (synthesizer) token limit
+	MaxTokens          int           `yaml:"max_tokens"`
+	MaxReplyTokens     int           `yaml:"max_reply_tokens"`
 	Timeout            time.Duration `yaml:"timeout"`
 	TranscriptionModel string        `yaml:"transcription_model"`
 }
@@ -109,20 +136,69 @@ func (c *Config) applyDefaults() {
 	if c.Server.Port == "" {
 		c.Server.Port = "8080"
 	}
-	if c.Model.BaseURL == "" {
-		c.Model.BaseURL = "http://localhost:11434/v1"
+	// Legacy config migration: if no upstreams defined but legacy fields exist,
+	// create a "default" upstream from the legacy fields.
+	if len(c.Model.Upstreams) == 0 {
+		baseURL := c.Model.BaseURL
+		if baseURL == "" {
+			baseURL = "http://localhost:11434/v1"
+		}
+		timeout := c.Model.Timeout
+		if timeout == 0 {
+			timeout = 120 * time.Second
+		}
+		c.Model.Upstreams = map[string]UpstreamConfig{
+			"default": {
+				Type:    "openai",
+				BaseURL: baseURL,
+				APIKey:  c.Model.APIKey,
+				Timeout: timeout,
+			},
+		}
+		modelName := c.Model.ModelName
+		if modelName == "" {
+			modelName = "gemma3:27b"
+		}
+		maxTokens := c.Model.MaxTokens
+		if maxTokens == 0 {
+			maxTokens = 4096
+		}
+		maxReplyTokens := c.Model.MaxReplyTokens
+		if maxReplyTokens == 0 {
+			maxReplyTokens = 16384
+		}
+		if c.Model.Orchestrator.Upstream == "" {
+			c.Model.Orchestrator = RoleConfig{Upstream: "default", ModelName: modelName, MaxTokens: maxTokens}
+		}
+		if c.Model.Synthesizer.Upstream == "" {
+			c.Model.Synthesizer = RoleConfig{Upstream: "default", ModelName: modelName, MaxTokens: maxReplyTokens}
+		}
+		if c.Model.Fallback.Upstream == "" {
+			c.Model.Fallback = RoleConfig{Upstream: "default", ModelName: modelName, MaxTokens: maxTokens}
+		}
+		if c.Model.Transcription.Upstream == "" {
+			transModel := c.Model.TranscriptionModel
+			if transModel == "" {
+				transModel = modelName
+			}
+			c.Model.Transcription = RoleConfig{Upstream: "default", ModelName: transModel}
+		}
 	}
-	if c.Model.ModelName == "" {
-		c.Model.ModelName = "gemma3:27b"
+	// Apply defaults for new-style config missing individual role fields.
+	for name, up := range c.Model.Upstreams {
+		if up.Timeout == 0 {
+			up.Timeout = 120 * time.Second
+			c.Model.Upstreams[name] = up
+		}
 	}
-	if c.Model.MaxTokens == 0 {
-		c.Model.MaxTokens = 4096
+	if c.Model.Orchestrator.MaxTokens == 0 {
+		c.Model.Orchestrator.MaxTokens = 4096
 	}
-	if c.Model.MaxReplyTokens == 0 {
-		c.Model.MaxReplyTokens = 16384
+	if c.Model.Synthesizer.MaxTokens == 0 {
+		c.Model.Synthesizer.MaxTokens = 16384
 	}
-	if c.Model.Timeout == 0 {
-		c.Model.Timeout = 120 * time.Second
+	if c.Model.Fallback.MaxTokens == 0 {
+		c.Model.Fallback.MaxTokens = 4096
 	}
 	if c.Agent.MaxIterations == 0 {
 		c.Agent.MaxIterations = 10

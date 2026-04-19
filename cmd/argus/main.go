@@ -129,11 +129,12 @@ func runCLI(cfg *config.Config) {
 	loader := setupSkills(cfg)
 	defer loader.Stop()
 
+	// CLI mode: use legacy single-client (all roles use same model).
 	modelClient := model.NewOpenAIClient(cfg.Model)
 	memStore := store.NewMemoryStore()
 	sb := buildSandbox(cfg)
 	toolReg := buildToolRegistry(cfg, sb, loader, nil, memStore)
-	ag := agent.New(modelClient, memStore, toolReg, loader.Index(), nil, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
+	ag := agent.New(modelClient, modelClient, memStore, toolReg, loader.Index(), nil, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
 
 	chatID := "cli:local"
 	ctx := context.Background()
@@ -213,12 +214,22 @@ func runServer(cfg *config.Config) {
 		defer db.Close()
 	}
 
-	modelClient := model.NewOpenAIClient(cfg.Model)
+	// Build model clients for each role (orchestrator, synthesizer, fallback, transcription).
+	orchClient, synthClient, fbClient, transClient, err := model.NewClientsForAgent(ctx, cfg.Model)
+	if err != nil {
+		slog.Error("create model clients", "err", err)
+		os.Exit(1)
+	}
+	// Wrap orchestrator and synthesizer with fallback.
+	orchWithFallback := model.NewFallbackClient(orchClient, fbClient)
+	synthWithFallback := model.NewFallbackClient(synthClient, fbClient)
 
 	// Embedding client (shared by worker and agent for query embedding).
+	// Use the fallback upstream's config for embedding (typically local).
 	var embedClient *embedding.Client
 	if cfg.Embedding.Enabled {
-		embedClient = embedding.NewClient(cfg.Model.BaseURL, cfg.Model.APIKey, cfg.Embedding.ModelName)
+		fallbackUp := cfg.Model.Upstreams[cfg.Model.Fallback.Upstream]
+		embedClient = embedding.NewClient(fallbackUp.BaseURL, fallbackUp.APIKey, cfg.Embedding.ModelName)
 
 		// Start background embedding worker if store supports it.
 		if ss, ok := st.(store.SemanticStore); ok {
@@ -240,7 +251,7 @@ func runServer(cfg *config.Config) {
 
 	sb := buildSandbox(cfg)
 	toolReg := buildToolRegistry(cfg, sb, loader, db, st)
-	ag := agent.New(modelClient, st, toolReg, loader.Index(), embedClient, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
+	ag := agent.New(orchWithFallback, synthWithFallback, st, toolReg, loader.Index(), embedClient, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
 
 	feishuClient := feishu.NewClient(cfg.Feishu)
 	processor := render.NewProcessor(feishuClient)
@@ -270,7 +281,7 @@ func runServer(cfg *config.Config) {
 	defer dispatcher.Stop()
 
 	// Handler: inbound (store + push + spawn media goroutine).
-	handler := feishu.NewHandler(feishuClient, cfg.Feishu, cfg.Agent.WorkspaceDir, qs, dispatcher, modelClient, modelClient, docReg)
+	handler := feishu.NewHandler(feishuClient, cfg.Feishu, cfg.Agent.WorkspaceDir, qs, dispatcher, transClient, transClient, docReg)
 
 	// Crash recovery: re-queue interrupted messages.
 	dispatcher.Recover(ctx, func(msg *store.StoredMessage, readyCh chan struct{}) {
