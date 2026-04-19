@@ -60,6 +60,13 @@ type anthropicContentBlock struct {
 	ToolUseID    string                 `json:"tool_use_id,omitempty"`
 	Content      string                 `json:"content,omitempty"`
 	CacheControl map[string]string      `json:"cache_control,omitempty"`
+	Source       *anthropicImageSource  `json:"source,omitempty"` // for type="image"
+}
+
+type anthropicImageSource struct {
+	Type      string `json:"type"`       // "base64"
+	MediaType string `json:"media_type"` // "image/png"
+	Data      string `json:"data"`       // base64 data (no prefix)
 }
 
 type anthropicTool struct {
@@ -297,10 +304,17 @@ func (c *AnthropicClient) buildRequest(messages []Message, tools []ToolDef, stre
 			}}
 
 		case RoleUser:
-			req.Messages = append(req.Messages, anthropicMsg{
-				Role:    "user",
-				Content: msg.TextContent(),
+			if parts, ok := msg.Content.([]ContentPart); ok && hasImages(parts) {
+				req.Messages = append(req.Messages, anthropicMsg{
+					Role:    "user",
+					Content: convertToAnthropicParts(parts),
+				})
+			} else {
+				req.Messages = append(req.Messages, anthropicMsg{
+					Role:    "user",
+					Content: msg.TextContent(),
 			})
+			}
 
 		case RoleAssistant:
 			if len(msg.ToolCalls) > 0 {
@@ -494,4 +508,50 @@ func (c *AnthropicClient) consumeStream(body io.Reader, ch chan<- StreamChunk, e
 			return
 		}
 	}
+}
+
+// hasImages checks if any ContentPart contains an image.
+func hasImages(parts []ContentPart) bool {
+	for _, p := range parts {
+		if p.Type == "image_url" && p.ImageURL != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// convertToAnthropicParts converts ContentPart array to Anthropic content blocks.
+func convertToAnthropicParts(parts []ContentPart) []anthropicContentBlock {
+	var blocks []anthropicContentBlock
+	for _, p := range parts {
+		if p.Type == "text" && p.Text != "" {
+			blocks = append(blocks, anthropicContentBlock{Type: "text", Text: p.Text})
+		} else if p.Type == "image_url" && p.ImageURL != nil {
+			mime, data := parseDataURL(p.ImageURL.URL)
+			if data != "" {
+				blocks = append(blocks, anthropicContentBlock{
+					Type: "image",
+					Source: &anthropicImageSource{
+						Type:      "base64",
+						MediaType: mime,
+						Data:      data,
+					},
+				})
+			}
+		}
+	}
+	return blocks
+}
+
+// parseDataURL extracts MIME type and base64 data from "data:image/png;base64,xxxxx".
+func parseDataURL(url string) (mime, data string) {
+	if !strings.HasPrefix(url, "data:") {
+		return "", ""
+	}
+	parts := strings.SplitN(url[5:], ",", 2)
+	if len(parts) != 2 {
+		return "", ""
+	}
+	meta := strings.TrimSuffix(parts[0], ";base64")
+	return meta, parts[1]
 }

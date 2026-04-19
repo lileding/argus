@@ -2,9 +2,13 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +19,32 @@ import (
 	"argus/internal/store"
 	"argus/internal/tool"
 )
+
+// buildUserMessage creates a text or multimodal message from stored content.
+// If filePaths contains image files, they are loaded from disk and encoded
+// as base64 data URLs for vision-capable models.
+func buildUserMessage(text string, filePaths []string, workspaceDir string) model.Message {
+	var dataURLs []string
+	for _, p := range filePaths {
+		ext := strings.ToLower(filepath.Ext(p))
+		if !imageExts[ext] {
+			continue
+		}
+		absPath := filepath.Join(workspaceDir, p)
+		data, err := os.ReadFile(absPath)
+		if err != nil {
+			slog.Debug("skip image file", "path", p, "err", err)
+			continue
+		}
+		contentType := http.DetectContentType(data)
+		dataURLs = append(dataURLs, fmt.Sprintf("data:%s;base64,%s",
+			contentType, base64.StdEncoding.EncodeToString(data)))
+	}
+	if len(dataURLs) > 0 {
+		return model.NewMultimodalMessage(model.RoleUser, text, dataURLs...)
+	}
+	return model.NewTextMessage(model.RoleUser, text)
+}
 
 const maxToolResultBytes = 16 * 1024
 
@@ -143,7 +173,7 @@ func (a *Agent) HandleStream(ctx context.Context, chatID string, userMsg model.M
 // HandleStreamQueued is the dispatcher entry point for pre-saved messages.
 // Unlike HandleStream, it does NOT save the user message (already in the DB)
 // and reconstructs the model.Message from the stored text content.
-func (a *Agent) HandleStreamQueued(ctx context.Context, chatID string, savedMsgID int64, userText string) <-chan Event {
+func (a *Agent) HandleStreamQueued(ctx context.Context, chatID string, savedMsgID int64, userText string, filePaths []string) <-chan Event {
 	ch := make(chan Event, 16)
 
 	go func() {
@@ -151,8 +181,8 @@ func (a *Agent) HandleStreamQueued(ctx context.Context, chatID string, savedMsgI
 
 		ctx = tool.WithChatID(ctx, chatID)
 
-		// Reconstruct a simple text message from the stored content.
-		userMsg := model.NewTextMessage(model.RoleUser, userText)
+		// Reconstruct message — multimodal if images are present.
+		userMsg := buildUserMessage(userText, filePaths, a.workspaceDir)
 
 		// Phase 1: Orchestration — smaller context window.
 		orchHistory, err := a.loadHistory(ctx, chatID, savedMsgID, a.orchestratorContextWindow)

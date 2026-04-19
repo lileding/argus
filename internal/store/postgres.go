@@ -513,6 +513,11 @@ func (s *PostgresStore) SetReplyStatus(ctx context.Context, msgID int64, status 
 	return err
 }
 
+func (s *PostgresStore) UpdateMessageFilePaths(ctx context.Context, msgID int64, paths []string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE messages SET file_paths = $1 WHERE id = $2`, pq.Array(paths), msgID)
+	return err
+}
+
 func (s *PostgresStore) AckReply(ctx context.Context, msgID int64, replyChannelID string) error {
 	// Only stores the reply channel ID. Does NOT change reply_status —
 	// the caller is responsible for status transitions. Previously this

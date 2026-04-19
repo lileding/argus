@@ -2,12 +2,8 @@ package agent
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
-	"log/slog"
-	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -147,31 +143,14 @@ func (a *Agent) buildSynthesizerPrompt() string {
 
 var imageExts = map[string]bool{".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true}
 
-// curateHistory filters message history and re-injects images from .files/.
+// curateHistory filters message history and re-injects images from stored FilePaths.
 func (a *Agent) curateHistory(messages []store.StoredMessage) []model.Message {
-	imageFiles := a.scanImageFiles()
-
 	var curated []model.Message
 	for _, m := range messages {
 		switch m.Role {
 		case "user":
-			var dataURLs []string
-			for name, absPath := range imageFiles {
-				if strings.Contains(m.Content, name) {
-					data, err := os.ReadFile(absPath)
-					if err != nil {
-						continue
-					}
-					contentType := http.DetectContentType(data)
-					dataURL := fmt.Sprintf("data:%s;base64,%s", contentType, base64.StdEncoding.EncodeToString(data))
-					dataURLs = append(dataURLs, dataURL)
-				}
-			}
-			if len(dataURLs) > 0 {
-				curated = append(curated, model.NewMultimodalMessage(model.RoleUser, m.Content, dataURLs...))
-			} else {
-				curated = append(curated, model.Message{Role: model.RoleUser, Content: m.Content})
-			}
+			msg := buildUserMessage(m.Content, m.FilePaths, a.workspaceDir)
+			curated = append(curated, msg)
 		case "assistant":
 			if m.Content != "" && m.ToolCallID == nil {
 				curated = append(curated, model.Message{Role: model.RoleAssistant, Content: m.Content})
@@ -181,23 +160,4 @@ func (a *Agent) curateHistory(messages []store.StoredMessage) []model.Message {
 	return curated
 }
 
-func (a *Agent) scanImageFiles() map[string]string {
-	filesDir := filepath.Join(a.workspaceDir, ".files")
-	entries, err := os.ReadDir(filesDir)
-	if err != nil {
-		return nil
-	}
-	result := make(map[string]string)
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		ext := strings.ToLower(filepath.Ext(e.Name()))
-		if imageExts[ext] {
-			result[e.Name()] = filepath.Join(filesDir, e.Name())
-		}
-	}
-	return result
-}
-
-var _ = slog.Default // silence unused import if slog drops out
+// imageExts and buildUserMessage are defined in agent.go

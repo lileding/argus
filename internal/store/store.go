@@ -70,6 +70,8 @@ type QueueStore interface {
 	UpdateMessageContent(ctx context.Context, msgID int64, content string) error
 	// SetReplyStatus transitions a message to a new pipeline status.
 	SetReplyStatus(ctx context.Context, msgID int64, status string) error
+	// UpdateMessageFilePaths sets the file_paths array for a message.
+	UpdateMessageFilePaths(ctx context.Context, msgID int64, paths []string) error
 	// AckReply transitions to 'ready' and records the IM-abstract reply channel ID.
 	AckReply(ctx context.Context, msgID int64, replyChannelID string) error
 	// ClaimNextReply atomically picks the oldest 'ready' message for chatID

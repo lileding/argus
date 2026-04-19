@@ -168,47 +168,53 @@ func (h *Handler) ProcessMedia(msg *store.StoredMessage, readyCh chan struct{}) 
 	defer close(readyCh)
 	ctx := context.Background()
 
-	processedText, err := h.buildProcessedContent(ctx, msg)
+	processedText, filePaths, err := h.buildProcessedContent(ctx, msg)
 	if err != nil {
 		slog.Warn("processMedia: build content failed", "msg_id", msg.ID, "err", err)
 		processedText = fmt.Sprintf("[Message processing failed: %v]", err)
 	}
 
-	// Update content + status in DB.
+	// Update content + file_paths + status in DB.
 	if err := h.store.UpdateMessageContent(ctx, msg.ID, processedText); err != nil {
 		slog.Error("processMedia: update content", "msg_id", msg.ID, "err", err)
+	}
+	if len(filePaths) > 0 {
+		if err := h.store.UpdateMessageFilePaths(ctx, msg.ID, filePaths); err != nil {
+			slog.Error("processMedia: update file_paths", "msg_id", msg.ID, "err", err)
+		}
 	}
 	if err := h.store.SetReplyStatus(ctx, msg.ID, "ready"); err != nil {
 		slog.Error("processMedia: set ready", "msg_id", msg.ID, "err", err)
 	}
 
-	slog.Info("processMedia: ready", "msg_id", msg.ID, "msg_type", msg.MsgType)
+	slog.Info("processMedia: ready", "msg_id", msg.ID, "msg_type", msg.MsgType, "files", len(filePaths))
 }
 
-// buildProcessedContent converts raw Feishu content JSON into agent-ready text.
-func (h *Handler) buildProcessedContent(ctx context.Context, msg *store.StoredMessage) (string, error) {
+// buildProcessedContent converts raw Feishu content JSON into agent-ready text
+// and returns any image file paths for multimodal message construction.
+func (h *Handler) buildProcessedContent(ctx context.Context, msg *store.StoredMessage) (string, []string, error) {
 	raw := msg.Content
 
 	switch msg.MsgType {
 	case "text":
 		var c TextContent
 		if err := json.Unmarshal([]byte(raw), &c); err != nil {
-			return raw, nil
+			return raw, nil, nil
 		}
-		return c.Text, nil
+		return c.Text, nil, nil
 
 	case "image":
 		var c struct {
 			ImageKey string `json:"image_key"`
 		}
 		if err := json.Unmarshal([]byte(raw), &c); err != nil {
-			return "[User sent an image]", nil
+			return "[User sent an image]", nil, nil
 		}
 		filePath, err := h.downloadMedia(msg.TriggerMsgID, c.ImageKey, "image", ".png")
 		if err != nil {
-			return "[User sent an image that could not be downloaded]", nil
+			return "[User sent an image that could not be downloaded]", nil, nil
 		}
-		return fmt.Sprintf("The user sent an image (saved at %s).", filePath), nil
+		return "The user sent an image.", []string{filePath}, nil
 
 	case "audio":
 		var c struct {
@@ -216,29 +222,27 @@ func (h *Handler) buildProcessedContent(ctx context.Context, msg *store.StoredMe
 			Duration int    `json:"duration"`
 		}
 		if err := json.Unmarshal([]byte(raw), &c); err != nil {
-			return "[User sent a voice message]", nil
+			return "[User sent a voice message]", nil, nil
 		}
 		filePath, err := h.downloadMedia(msg.TriggerMsgID, c.FileKey, "file", ".opus")
 		if err != nil {
-			return "[Voice message could not be downloaded]", nil
+			return "[Voice message could not be downloaded]", nil, nil
 		}
 		slog.Info("media saved", "type", "audio", "path", filePath, "duration_ms", c.Duration)
 
 		absPath := filepath.Join(h.workspaceDir, filePath)
 		audioData, err := os.ReadFile(absPath)
 		if err != nil {
-			return fmt.Sprintf("[Voice message saved at %s but could not be read]", filePath), nil
+			return fmt.Sprintf("[Voice message saved at %s but could not be read]", filePath), nil, nil
 		}
 
 		result, err := h.transcriber.Transcribe(ctx, audioData, filepath.Base(absPath))
 		if err != nil {
-			return fmt.Sprintf("[Voice message, %ds, transcription failed: %v]", c.Duration/1000, err), nil
+			return fmt.Sprintf("[Voice message, %ds, transcription failed: %v]", c.Duration/1000, err), nil, nil
 		}
 		transcript := result.Text
 		slog.Info("audio transcribed", "text", transcript, "confidence", result.Confidence)
 
-		// Whisper confidence is avg_logprob: -0.0 (perfect) to -1.0+ (poor).
-		// Skip LLM correction when confidence is high — saves ~5-10s per message.
 		if h.corrector != nil && result.Confidence < -0.15 {
 			if corrected := h.correctTranscription(ctx, transcript); corrected != "" {
 				slog.Info("transcription corrected", "original", transcript, "corrected", corrected)
@@ -248,12 +252,12 @@ func (h *Handler) buildProcessedContent(ctx context.Context, msg *store.StoredMe
 			slog.Info("transcription confident, skipping LLM correction",
 				"confidence", result.Confidence)
 		}
-		return fmt.Sprintf("[Voice message, %ds, saved at %s]\n%s", c.Duration/1000, filePath, transcript), nil
+		return fmt.Sprintf("[Voice message, %ds, saved at %s]\n%s", c.Duration/1000, filePath, transcript), nil, nil
 
 	case "post":
 		var rawMsg json.RawMessage
 		if err := json.Unmarshal([]byte(raw), &rawMsg); err != nil {
-			return raw, nil
+			return raw, nil, nil
 		}
 		text, imageKeys := extractPostContent(rawMsg)
 		var savedPaths []string
@@ -265,10 +269,7 @@ func (h *Handler) buildProcessedContent(ctx context.Context, msg *store.StoredMe
 		if text == "" {
 			text = "The user sent images."
 		}
-		if len(savedPaths) > 0 {
-			text += fmt.Sprintf(" (images saved at: %s)", strings.Join(savedPaths, ", "))
-		}
-		return text, nil
+		return text, savedPaths, nil
 
 	case "file":
 		var c struct {
@@ -276,7 +277,7 @@ func (h *Handler) buildProcessedContent(ctx context.Context, msg *store.StoredMe
 			FileName string `json:"file_name"`
 		}
 		if err := json.Unmarshal([]byte(raw), &c); err != nil {
-			return "[User sent a file]", nil
+			return "[User sent a file]", nil, nil
 		}
 		ext := filepath.Ext(c.FileName)
 		if ext == "" {
@@ -284,7 +285,7 @@ func (h *Handler) buildProcessedContent(ctx context.Context, msg *store.StoredMe
 		}
 		filePath, err := h.downloadMedia(msg.TriggerMsgID, c.FileKey, "file", ext)
 		if err != nil {
-			return fmt.Sprintf("[File '%s' could not be downloaded]", c.FileName), nil
+			return fmt.Sprintf("[File '%s' could not be downloaded]", c.FileName), nil, nil
 		}
 		absPath := filepath.Join(h.workspaceDir, filePath)
 		if h.docStore != nil {
@@ -293,10 +294,10 @@ func (h *Handler) buildProcessedContent(ctx context.Context, msg *store.StoredMe
 			})
 		}
 		return fmt.Sprintf("The user sent a file '%s' (saved at %s, absolute path: %s).",
-			c.FileName, filePath, absPath), nil
+			c.FileName, filePath, absPath), nil, nil
 
 	default:
-		return raw, nil
+		return raw, nil, nil
 	}
 }
 

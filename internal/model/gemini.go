@@ -48,8 +48,14 @@ type geminiContent struct {
 
 type geminiPart struct {
 	Text             string                `json:"text,omitempty"`
+	InlineData       *geminiBlob           `json:"inlineData,omitempty"`
 	FunctionCall     *geminiFunctionCall   `json:"functionCall,omitempty"`
 	FunctionResponse *geminiFunctionResp   `json:"functionResponse,omitempty"`
+}
+
+type geminiBlob struct {
+	MimeType string `json:"mimeType"`
+	Data     string `json:"data"` // base64 encoded
 }
 
 type geminiFunctionCall struct {
@@ -344,14 +350,31 @@ func (c *GeminiClient) buildRequest(messages []Message, tools []ToolDef) geminiR
 			}
 
 		case RoleUser:
-			text := msg.TextContent()
-			if text == "" {
-				text = " "
+			if parts, ok := msg.Content.([]ContentPart); ok && hasImages(parts) {
+				var gParts []*geminiPart
+				for _, p := range parts {
+					if p.Type == "text" && p.Text != "" {
+						gParts = append(gParts, &geminiPart{Text: p.Text})
+					} else if p.Type == "image_url" && p.ImageURL != nil {
+						mime, data := parseDataURL(p.ImageURL.URL)
+						if data != "" {
+							gParts = append(gParts, &geminiPart{
+								InlineData: &geminiBlob{MimeType: mime, Data: data},
+							})
+						}
+					}
+				}
+				req.Contents = append(req.Contents, &geminiContent{Role: "user", Parts: gParts})
+			} else {
+				text := msg.TextContent()
+				if text == "" {
+					text = " "
+				}
+				req.Contents = append(req.Contents, &geminiContent{
+					Role:  "user",
+					Parts: []*geminiPart{{Text: text}},
+				})
 			}
-			req.Contents = append(req.Contents, &geminiContent{
-				Role:  "user",
-				Parts: []*geminiPart{{Text: text}},
-			})
 
 		case RoleAssistant:
 			var parts []*geminiPart

@@ -253,7 +253,7 @@ func (d *Dispatcher) processAndTrace(ctx context.Context, chatID string, msg *st
 	}
 
 	// Run agent and tee events: adapter gets UI events, we collect trace data.
-	agentCh := d.agent.HandleStreamQueued(ctx, chatID, msg.ID, msg.Content)
+	agentCh := d.agent.HandleStreamQueued(ctx, chatID, msg.ID, msg.Content, msg.FilePaths)
 	adapterCh := make(chan agent.Event, 16)
 
 	var toolCalls []store.ToolCallRecord

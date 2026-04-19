@@ -76,6 +76,18 @@ func (s *MemoryStore) UpdateMessageContent(_ context.Context, msgID int64, conte
 	return nil
 }
 
+func (s *MemoryStore) UpdateMessageFilePaths(_ context.Context, msgID int64, paths []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.messages {
+		if s.messages[i].ID == msgID {
+			s.messages[i].FilePaths = paths
+			return nil
+		}
+	}
+	return nil
+}
+
 func (s *MemoryStore) SetReplyStatus(_ context.Context, msgID int64, status string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
