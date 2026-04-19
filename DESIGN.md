@@ -142,8 +142,8 @@ Argus handles all Feishu message types natively:
 | Message Type | Processing |
 |-------------|-----------|
 | **text** | Handler stores raw JSON → `ProcessMedia` extracts text (instant) |
-| **image** | Handler stores raw JSON → `ProcessMedia` downloads to `.files/` |
-| **post** (rich text) | Handler stores raw JSON → `ProcessMedia` extracts text + downloads images |
+| **image** | Handler stores raw JSON → `ProcessMedia` downloads to `.files/` + saves `file_paths` to DB |
+| **post** (rich text) | Handler stores raw JSON → `ProcessMedia` extracts text + downloads images + saves `file_paths` to DB |
 | **audio** | Handler stores raw JSON → `ProcessMedia` downloads `.opus` → Whisper → LLM correction |
 | **file** (PDF, docx, etc.) | Handler stores raw JSON → `ProcessMedia` downloads to `.files/` → registers for RAG |
 
@@ -153,9 +153,27 @@ channel push + goroutine spawn. The Dispatcher opens the thinking card
 immediately on pop, then blocks on the goroutine's `ReadyCh` until
 content is ready.
 
-### Multi-Turn Vision
+### Vision (Multimodal Image Understanding)
 
-Images are saved to `workspace/.files/`. When building history context, messages referencing saved images are re-loaded from disk as multimodal content, so the model can see and discuss previously sent images across conversation turns.
+Images flow end-to-end to vision-capable models (GPT-5.4, Gemini, Claude):
+
+```
+Feishu image/post → download to .files/ → file_paths saved to DB
+    → HandleStreamQueued loads from disk → base64 data URL
+    → NewMultimodalMessage(text, dataURLs...)
+    → OpenAI: ContentPart array (native)
+    → Anthropic: {type:"image", source:{type:"base64",...}}
+    → Gemini: {inlineData:{mimeType, data}}
+```
+
+**Context budget**: only the most recent image-bearing message in
+history gets real image data injected (~130KB base64 per image). Older
+image messages are replaced with `"[Image(s) omitted from context]"`
+text placeholder. The current user message always gets full images.
+
+**Storage**: images are NOT stored as base64 in the DB (too heavy).
+`messages.file_paths` stores the relative path to `.files/`; images
+are loaded from disk on-demand when building model context.
 
 ### Audio Pipeline
 
