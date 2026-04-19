@@ -166,6 +166,54 @@ serializes delivery so it never conflicts with an active sync reply card.
 This preserves the current chat UX while allowing background work to use
 all available worker capacity.
 
+#### Task State Machine
+
+Async tasks must be persisted before execution. The worker pool claims
+queued tasks with a lease, runs them, records the result, and emits an
+outbound event for delivery.
+
+```
+queued → running → succeeded
+                 → failed
+                 → cancelled
+```
+
+`running` tasks carry `lease_owner` and `lease_until`. On startup, tasks
+whose lease expired are moved back to `queued` unless they are already in
+a terminal state. This gives async jobs the same "store first, process
+later" recovery property as IM messages.
+
+Planned table:
+
+```sql
+CREATE TABLE tasks (
+    id                 BIGSERIAL PRIMARY KEY,
+    kind               TEXT NOT NULL, -- sync / async
+    source             TEXT NOT NULL, -- im / cron / agent
+    chat_id            TEXT NOT NULL,
+    user_id            TEXT,
+    parent_task_id     BIGINT REFERENCES tasks(id),
+    trigger_message_id BIGINT REFERENCES messages(id),
+    status             TEXT NOT NULL DEFAULT 'queued',
+    priority           INT NOT NULL DEFAULT 0,
+    title              TEXT NOT NULL DEFAULT '',
+    input              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    result             TEXT NOT NULL DEFAULT '',
+    error              TEXT NOT NULL DEFAULT '',
+    lease_owner        TEXT,
+    lease_until        TIMESTAMPTZ,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at         TIMESTAMPTZ,
+    finished_at        TIMESTAMPTZ
+);
+```
+
+`messages` remains the conversation timeline and context source. `tasks`
+is the execution ledger. A sync IM turn can still be represented by the
+existing `messages.reply_status` queue during the first migration stage,
+but new async work should use `tasks` from day one so the two concepts do
+not collapse into one overloaded table.
+
 ---
 
 ## Multimodal Input
