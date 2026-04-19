@@ -311,8 +311,9 @@ The Dispatcher tees the agent event stream — one path to the Adapter
 (UI), one path to the trace collector (DB).
 
 `traces`: one row per user-message → reply cycle. Fields: `message_id`,
-`reply_id`, `chat_id`, `iterations`, `summary`, prompt/completion tokens
-for both phases, `duration_ms`.
+`reply_id`, `chat_id`, `orchestrator_model`, `synthesizer_model`,
+`iterations`, `summary`, prompt/completion tokens for both phases,
+`duration_ms`.
 
 `tool_calls`: one row per tool invocation. Fields: `trace_id`, `iteration`,
 `seq`, `tool_name`, `arguments` (raw), `normalized_args` (parsed),
@@ -354,39 +355,75 @@ defaults to `created_at desc`.
 
 ## Model Strategy
 
-All messages are handled by a local LLM via an OpenAI-compatible endpoint (omlx, vLLM, or similar). No routing layer — the orchestrator decides implicitly through tool calling what capabilities to use.
+### Why Commercial APIs
 
-### Model Choice
+The original design used local models exclusively (Qwen 3.5 MoE on Mac
+Studio). This worked for basic queries but had fundamental limitations:
 
-| Role | Model | Notes |
-|------|-------|-------|
-| Chat | **Qwen3.5-35B-A3B 8bit (MoE)** — production | 3B active on 35B total. Hermes-style tool calling is strict — very few loop/skip bugs observed in production. |
-| Transcription | Whisper Large v3 | `/v1/audio/transcriptions` with domain-prompt vocabulary (composers, tech, finance) |
-| Embedding | modernbert-embed-base (768 dim) | Async worker batches unembedded messages/memories/chunks every 2 s |
+- **Orchestrator quality**: local models (including Qwen 3.5 35B MoE)
+  frequently misused tools — calling skill names as tool names, using
+  wrong column names in SQL, looping the same search 20+ times, or
+  ignoring tool-only instructions entirely. The harness budgets,
+  early-abort, and retry mechanisms were all built to survive these
+  failures. With commercial models (even Haiku-class), these harness
+  mechanisms rarely fire — the model follows instructions correctly
+  on the first attempt.
+- **Synthesizer quality**: local models produced shallow, repetitive
+  answers. Commercial models produce structured, insightful responses.
+- **Cost reality**: at ~50-200 queries/day for a personal assistant,
+  commercial API costs ($5-20/month) are negligible compared to the
+  electricity cost of running a Mac Studio 24/7.
 
-KV cache 4-bit quantization is recommended; unified-memory Macs are
-bandwidth-bound for decode so compressing KV cache directly buys speed.
+### Multi-Backend Architecture
 
-**Dense models are not recommended.** Tested dense chat models on the
-same hardware had two disqualifying failure modes: (1) bandwidth-bound
-decode at long context (~5 tok/s), and (2) unreliable instruction
-following under the two-phase contract (skipping tool calls, looping
-the same search 20+ times with trivial query variations, ignoring
-system-level loop-break nudges). The harness budgets in the
-Orchestrator were originally added to survive exactly this behavior;
-on MoE models with stricter tool-calling, they rarely fire.
+Argus supports multiple model providers via named **upstreams**. Each
+agent role (orchestrator, synthesizer, fallback, transcription) selects
+its own upstream and model independently.
 
-### Hardware baseline (M4 Max 128 GB)
+```yaml
+upstreams:
+  local:    {type: openai,    base_url: "http://localhost:8000/v1", api_key: "..."}
+  openai:   {type: openai,    base_url: "https://api.openai.com/v1", api_key: "..."}
+  anthropic:{type: anthropic,  api_key: "..."}
+  gemini:   {type: gemini,     api_key: "..."}
 
-| Config | Prefill | Decode (long ctx) | Notes |
-|---|---:|---:|---|
-| Qwen3.5-35B-A3B 8bit + KV 4bit | ~180 tok/s | ~30 tok/s | **current production** |
-| Qwen3.5-35B-A3B 4bit + KV 4bit | ~200 tok/s | 40+ tok/s | faster, slightly less accurate |
-| 31B dense 8bit (reference) | ~190 tok/s | 4–9 tok/s | bandwidth-bound ceiling |
+model:
+  orchestrator:  {upstream: openai,    model_name: "gpt-5.4"}
+  synthesizer:   {upstream: gemini,    model_name: "gemini-2.5-flash-lite"}
+  fallback:      {upstream: local,     model_name: "Qwen3.5-35B-A3B-8bit"}
+  transcription: {upstream: local,     model_name: "whisper-large-v3"}
+```
 
-MoE is the correct architecture for this deployment envelope: the same
-model file is ~5× faster at decode than a comparable dense model on this
-hardware.
+Four upstream types, all implemented with plain `net/http` (no SDKs):
+
+| Type | Endpoint | Auth |
+|------|----------|------|
+| `openai` | Any OpenAI-compatible API | Bearer token |
+| `anthropic` | Anthropic Messages API | `x-api-key` header |
+| `gemini` | Google Gemini REST API | API key in URL |
+
+**FallbackClient** wraps each role's primary with a fallback. On error,
+retries 429 (rate limit) up to 2× with 30s delay, then degrades to
+the fallback model. Other errors fall back immediately.
+
+### Recommended Configurations
+
+| Orchestrator | Synthesizer | Cost | Quality |
+|---|---|---|---|
+| GPT-5.4 | Gemini 2.5 Flash Lite | ~$15/mo | Excellent tool calling + fast synthesis |
+| Claude Haiku 4.5 | Gemini 2.5 Flash Lite | ~$5/mo | Good quality, best value |
+| Qwen 3.5 (local) | Qwen 3.5 (local) | $0 | Functional but needs all harness guardrails |
+
+### Local Models (Fallback + Transcription)
+
+Local models still serve two roles:
+- **Fallback**: when commercial APIs are down or rate-limited
+- **Transcription**: Whisper Large v3 via omlx (no commercial
+  equivalent needed — Whisper is excellent)
+- **Embedding**: modernbert-embed-base (768 dim) via omlx
+
+KV cache 4-bit quantization recommended for local MoE models on
+unified-memory Macs.
 
 ---
 
@@ -737,12 +774,14 @@ internal/
     event.go                 Event type definitions
     dedup.go                 Event ID deduplication
   model/
-    model.go                 Client interface: Chat + ChatStream +
-                             ChatWithEarlyAbort + Transcribe
-    openai.go                OpenAI-compatible impl (JSON + SSE + multipart);
-                             ChatWithEarlyAbort parses tool_call deltas
-                             from SSE for early text-only abort
-    types.go                 Message (multimodal), ToolCall, Response, Usage
+    model.go                 Client interface (Chat, ChatStream,
+                             ChatWithEarlyAbort, Transcribe)
+    openai.go                OpenAI-compatible (local + api.openai.com)
+    anthropic.go             Anthropic Messages API (Claude)
+    gemini.go                Google Gemini REST API
+    fallback.go              FallbackClient wrapper (retry 429 + degrade)
+    factory.go               NewClientFromConfig / NewClientsForAgent
+    types.go                 Message, ToolCall, Response, Usage
   render/
     renderer.go              Processor: markdown → LaTeX images → markers
     latex.go                 LaTeX detection + RaTeX PNG rendering
@@ -792,7 +831,7 @@ third_party/ratex/           Embedded Rust LaTeX renderer (CGo)
 |-----------|--------|
 | Language | Go |
 | IM | Feishu Bot API (text, image, audio, file, rich text, interactive cards) |
-| Chat Model | Local MoE — Qwen3.5-35B-A3B 8bit in production, via omlx / vLLM |
+| Chat Model | Multi-backend: OpenAI (GPT-5.4), Anthropic (Claude), Gemini, local MoE fallback |
 | Transcription | Whisper Large v3 via `/v1/audio/transcriptions` |
 | Embedding | modernbert-embed-base (768 dim) via `/v1/embeddings` |
 | Database | PostgreSQL + pgvector (optional, memory store fallback) |
@@ -853,6 +892,18 @@ third_party/ratex/           Embedded Rust LaTeX renderer (CGo)
 
 Considered and rejected. Documenting the reasoning so future contributors
 don't re-propose them without new evidence.
+
+**Local-only model deployment.** The initial architecture used only local
+models (Qwen 3.5 MoE on Mac Studio) to keep API costs at zero. In
+practice, local models at the 30B parameter range lack the instruction-
+following capability needed for reliable agent orchestration. Trace
+analysis showed: Qwen confused skill names with tool names, hallucinated
+column names in SQL, looped identical searches, and ignored system-level
+constraints. Even with all harness guardrails (budgets, early-abort,
+retry, prompt engineering), the failure rate was too high for daily use.
+Switching to commercial APIs (even the cheapest tier — Claude Haiku)
+eliminated these issues immediately. Local models are retained as
+fallback and for transcription/embedding where they perform well.
 
 **Raw SQL tools (db / db\_exec).** The original design exposed raw SQL to
 the model via `db` (read-only) and `db_exec` (write) tools, with an
@@ -922,4 +973,8 @@ decision should be revisited.
 - Skills grow organically through use, not through code changes
 - All media saved to workspace for memory system reference
 - Local models handle everything; API cost approaches zero
-- Prefer MoE on unified-memory Macs — bandwidth-bound decode, dense 30B hits ~5 tok/s ceiling while a 35B/3B MoE at 8bit holds ~30 tok/s in production
+- **Use the best model for each role** — commercial APIs for orchestrator
+  (tool calling quality) and synthesizer (answer quality); local models
+  for fallback, transcription, and embedding. The harness guardrails
+  (budgets, early-abort, retry) remain as safety nets but should rarely
+  fire with capable models
