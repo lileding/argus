@@ -131,6 +131,7 @@ type DocumentStore interface {
 	PendingDocuments(ctx context.Context, limit int) ([]Document, error)
 	SaveChunks(ctx context.Context, chunks []Chunk) error
 	SearchChunks(ctx context.Context, embedding []float32, limit int) ([]Chunk, error)
+	ListDocuments(ctx context.Context) ([]Document, error)
 	UnembeddedChunks(ctx context.Context, limit int) ([]Chunk, error)
 	SetChunkEmbedding(ctx context.Context, chunkID int64, embedding []float32) error
 }

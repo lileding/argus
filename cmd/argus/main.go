@@ -99,7 +99,7 @@ func buildSandbox(cfg *config.Config) sandbox.Sandbox {
 }
 
 // buildToolRegistry creates the tool registry with all available tools.
-func buildToolRegistry(cfg *config.Config, sb sandbox.Sandbox, loader *skill.FileLoader, db *sql.DB, st store.Store) *tool.Registry {
+func buildToolRegistry(cfg *config.Config, sb sandbox.Sandbox, loader *skill.FileLoader, db *sql.DB, st store.Store, embedClient *embedding.Client) *tool.Registry {
 	registry := tool.NewRegistry()
 	registry.Register(tool.NewReadFileTool(cfg.Agent.WorkspaceDir))
 	registry.Register(tool.NewWriteFileTool(cfg.Agent.WorkspaceDir))
@@ -120,6 +120,12 @@ func buildToolRegistry(cfg *config.Config, sb sandbox.Sandbox, loader *skill.Fil
 	if ps, ok := st.(store.PinnedMemoryStore); ok {
 		registry.Register(tool.NewRememberTool(ps))
 		registry.Register(tool.NewForgetTool(ps))
+	}
+
+	// Document search tools (available when store supports documents + embeddings available).
+	if ds, ok := st.(store.DocumentStore); ok && embedClient != nil {
+		registry.Register(tool.NewSearchDocsTool(ds, embedClient))
+		registry.Register(tool.NewListDocsTool(ds))
 	}
 
 	return registry
@@ -210,7 +216,7 @@ func runServer(cfg *config.Config) {
 	}
 
 	sb := buildSandbox(cfg)
-	toolReg := buildToolRegistry(cfg, sb, loader, db, st)
+	toolReg := buildToolRegistry(cfg, sb, loader, db, st, embedClient)
 	ag := agent.New(orchClient, synthClient, st, toolReg, loader.Index(), embedClient, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.OrchestratorContextWindow, cfg.Agent.MaxIterations)
 
 	feishuClient := feishu.NewClient(cfg.Feishu)
