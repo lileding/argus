@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 func TestMemoryOutboxClaimAndRecover(t *testing.T) {
@@ -67,5 +68,59 @@ func TestMemoryOutboxClaimAndRecover(t *testing.T) {
 	}
 	if event == nil || event.Priority != 0 {
 		t.Fatalf("claimed event = %#v, want priority 0", event)
+	}
+}
+
+func TestMemoryCronStore(t *testing.T) {
+	ctx := context.Background()
+	st := NewMemoryStore()
+	now := time.Now()
+	next := now.Add(-time.Minute)
+
+	if err := st.CreateCronSchedule(ctx, &CronSchedule{
+		ChatID:    "chat",
+		Name:      "daily",
+		Hour:      9,
+		Minute:    30,
+		Timezone:  "UTC",
+		Prompt:    "Run report",
+		NextRunAt: &next,
+	}); err != nil {
+		t.Fatalf("CreateCronSchedule: %v", err)
+	}
+
+	due, err := st.DueCronSchedules(ctx, now, 10)
+	if err != nil {
+		t.Fatalf("DueCronSchedules: %v", err)
+	}
+	if len(due) != 1 || due[0].Name != "daily" {
+		t.Fatalf("due = %#v, want one daily schedule", due)
+	}
+
+	later := now.Add(24 * time.Hour)
+	if err := st.MarkCronScheduleRun(ctx, due[0].ID, now, later); err != nil {
+		t.Fatalf("MarkCronScheduleRun: %v", err)
+	}
+	due, err = st.DueCronSchedules(ctx, now, 10)
+	if err != nil {
+		t.Fatalf("DueCronSchedules after mark: %v", err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("due after mark = %#v, want none", due)
+	}
+
+	deleted, err := st.DeleteCronSchedule(ctx, 1, "chat")
+	if err != nil {
+		t.Fatalf("DeleteCronSchedule: %v", err)
+	}
+	if !deleted {
+		t.Fatal("expected schedule to be disabled")
+	}
+	list, err := st.ListCronSchedules(ctx, "chat", false)
+	if err != nil {
+		t.Fatalf("ListCronSchedules: %v", err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("enabled schedules = %#v, want none", list)
 	}
 }

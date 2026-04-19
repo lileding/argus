@@ -15,10 +15,12 @@ type MemoryStore struct {
 	nextTask int64
 	outbox   []OutboxEvent
 	nextOut  int64
+	cron     []CronSchedule
+	nextCron int64
 }
 
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{nextID: 1, nextTask: 1, nextOut: 1}
+	return &MemoryStore{nextID: 1, nextTask: 1, nextOut: 1, nextCron: 1}
 }
 
 func (s *MemoryStore) SaveMessage(_ context.Context, msg *StoredMessage) error {
@@ -410,4 +412,98 @@ func (s *MemoryStore) RecoverOutbox(_ context.Context) (int, error) {
 		}
 	}
 	return recovered, nil
+}
+
+// --- CronStore (in-memory, for tests / no-DB mode) ---
+
+func (s *MemoryStore) CreateCronSchedule(_ context.Context, schedule *CronSchedule) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	schedule.ID = s.nextCron
+	s.nextCron++
+	if schedule.ScheduleType == "" {
+		schedule.ScheduleType = "daily"
+	}
+	if schedule.Timezone == "" {
+		schedule.Timezone = "Asia/Shanghai"
+	}
+	schedule.Enabled = true
+	now := time.Now()
+	if schedule.CreatedAt.IsZero() {
+		schedule.CreatedAt = now
+	}
+	if schedule.UpdatedAt.IsZero() {
+		schedule.UpdatedAt = now
+	}
+	s.cron = append(s.cron, *schedule)
+	return nil
+}
+
+func (s *MemoryStore) ListCronSchedules(_ context.Context, chatID string, includeDisabled bool) ([]CronSchedule, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var out []CronSchedule
+	for _, sched := range s.cron {
+		if sched.ChatID != chatID {
+			continue
+		}
+		if !includeDisabled && !sched.Enabled {
+			continue
+		}
+		out = append(out, sched)
+	}
+	return out, nil
+}
+
+func (s *MemoryStore) DeleteCronSchedule(_ context.Context, scheduleID int64, chatID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	for i := range s.cron {
+		if s.cron[i].ID == scheduleID && s.cron[i].ChatID == chatID && s.cron[i].Enabled {
+			s.cron[i].Enabled = false
+			s.cron[i].UpdatedAt = now
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *MemoryStore) DueCronSchedules(_ context.Context, now time.Time, limit int) ([]CronSchedule, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if limit <= 0 {
+		limit = 20
+	}
+	var out []CronSchedule
+	for _, sched := range s.cron {
+		if !sched.Enabled || sched.NextRunAt == nil || sched.NextRunAt.After(now) {
+			continue
+		}
+		out = append(out, sched)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (s *MemoryStore) MarkCronScheduleRun(_ context.Context, scheduleID int64, lastRunAt, nextRunAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	for i := range s.cron {
+		if s.cron[i].ID == scheduleID {
+			s.cron[i].LastRunAt = &lastRunAt
+			s.cron[i].NextRunAt = &nextRunAt
+			s.cron[i].UpdatedAt = now
+			return nil
+		}
+	}
+	return nil
 }

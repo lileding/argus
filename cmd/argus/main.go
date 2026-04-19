@@ -129,6 +129,11 @@ func buildToolRegistry(cfg *config.Config, sb sandbox.Sandbox, loader *skill.Fil
 		registry.Register(tool.NewGetTaskStatusTool(ts))
 		registry.Register(tool.NewCancelTaskTool(ts))
 	}
+	if cs, ok := st.(store.CronStore); ok {
+		registry.Register(tool.NewCreateCronTool(cs))
+		registry.Register(tool.NewListCronTool(cs))
+		registry.Register(tool.NewDeleteCronTool(cs))
+	}
 
 	// Document search tools (available when store supports documents + embeddings available).
 	if ds, ok := st.(store.DocumentStore); ok && embedClient != nil {
@@ -302,6 +307,13 @@ func runServer(cfg *config.Config) {
 	scheduler := setupCron(cfg, ag, feishuClient, processor, ctx)
 	scheduler.Start()
 	defer scheduler.Stop()
+	if cronStore, ok := st.(store.CronStore); ok {
+		if taskStore, ok := st.(store.TaskStore); ok {
+			dbScheduler := cron.NewDBScheduler(cronStore, taskStore, time.Minute)
+			dbScheduler.Start()
+			defer dbScheduler.Stop()
+		}
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

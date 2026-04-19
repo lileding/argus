@@ -23,6 +23,9 @@ ABSOLUTE RULES:
   create_async_task with a complete prompt, then finish_task. Do NOT use
   create_async_task for ordinary short questions, simple searches, or small
   database queries.
+- For recurring work (for example "daily at 10pm", "每天晚上10点..."):
+  use create_cron with a complete prompt. Use list_cron or delete_cron when
+  the user asks to inspect or remove schedules.
 - For tasks like writing code or scripts: use write_file + cli.
 
 SEARCH RULES (critical for answer quality):

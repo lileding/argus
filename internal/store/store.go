@@ -181,6 +181,34 @@ type OutboxEvent struct {
 	SentAt    *time.Time
 }
 
+// CronStore manages database-backed schedules that produce async tasks.
+type CronStore interface {
+	CreateCronSchedule(ctx context.Context, schedule *CronSchedule) error
+	ListCronSchedules(ctx context.Context, chatID string, includeDisabled bool) ([]CronSchedule, error)
+	DeleteCronSchedule(ctx context.Context, scheduleID int64, chatID string) (bool, error)
+	DueCronSchedules(ctx context.Context, now time.Time, limit int) ([]CronSchedule, error)
+	MarkCronScheduleRun(ctx context.Context, scheduleID int64, lastRunAt, nextRunAt time.Time) error
+}
+
+type CronSchedule struct {
+	ID              int64
+	ChatID          string
+	UserID          string
+	Name            string
+	ScheduleType    string
+	CronExpr        string
+	Hour            int
+	Minute          int
+	Timezone        string
+	Prompt          string
+	Enabled         bool
+	CreatedByTaskID *int64
+	LastRunAt       *time.Time
+	NextRunAt       *time.Time
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
 // DocumentStore manages document ingestion and RAG.
 type DocumentStore interface {
 	SaveDocument(ctx context.Context, doc *Document) error

@@ -319,8 +319,8 @@ Implementation order:
 1. ~~Add `tasks`, async worker leases, worker execution, and basic task tools.~~
 2. ~~Add `outbox_events` and per-chat presentation serialization.~~
 3. ~~Link traces to `task_id` / `parent_task_id`.~~
-4. Add `cron_schedules` and daily schedule execution.
-5. Add `create_cron`, `list_cron`, and `delete_cron`.
+4. ~~Add `cron_schedules` and daily schedule execution.~~
+5. ~~Add `create_cron`, `list_cron`, and `delete_cron`.~~
 6. Migrate config-only cron jobs into bootstrap schedules or deprecate
    them once DB-backed schedules are stable.
 
@@ -760,9 +760,9 @@ skills, but the final authoring remains human-controlled.
 | `create_async_task` | Create a durable background task | 2/turn |
 | `get_task_status` | Inspect background task state | — |
 | `cancel_task` | Cancel a queued/running background task | — |
-| `create_cron` | Create a DB-backed schedule that emits async tasks (planned) | — |
-| `list_cron` | List schedules for the current user/chat (planned) | — |
-| `delete_cron` | Disable a schedule (planned) | — |
+| `create_cron` | Create a DB-backed daily schedule that emits async tasks | — |
+| `list_cron` | List schedules for the current user/chat | — |
+| `delete_cron` | Disable a schedule | — |
 
 Removed tools: `save_skill` (skills are human-authored), `db_exec` (replaced
 by the structured `db` tool).
@@ -950,7 +950,10 @@ stores the final result on the task row. Completed and failed async tasks
 now emit `outbox_events`; the Feishu outbox presenter delivers those
 events only when the chat presentation lock is free. Async worker runs
 are recorded in `traces` with `task_id` and `parent_task_id`, using the
-same event-stream collector as sync IM turns.
+same event-stream collector as sync IM turns. DB-backed daily cron
+schedules are implemented; scheduler ticks create async tasks, and
+`create_cron`, `list_cron`, and `delete_cron` expose schedule management
+to the orchestrator.
 
 ---
 
@@ -1109,6 +1112,7 @@ internal/
       003_message_queue.sql  reply_status + reply_channel_id + trigger_msg_id
       005_async_tasks.sql    tasks + outbox_events
       006_task_traces.sql    trace linkage to task_id / parent_task_id
+      007_cron_schedules.sql DB-backed daily schedules
   task/
     worker.go                Lease-based async task worker
   tool/

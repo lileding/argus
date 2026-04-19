@@ -785,6 +785,130 @@ func (s *PostgresStore) RecoverOutbox(ctx context.Context) (int, error) {
 	return int(n), nil
 }
 
+// --- CronStore ---
+
+func (s *PostgresStore) CreateCronSchedule(ctx context.Context, schedule *CronSchedule) error {
+	if schedule.ScheduleType == "" {
+		schedule.ScheduleType = "daily"
+	}
+	if schedule.Timezone == "" {
+		schedule.Timezone = "Asia/Shanghai"
+	}
+	schedule.Enabled = true
+	err := s.db.QueryRowContext(ctx, `
+		INSERT INTO cron_schedules (
+			chat_id, user_id, name, schedule_type, cron_expr, hour, minute,
+			timezone, prompt, enabled, created_by_task_id, next_run_at
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		RETURNING id, created_at, updated_at
+	`, schedule.ChatID, schedule.UserID, schedule.Name, schedule.ScheduleType,
+		nullEmpty(schedule.CronExpr), schedule.Hour, schedule.Minute, schedule.Timezone,
+		schedule.Prompt, schedule.Enabled, schedule.CreatedByTaskID, schedule.NextRunAt,
+	).Scan(&schedule.ID, &schedule.CreatedAt, &schedule.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("create cron schedule: %w", err)
+	}
+	return nil
+}
+
+func (s *PostgresStore) ListCronSchedules(ctx context.Context, chatID string, includeDisabled bool) ([]CronSchedule, error) {
+	query := `
+		SELECT id, chat_id, user_id, name, schedule_type, cron_expr, hour, minute,
+			timezone, prompt, enabled, created_by_task_id, last_run_at, next_run_at,
+			created_at, updated_at
+		FROM cron_schedules
+		WHERE chat_id = $1`
+	if !includeDisabled {
+		query += ` AND enabled = TRUE`
+	}
+	query += ` ORDER BY created_at DESC`
+
+	rows, err := s.db.QueryContext(ctx, query, chatID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanCronSchedules(rows)
+}
+
+func (s *PostgresStore) DeleteCronSchedule(ctx context.Context, scheduleID int64, chatID string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE cron_schedules
+		SET enabled = FALSE, updated_at = NOW()
+		WHERE id = $1 AND chat_id = $2 AND enabled = TRUE
+	`, scheduleID, chatID)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+func (s *PostgresStore) DueCronSchedules(ctx context.Context, now time.Time, limit int) ([]CronSchedule, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, chat_id, user_id, name, schedule_type, cron_expr, hour, minute,
+			timezone, prompt, enabled, created_by_task_id, last_run_at, next_run_at,
+			created_at, updated_at
+		FROM cron_schedules
+		WHERE enabled = TRUE AND next_run_at IS NOT NULL AND next_run_at <= $1
+		ORDER BY next_run_at, id
+		LIMIT $2
+	`, now, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanCronSchedules(rows)
+}
+
+func (s *PostgresStore) MarkCronScheduleRun(ctx context.Context, scheduleID int64, lastRunAt, nextRunAt time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE cron_schedules
+		SET last_run_at = $1, next_run_at = $2, updated_at = NOW()
+		WHERE id = $3
+	`, lastRunAt, nextRunAt, scheduleID)
+	return err
+}
+
+func scanCronSchedules(rows *sql.Rows) ([]CronSchedule, error) {
+	var schedules []CronSchedule
+	for rows.Next() {
+		var s CronSchedule
+		var userID, cronExpr sql.NullString
+		var createdBy sql.NullInt64
+		var lastRun, nextRun sql.NullTime
+		if err := rows.Scan(&s.ID, &s.ChatID, &userID, &s.Name, &s.ScheduleType, &cronExpr,
+			&s.Hour, &s.Minute, &s.Timezone, &s.Prompt, &s.Enabled, &createdBy,
+			&lastRun, &nextRun, &s.CreatedAt, &s.UpdatedAt); err != nil {
+			return nil, err
+		}
+		s.UserID = userID.String
+		s.CronExpr = cronExpr.String
+		if createdBy.Valid {
+			s.CreatedByTaskID = &createdBy.Int64
+		}
+		if lastRun.Valid {
+			s.LastRunAt = &lastRun.Time
+		}
+		if nextRun.Valid {
+			s.NextRunAt = &nextRun.Time
+		}
+		schedules = append(schedules, s)
+	}
+	return schedules, nil
+}
+
+func nullEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
 // --- QueueStore (message pipeline) ---
 
 func (s *PostgresStore) SaveMessageQueued(ctx context.Context, msg *StoredMessage) error {
