@@ -254,6 +254,46 @@ Argus is currently single-instance. If horizontal scaling is introduced,
 the lock must move to a DB lease or advisory lock, matching the existing
 deployment constraint for per-chat FIFO.
 
+#### Cron as Task Producer
+
+Cron schedules are persisted configuration, not execution. A scheduler
+tick finds due schedules, creates async tasks, advances `next_run_at`,
+and exits. The async task worker then runs the Agent and uses the outbox
+for delivery.
+
+```sql
+CREATE TABLE cron_schedules (
+    id                 BIGSERIAL PRIMARY KEY,
+    chat_id            TEXT NOT NULL,
+    user_id            TEXT,
+    name               TEXT NOT NULL,
+    schedule_type      TEXT NOT NULL DEFAULT 'daily',
+    cron_expr          TEXT,
+    hour               INT,
+    minute             INT,
+    timezone           TEXT NOT NULL DEFAULT 'Asia/Shanghai',
+    prompt             TEXT NOT NULL,
+    enabled            BOOLEAN NOT NULL DEFAULT TRUE,
+    created_by_task_id BIGINT REFERENCES tasks(id),
+    last_run_at        TIMESTAMPTZ,
+    next_run_at        TIMESTAMPTZ,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+The initial scheduling scope should be intentionally small: daily jobs
+with explicit hour, minute, and timezone. Natural-language requests such
+as "每天晚上10点做当日饮食统计" should be converted by the orchestrator
+into a `create_cron` tool call that stores a daily schedule. Weekly,
+monthly, and full cron expression support can be added after daily
+schedules are reliable and visible to the user.
+
+This replaces the current config-only cron model. Static jobs in
+`config.yaml` can remain as a bootstrap path, but runtime user-created
+schedules must live in the database so they can be listed, edited,
+disabled, and recovered after restart.
+
 ---
 
 ## Multimodal Input
