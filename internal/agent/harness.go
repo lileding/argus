@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -144,13 +145,37 @@ func (a *Agent) buildSynthesizerPrompt() string {
 var imageExts = map[string]bool{".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true}
 
 // curateHistory filters message history and re-injects images from stored FilePaths.
+// Only the most recent image-bearing message gets real image data injected;
+// older images are replaced with a text placeholder to save context tokens.
 func (a *Agent) curateHistory(messages []store.StoredMessage) []model.Message {
+	// Find the last user message index that has image file paths.
+	lastImageIdx := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" && hasImagePaths(messages[i].FilePaths) {
+			lastImageIdx = i
+			break
+		}
+	}
+
 	var curated []model.Message
-	for _, m := range messages {
+	for i, m := range messages {
 		switch m.Role {
 		case "user":
-			msg := buildUserMessage(m.Content, m.FilePaths, a.workspaceDir)
-			curated = append(curated, msg)
+			if i == lastImageIdx {
+				// Most recent image message: inject real images.
+				curated = append(curated, buildUserMessage(m.Content, m.FilePaths, a.workspaceDir))
+			} else if hasImagePaths(m.FilePaths) {
+				// Older image message: text placeholder only.
+				text := m.Content
+				if text == "" {
+					text = "[User previously sent an image]"
+				} else {
+					text += "\n[Image(s) omitted from context]"
+				}
+				curated = append(curated, model.Message{Role: model.RoleUser, Content: text})
+			} else {
+				curated = append(curated, model.Message{Role: model.RoleUser, Content: m.Content})
+			}
 		case "assistant":
 			if m.Content != "" && m.ToolCallID == nil {
 				curated = append(curated, model.Message{Role: model.RoleAssistant, Content: m.Content})
@@ -158,6 +183,16 @@ func (a *Agent) curateHistory(messages []store.StoredMessage) []model.Message {
 		}
 	}
 	return curated
+}
+
+func hasImagePaths(paths []string) bool {
+	for _, p := range paths {
+		ext := strings.ToLower(filepath.Ext(p))
+		if imageExts[ext] {
+			return true
+		}
+	}
+	return false
 }
 
 // imageExts and buildUserMessage are defined in agent.go
