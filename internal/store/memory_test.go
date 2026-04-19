@@ -71,6 +71,44 @@ func TestMemoryOutboxClaimAndRecover(t *testing.T) {
 	}
 }
 
+func TestMemoryOutboxErrorReturnsToPending(t *testing.T) {
+	ctx := context.Background()
+	st := NewMemoryStore()
+
+	if err := st.CreateOutboxEvent(ctx, &OutboxEvent{
+		ChatID:  "chat",
+		Kind:    "async_done",
+		Payload: []byte(`{"title":"retry"}`),
+	}); err != nil {
+		t.Fatalf("CreateOutboxEvent: %v", err)
+	}
+	event, err := st.ClaimNextOutboxEvent(ctx, "chat")
+	if err != nil {
+		t.Fatalf("ClaimNextOutboxEvent: %v", err)
+	}
+	if event == nil {
+		t.Fatal("expected event")
+	}
+	if err := st.MarkOutboxError(ctx, event.ID, "temporary network error"); err != nil {
+		t.Fatalf("MarkOutboxError: %v", err)
+	}
+
+	chats, err := st.PendingOutboxChats(ctx)
+	if err != nil {
+		t.Fatalf("PendingOutboxChats: %v", err)
+	}
+	if len(chats) != 1 || chats[0] != "chat" {
+		t.Fatalf("chats = %#v, want retryable pending chat", chats)
+	}
+	event, err = st.ClaimNextOutboxEvent(ctx, "chat")
+	if err != nil {
+		t.Fatalf("ClaimNextOutboxEvent retry: %v", err)
+	}
+	if event == nil || event.Error != "temporary network error" {
+		t.Fatalf("event = %#v, want retryable event with last error", event)
+	}
+}
+
 func TestMemoryCronStore(t *testing.T) {
 	ctx := context.Background()
 	st := NewMemoryStore()

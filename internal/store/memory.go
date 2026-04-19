@@ -392,7 +392,7 @@ func (s *MemoryStore) MarkOutboxError(_ context.Context, eventID int64, errorMsg
 
 	for i := range s.outbox {
 		if s.outbox[i].ID == eventID {
-			s.outbox[i].Status = "failed"
+			s.outbox[i].Status = "pending"
 			s.outbox[i].Error = errorMsg
 			return nil
 		}

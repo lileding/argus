@@ -174,7 +174,7 @@ type OutboxEvent struct {
 	TaskID    *int64
 	Kind      string // async_done / async_failed / reminder / notice
 	Payload   []byte // JSON object
-	Status    string // pending / sending / sent / failed
+	Status    string // pending / sending / sent
 	Priority  int
 	Error     string
 	CreatedAt time.Time

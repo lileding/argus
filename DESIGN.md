@@ -241,6 +241,11 @@ card, async completion events for the same chat remain pending. When the
 sync card reaches its final update, the presenter drains pending outbox
 events in priority/created order.
 
+Delivery is at-least-once until success. If an IM send fails, the event's
+last error is recorded but the status returns to `pending`; the presenter
+keeps retrying in later polling rounds until `sent_at` is set. Outbox
+events do not enter a terminal failed state.
+
 This keeps two concerns separate:
 
 - **Execution concurrency**: async tasks can run in parallel across all
@@ -321,7 +326,8 @@ Implementation order:
 3. ~~Link traces to `task_id` / `parent_task_id`.~~
 4. ~~Add `cron_schedules` and daily schedule execution.~~
 5. ~~Add `create_cron`, `list_cron`, and `delete_cron`.~~
-6. Migrate config-only cron jobs into bootstrap schedules or deprecate
+6. ~~Keep retrying outbox delivery until sent; do not terminal-fail IM sends.~~
+7. Migrate config-only cron jobs into bootstrap schedules or deprecate
    them once DB-backed schedules are stable.
 
 ---

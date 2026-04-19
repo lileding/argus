@@ -766,7 +766,7 @@ func (s *PostgresStore) MarkOutboxSent(ctx context.Context, eventID int64) error
 func (s *PostgresStore) MarkOutboxError(ctx context.Context, eventID int64, errorMsg string) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE outbox_events
-		SET status = 'failed', error = $1
+		SET status = 'pending', error = $1
 		WHERE id = $2
 	`, errorMsg, eventID)
 	return err
