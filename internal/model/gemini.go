@@ -1,77 +1,174 @@
 package model
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"strings"
-
-	"google.golang.org/genai"
+	"time"
 )
 
-// GeminiClient implements Client using Google's Gemini API.
+const geminiBaseURL = "https://generativelanguage.googleapis.com/v1beta/models"
+
+// GeminiClient implements Client using Google's Gemini REST API directly.
 type GeminiClient struct {
-	client    *genai.Client
+	apiKey    string
 	modelName string
 	maxTokens int
+	client    *http.Client
 }
 
-func NewGeminiClient(ctx context.Context, apiKey, modelName string, maxTokens int) (*GeminiClient, error) {
-	client, err := genai.NewClient(ctx, &genai.ClientConfig{
-		Backend: genai.BackendGeminiAPI,
-		APIKey:  apiKey,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("create gemini client: %w", err)
-	}
+func NewGeminiClient(_ context.Context, apiKey, modelName string, maxTokens int) (*GeminiClient, error) {
 	return &GeminiClient{
-		client:    client,
+		apiKey:    apiKey,
 		modelName: modelName,
 		maxTokens: maxTokens,
+		client:    &http.Client{Timeout: 120 * time.Second},
 	}, nil
 }
 
+// --- Gemini API types ---
+
+type geminiRequest struct {
+	Contents         []*geminiContent        `json:"contents"`
+	Tools            []*geminiTool           `json:"tools,omitempty"`
+	SystemInstruction *geminiContent         `json:"systemInstruction,omitempty"`
+	GenerationConfig *geminiGenerationConfig `json:"generationConfig,omitempty"`
+}
+
+type geminiContent struct {
+	Role  string        `json:"role,omitempty"`
+	Parts []*geminiPart `json:"parts"`
+}
+
+type geminiPart struct {
+	Text             string                `json:"text,omitempty"`
+	FunctionCall     *geminiFunctionCall   `json:"functionCall,omitempty"`
+	FunctionResponse *geminiFunctionResp   `json:"functionResponse,omitempty"`
+}
+
+type geminiFunctionCall struct {
+	Name string         `json:"name"`
+	Args map[string]any `json:"args,omitempty"`
+}
+
+type geminiFunctionResp struct {
+	Name     string         `json:"name"`
+	Response map[string]any `json:"response"`
+}
+
+type geminiTool struct {
+	FunctionDeclarations []*geminiFuncDecl `json:"functionDeclarations,omitempty"`
+}
+
+type geminiFuncDecl struct {
+	Name        string       `json:"name"`
+	Description string       `json:"description"`
+	Parameters  *geminiSchema `json:"parameters,omitempty"`
+}
+
+type geminiSchema struct {
+	Type        string                   `json:"type"`
+	Description string                   `json:"description,omitempty"`
+	Properties  map[string]*geminiSchema `json:"properties,omitempty"`
+	Required    []string                 `json:"required,omitempty"`
+	Items       *geminiSchema            `json:"items,omitempty"`
+	Enum        []string                 `json:"enum,omitempty"`
+}
+
+type geminiGenerationConfig struct {
+	MaxOutputTokens int `json:"maxOutputTokens,omitempty"`
+}
+
+type geminiResponse struct {
+	Candidates    []*geminiCandidate    `json:"candidates"`
+	UsageMetadata *geminiUsageMetadata  `json:"usageMetadata,omitempty"`
+}
+
+type geminiCandidate struct {
+	Content      *geminiContent `json:"content"`
+	FinishReason string         `json:"finishReason,omitempty"`
+}
+
+type geminiUsageMetadata struct {
+	PromptTokenCount     int `json:"promptTokenCount"`
+	CandidatesTokenCount int `json:"candidatesTokenCount"`
+	TotalTokenCount      int `json:"totalTokenCount"`
+}
+
+// --- Client interface ---
+
 func (c *GeminiClient) Chat(ctx context.Context, messages []Message, tools []ToolDef) (*Response, error) {
-	config, history, userParts := c.prepare(messages, tools)
-	chat, err := c.client.Chats.Create(ctx, c.modelName, config, history)
+	req := c.buildRequest(messages, tools)
+	data, _ := json.Marshal(req)
+
+	body, err := c.doRequest(ctx, "generateContent", data)
 	if err != nil {
-		return nil, fmt.Errorf("gemini create chat: %w", err)
+		return nil, err
 	}
 
-	resp, err := chat.SendMessage(ctx, userParts...)
-	if err != nil {
-		return nil, fmt.Errorf("gemini chat: %w", err)
+	var resp geminiResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("gemini parse: %w", err)
 	}
-	return c.convertResponse(resp), nil
+	return convertGeminiResponse(&resp), nil
 }
 
 func (c *GeminiClient) ChatStream(ctx context.Context, messages []Message, tools []ToolDef) (<-chan StreamChunk, error) {
-	config, history, userParts := c.prepare(messages, tools)
-	chat, err := c.client.Chats.Create(ctx, c.modelName, config, history)
+	req := c.buildRequest(messages, tools)
+	data, _ := json.Marshal(req)
+
+	httpResp, err := c.doStreamRequest(ctx, data)
 	if err != nil {
-		return nil, fmt.Errorf("gemini create chat: %w", err)
+		return nil, err
 	}
 
 	ch := make(chan StreamChunk, 32)
 	go func() {
 		defer close(ch)
+		defer httpResp.Body.Close()
+
 		var usage Usage
-		for resp, err := range chat.SendMessageStream(ctx, userParts...) {
+		reader := bufio.NewReader(httpResp.Body)
+		for {
+			line, err := reader.ReadString('\n')
 			if err != nil {
-				ch <- StreamChunk{Done: true, Err: fmt.Errorf("gemini stream: %w", err), Usage: usage}
-				return
+				if err != io.EOF {
+					ch <- StreamChunk{Done: true, Err: fmt.Errorf("gemini stream: %w", err), Usage: usage}
+					return
+				}
+				break
 			}
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			payload := line[6:]
+			if payload == "" {
+				continue
+			}
+
+			var resp geminiResponse
+			if err := json.Unmarshal([]byte(payload), &resp); err != nil {
+				continue
+			}
+
+			if resp.UsageMetadata != nil {
+				usage.PromptTokens = resp.UsageMetadata.PromptTokenCount
+				usage.CompletionTokens = resp.UsageMetadata.CandidatesTokenCount
+			}
+
 			if len(resp.Candidates) > 0 && resp.Candidates[0].Content != nil {
 				for _, part := range resp.Candidates[0].Content.Parts {
 					if part.Text != "" {
 						ch <- StreamChunk{Delta: part.Text}
 					}
 				}
-			}
-			if resp.UsageMetadata != nil {
-				usage.PromptTokens = int(resp.UsageMetadata.PromptTokenCount)
-				usage.CompletionTokens = int(resp.UsageMetadata.CandidatesTokenCount)
 			}
 		}
 		ch <- StreamChunk{Done: true, Usage: usage}
@@ -80,25 +177,57 @@ func (c *GeminiClient) ChatStream(ctx context.Context, messages []Message, tools
 }
 
 func (c *GeminiClient) ChatWithEarlyAbort(ctx context.Context, messages []Message, tools []ToolDef, maxTextTokens int) (*Response, error) {
-	config, history, userParts := c.prepare(messages, tools)
-	chat, err := c.client.Chats.Create(ctx, c.modelName, config, history)
-	if err != nil {
-		return nil, fmt.Errorf("gemini create chat: %w", err)
-	}
+	req := c.buildRequest(messages, tools)
+	data, _ := json.Marshal(req)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.streamURL(), bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	httpResp, err := (&http.Client{}).Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("gemini request: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(httpResp.Body)
+		return nil, fmt.Errorf("gemini error: status=%d body=%s", httpResp.StatusCode, body)
+	}
+
 	var content strings.Builder
-	var functionCalls []ToolCall
+	var toolCalls []ToolCall
 	var usage Usage
 
-	for resp, err := range chat.SendMessageStream(ctx, userParts...) {
+	reader := bufio.NewReader(httpResp.Body)
+	for {
+		line, err := reader.ReadString('\n')
 		if err != nil {
-			if content.Len() > 0 || len(functionCalls) > 0 {
-				break
+			if err != io.EOF {
+				if content.Len() == 0 && len(toolCalls) == 0 {
+					return nil, fmt.Errorf("gemini stream: %w", err)
+				}
 			}
-			return nil, fmt.Errorf("gemini stream: %w", err)
+			break
+		}
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		var resp geminiResponse
+		if err := json.Unmarshal([]byte(line[6:]), &resp); err != nil {
+			continue
+		}
+
+		if resp.UsageMetadata != nil {
+			usage.PromptTokens = resp.UsageMetadata.PromptTokenCount
+			usage.CompletionTokens = resp.UsageMetadata.CandidatesTokenCount
 		}
 
 		if len(resp.Candidates) > 0 && resp.Candidates[0].Content != nil {
@@ -107,17 +236,12 @@ func (c *GeminiClient) ChatWithEarlyAbort(ctx context.Context, messages []Messag
 					content.WriteString(part.Text)
 				}
 				if part.FunctionCall != nil {
-					fc := part.FunctionCall
-					argsJSON, _ := json.Marshal(fc.Args)
-					id := fc.ID
-					if id == "" {
-						id = fmt.Sprintf("call_%s_%d", fc.Name, len(functionCalls))
-					}
-					functionCalls = append(functionCalls, ToolCall{
-						ID:   id,
+					argsJSON, _ := json.Marshal(part.FunctionCall.Args)
+					toolCalls = append(toolCalls, ToolCall{
+						ID:   fmt.Sprintf("call_%s_%d", part.FunctionCall.Name, len(toolCalls)),
 						Type: "function",
 						Function: FunctionCall{
-							Name:      fc.Name,
+							Name:      part.FunctionCall.Name,
 							Arguments: string(argsJSON),
 						},
 					})
@@ -125,175 +249,178 @@ func (c *GeminiClient) ChatWithEarlyAbort(ctx context.Context, messages []Messag
 			}
 		}
 
-		if resp.UsageMetadata != nil {
-			usage.PromptTokens = int(resp.UsageMetadata.PromptTokenCount)
-			usage.CompletionTokens = int(resp.UsageMetadata.CandidatesTokenCount)
-		}
-
-		// Early abort: too much text, no tool calls.
-		if len(functionCalls) == 0 && content.Len()/4 > maxTextTokens {
+		if len(toolCalls) == 0 && content.Len()/4 > maxTextTokens {
 			slog.Info("gemini early abort", "tokens_estimate", content.Len()/4, "max", maxTextTokens)
 			cancel()
-			return &Response{
-				Content:      content.String(),
-				FinishReason: "early_abort",
-				Usage:        usage,
-			}, nil
+			return &Response{Content: content.String(), FinishReason: "early_abort", Usage: usage}, nil
 		}
 	}
 
 	finishReason := "stop"
-	if len(functionCalls) > 0 {
+	if len(toolCalls) > 0 {
 		finishReason = "tool_calls"
 	}
-
-	return &Response{
-		Content:      content.String(),
-		ToolCalls:    functionCalls,
-		FinishReason: finishReason,
-		Usage:        usage,
-	}, nil
+	return &Response{Content: content.String(), ToolCalls: toolCalls, FinishReason: finishReason, Usage: usage}, nil
 }
 
 func (c *GeminiClient) Transcribe(_ context.Context, _ []byte, _ string) (*TranscriptionResult, error) {
 	return nil, fmt.Errorf("gemini does not support transcription (use openai upstream with Whisper)")
 }
 
-// --- Internal helpers ---
+// --- Internal ---
 
-func (c *GeminiClient) prepare(messages []Message, tools []ToolDef) (*genai.GenerateContentConfig, []*genai.Content, []genai.Part) {
-	config := &genai.GenerateContentConfig{
-		MaxOutputTokens: int32(c.maxTokens),
+func (c *GeminiClient) url() string {
+	return fmt.Sprintf("%s/%s:generateContent?key=%s", geminiBaseURL, c.modelName, c.apiKey)
+}
+
+func (c *GeminiClient) streamURL() string {
+	return fmt.Sprintf("%s/%s:streamGenerateContent?alt=sse&key=%s", geminiBaseURL, c.modelName, c.apiKey)
+}
+
+func (c *GeminiClient) doRequest(ctx context.Context, _ string, body []byte) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", c.url(), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("gemini request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("gemini read: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("gemini error: status=%d body=%s", resp.StatusCode, respBody)
+	}
+	return respBody, nil
+}
+
+func (c *GeminiClient) doStreamRequest(ctx context.Context, body []byte) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", c.streamURL(), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("gemini request: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("gemini error: status=%d body=%s", resp.StatusCode, b)
+	}
+	return resp, nil
+}
+
+func (c *GeminiClient) buildRequest(messages []Message, tools []ToolDef) geminiRequest {
+	req := geminiRequest{
+		GenerationConfig: &geminiGenerationConfig{MaxOutputTokens: c.maxTokens},
 	}
 
-	// Convert tools.
 	if len(tools) > 0 {
-		var decls []*genai.FunctionDeclaration
+		var decls []*geminiFuncDecl
 		for _, t := range tools {
-			decls = append(decls, convertToolDef(t))
+			decls = append(decls, &geminiFuncDecl{
+				Name:        t.Function.Name,
+				Description: t.Function.Description,
+				Parameters:  convertToGeminiSchema(t.Function.Parameters),
+			})
 		}
-		config.Tools = []*genai.Tool{{FunctionDeclarations: decls}}
+		req.Tools = []*geminiTool{{FunctionDeclarations: decls}}
 	}
 
-	// Split messages into system, history, and final user turn.
-	var history []*genai.Content
-	var userParts []genai.Part
-
-	for i, msg := range messages {
+	for _, msg := range messages {
 		switch msg.Role {
 		case RoleSystem:
-			config.SystemInstruction = &genai.Content{
-				Parts: []*genai.Part{{Text: msg.TextContent()}},
+			req.SystemInstruction = &geminiContent{
+				Parts: []*geminiPart{{Text: msg.TextContent()}},
 			}
+
 		case RoleUser:
 			text := msg.TextContent()
 			if text == "" {
-				text = " " // Gemini rejects empty Parts
+				text = " "
 			}
-			if i == len(messages)-1 {
-				userParts = append(userParts, genai.Part{Text: text})
-			} else {
-				history = append(history, &genai.Content{
-					Role:  "user",
-					Parts: []*genai.Part{{Text: text}},
-				})
-			}
+			req.Contents = append(req.Contents, &geminiContent{
+				Role:  "user",
+				Parts: []*geminiPart{{Text: text}},
+			})
+
 		case RoleAssistant:
-			parts := []*genai.Part{}
+			var parts []*geminiPart
 			if text := msg.TextContent(); text != "" {
-				parts = append(parts, &genai.Part{Text: text})
+				parts = append(parts, &geminiPart{Text: text})
 			}
 			for _, tc := range msg.ToolCalls {
 				var args map[string]any
 				json.Unmarshal([]byte(tc.Function.Arguments), &args)
-				parts = append(parts, &genai.Part{
-					FunctionCall: &genai.FunctionCall{
-						ID:   tc.ID,
-						Name: tc.Function.Name,
-						Args: args,
-					},
+				parts = append(parts, &geminiPart{
+					FunctionCall: &geminiFunctionCall{Name: tc.Function.Name, Args: args},
 				})
 			}
 			if len(parts) > 0 {
-				history = append(history, &genai.Content{Role: "model", Parts: parts})
+				req.Contents = append(req.Contents, &geminiContent{Role: "model", Parts: parts})
 			}
+
 		case RoleTool:
 			text := msg.TextContent()
 			if text == "" {
-				continue // skip empty tool results
+				continue
 			}
 			var respData map[string]any
 			json.Unmarshal([]byte(text), &respData)
 			if respData == nil {
 				respData = map[string]any{"result": text}
 			}
-			// ToolCallID may contain the tool name or a call ID.
-			// Gemini needs a non-empty name for FunctionResponse.
 			name := msg.ToolCallID
 			if name == "" {
 				name = "tool"
 			}
-			history = append(history, &genai.Content{
+			req.Contents = append(req.Contents, &geminiContent{
 				Role: "user",
-				Parts: []*genai.Part{{
-					FunctionResponse: &genai.FunctionResponse{
-						ID:       msg.ToolCallID,
-						Name:     name,
-						Response: respData,
-					},
+				Parts: []*geminiPart{{
+					FunctionResponse: &geminiFunctionResp{Name: name, Response: respData},
 				}},
 			})
 		}
 	}
 
-	if len(userParts) == 0 {
-		userParts = []genai.Part{{Text: " "}}
-	}
-
-	return config, history, userParts
+	return req
 }
 
-func (c *GeminiClient) convertResponse(resp *genai.GenerateContentResponse) *Response {
+func convertGeminiResponse(resp *geminiResponse) *Response {
 	result := &Response{FinishReason: "stop"}
-
 	if resp.UsageMetadata != nil {
 		result.Usage = Usage{
-			PromptTokens:     int(resp.UsageMetadata.PromptTokenCount),
-			CompletionTokens: int(resp.UsageMetadata.CandidatesTokenCount),
+			PromptTokens:     resp.UsageMetadata.PromptTokenCount,
+			CompletionTokens: resp.UsageMetadata.CandidatesTokenCount,
 		}
 	}
-
-	if len(resp.Candidates) == 0 {
-		return result
-	}
-	cand := resp.Candidates[0]
-	if cand.Content == nil {
+	if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
 		return result
 	}
 
 	var textParts []string
-	for _, part := range cand.Content.Parts {
+	for _, part := range resp.Candidates[0].Content.Parts {
 		if part.Text != "" {
 			textParts = append(textParts, part.Text)
 		}
 		if part.FunctionCall != nil {
-			fc := part.FunctionCall
-			argsJSON, _ := json.Marshal(fc.Args)
-			id := fc.ID
-			if id == "" {
-				id = fmt.Sprintf("call_%s_%d", fc.Name, len(result.ToolCalls))
-			}
+			argsJSON, _ := json.Marshal(part.FunctionCall.Args)
 			result.ToolCalls = append(result.ToolCalls, ToolCall{
-				ID:   id,
+				ID:   fmt.Sprintf("call_%s_%d", part.FunctionCall.Name, len(result.ToolCalls)),
 				Type: "function",
-				Function: FunctionCall{
-					Name:      fc.Name,
-					Arguments: string(argsJSON),
-				},
+				Function: FunctionCall{Name: part.FunctionCall.Name, Arguments: string(argsJSON)},
 			})
 		}
 	}
-
 	result.Content = strings.Join(textParts, "")
 	if len(result.ToolCalls) > 0 {
 		result.FinishReason = "tool_calls"
@@ -301,59 +428,33 @@ func (c *GeminiClient) convertResponse(resp *genai.GenerateContentResponse) *Res
 	return result
 }
 
-// convertToolDef converts our OpenAI-format ToolDef to genai.FunctionDeclaration.
-func convertToolDef(t ToolDef) *genai.FunctionDeclaration {
-	fd := &genai.FunctionDeclaration{
-		Name:        t.Function.Name,
-		Description: t.Function.Description,
-	}
-	if t.Function.Parameters != nil {
-		fd.Parameters = convertJSONSchema(t.Function.Parameters)
-	}
-	return fd
-}
-
-func convertJSONSchema(raw json.RawMessage) *genai.Schema {
-	var schema map[string]any
-	if err := json.Unmarshal(raw, &schema); err != nil {
+func convertToGeminiSchema(raw json.RawMessage) *geminiSchema {
+	if raw == nil {
 		return nil
 	}
-	return convertSchemaMap(schema)
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil
+	}
+	return mapToGeminiSchema(m)
 }
 
-func convertSchemaMap(m map[string]any) *genai.Schema {
-	s := &genai.Schema{}
-
+func mapToGeminiSchema(m map[string]any) *geminiSchema {
+	s := &geminiSchema{}
 	if t, ok := m["type"].(string); ok {
-		switch t {
-		case "object":
-			s.Type = genai.TypeObject
-		case "array":
-			s.Type = genai.TypeArray
-		case "string":
-			s.Type = genai.TypeString
-		case "number":
-			s.Type = genai.TypeNumber
-		case "integer":
-			s.Type = genai.TypeInteger
-		case "boolean":
-			s.Type = genai.TypeBoolean
-		}
+		s.Type = strings.ToUpper(t)
 	}
-
-	if desc, ok := m["description"].(string); ok {
-		s.Description = desc
+	if d, ok := m["description"].(string); ok {
+		s.Description = d
 	}
-
 	if props, ok := m["properties"].(map[string]any); ok {
-		s.Properties = make(map[string]*genai.Schema)
+		s.Properties = make(map[string]*geminiSchema)
 		for k, v := range props {
 			if vm, ok := v.(map[string]any); ok {
-				s.Properties[k] = convertSchemaMap(vm)
+				s.Properties[k] = mapToGeminiSchema(vm)
 			}
 		}
 	}
-
 	if req, ok := m["required"].([]any); ok {
 		for _, r := range req {
 			if rs, ok := r.(string); ok {
@@ -361,11 +462,9 @@ func convertSchemaMap(m map[string]any) *genai.Schema {
 			}
 		}
 	}
-
 	if items, ok := m["items"].(map[string]any); ok {
-		s.Items = convertSchemaMap(items)
+		s.Items = mapToGeminiSchema(items)
 	}
-
 	if enum, ok := m["enum"].([]any); ok {
 		for _, e := range enum {
 			if es, ok := e.(string); ok {
@@ -373,6 +472,5 @@ func convertSchemaMap(m map[string]any) *genai.Schema {
 			}
 		}
 	}
-
 	return s
 }
