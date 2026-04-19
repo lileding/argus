@@ -36,6 +36,14 @@ func NewClientFromConfig(ctx context.Context, upstreams map[string]config.Upstre
 		)
 		return client, nil
 
+	case "anthropic":
+		client := NewAnthropicClient(up.APIKey, role.ModelName, role.MaxTokens, up.Timeout)
+		slog.Info("model client created",
+			"upstream", role.Upstream, "type", "anthropic",
+			"model", role.ModelName, "max_tokens", role.MaxTokens,
+		)
+		return client, nil
+
 	default:
 		return nil, fmt.Errorf("unknown upstream type %q for upstream %q", up.Type, role.Upstream)
 	}
