@@ -243,6 +243,11 @@ func runServer(cfg *config.Config) {
 	}
 	if ts, ok := st.(store.TaskStore); ok {
 		taskWorker := task.NewWorker(ts, ag, "argus-task-worker", 2*time.Second, 30*time.Minute)
+		taskWorker.WithMessageStore(st)
+		taskWorker.WithModelNames(cfg.Model.Orchestrator.ModelName, cfg.Model.Synthesizer.ModelName)
+		if traces, ok := st.(store.TraceStore); ok {
+			taskWorker.WithTraceStore(traces)
+		}
 		if outboxStore != nil {
 			taskWorker.WithOutbox(outboxStore)
 		}

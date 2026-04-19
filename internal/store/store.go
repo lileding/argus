@@ -98,6 +98,8 @@ type Trace struct {
 	ID                    int64
 	MessageID             int64
 	ReplyID               int64
+	TaskID                *int64
+	ParentTaskID          *int64
 	ChatID                string
 	OrchestratorModel     string
 	SynthesizerModel      string

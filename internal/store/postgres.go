@@ -470,10 +470,10 @@ func (s *PostgresStore) FailedTranscriptions(ctx context.Context) ([]StoredMessa
 
 func (s *PostgresStore) CreateTrace(ctx context.Context, t *Trace) error {
 	return s.db.QueryRowContext(ctx, `
-		INSERT INTO traces (message_id, chat_id, orchestrator_model, synthesizer_model)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO traces (message_id, chat_id, orchestrator_model, synthesizer_model, task_id, parent_task_id)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING id, created_at
-	`, t.MessageID, t.ChatID, t.OrchestratorModel, t.SynthesizerModel).Scan(&t.ID, &t.CreatedAt)
+	`, t.MessageID, t.ChatID, t.OrchestratorModel, t.SynthesizerModel, t.TaskID, t.ParentTaskID).Scan(&t.ID, &t.CreatedAt)
 }
 
 func (s *PostgresStore) FinishTrace(ctx context.Context, t *Trace) error {

@@ -9,15 +9,19 @@ import (
 	"time"
 
 	"argus/internal/agent"
-	"argus/internal/model"
 	"argus/internal/store"
+	"argus/internal/tool"
 )
 
 type Worker struct {
 	store         store.TaskStore
+	messageStore  store.Store
+	traceStore    store.TraceStore
 	outbox        store.OutboxStore
 	agent         *agent.Agent
 	workerID      string
+	orchModel     string
+	synthModel    string
 	pollInterval  time.Duration
 	leaseDuration time.Duration
 	quit          chan struct{}
@@ -46,6 +50,22 @@ func NewWorker(st store.TaskStore, ag *agent.Agent, workerID string, pollInterva
 
 func (w *Worker) WithOutbox(outbox store.OutboxStore) *Worker {
 	w.outbox = outbox
+	return w
+}
+
+func (w *Worker) WithMessageStore(messageStore store.Store) *Worker {
+	w.messageStore = messageStore
+	return w
+}
+
+func (w *Worker) WithTraceStore(traceStore store.TraceStore) *Worker {
+	w.traceStore = traceStore
+	return w
+}
+
+func (w *Worker) WithModelNames(orchestrator, synthesizer string) *Worker {
+	w.orchModel = orchestrator
+	w.synthModel = synthesizer
 	return w
 }
 
@@ -100,14 +120,25 @@ func (w *Worker) processOne(ctx context.Context, task *store.Task) {
 		w.fail(ctx, task, err)
 		return
 	}
+	if w.messageStore == nil {
+		w.fail(ctx, task, fmt.Errorf("async task worker missing message store"))
+		return
+	}
 
-	msg := model.NewTextMessage(model.RoleUser, prompt)
-	msg.Meta = &model.MessageMeta{
+	msg := &store.StoredMessage{
+		ChatID:   task.ChatID,
+		Role:     "user",
+		Content:  prompt,
 		SourceIM: "task",
 		Channel:  task.ChatID,
 		MsgType:  "text",
 	}
-	reply, err := w.agent.Handle(ctx, task.ChatID, msg)
+	if err := w.messageStore.SaveMessage(ctx, msg); err != nil {
+		w.fail(ctx, task, fmt.Errorf("save task message: %w", err))
+		return
+	}
+
+	reply, err := w.runAgentWithTrace(ctx, task, msg)
 	if err != nil {
 		w.fail(ctx, task, err)
 		return
@@ -122,6 +153,106 @@ func (w *Worker) processOne(ctx context.Context, task *store.Task) {
 	})
 
 	slog.Info("async task succeeded", "task_id", task.ID)
+}
+
+func (w *Worker) runAgentWithTrace(ctx context.Context, task *store.Task, msg *store.StoredMessage) (string, error) {
+	start := time.Now()
+	trace := &store.Trace{
+		MessageID:         msg.ID,
+		TaskID:            &task.ID,
+		ParentTaskID:      task.ParentTaskID,
+		ChatID:            task.ChatID,
+		OrchestratorModel: w.orchModel,
+		SynthesizerModel:  w.synthModel,
+	}
+	if w.traceStore != nil {
+		if err := w.traceStore.CreateTrace(ctx, trace); err != nil {
+			slog.Warn("async task create trace", "task_id", task.ID, "err", err)
+		}
+	}
+
+	agentCh := w.agent.HandleStreamQueued(ctx, task.ChatID, msg.ID, msg.Content, msg.FilePaths)
+	var toolCalls []store.ToolCallRecord
+	toolArgs := map[[2]int]string{}
+	var composing *agent.ComposingPayload
+	var replyPayload *agent.ReplyPayload
+	var lastErr error
+
+	for ev := range agentCh {
+		switch ev.Type {
+		case agent.EventToolCall:
+			p := ev.Payload.(agent.ToolCallPayload)
+			toolArgs[[2]int{p.Iteration, p.Seq}] = p.Arguments
+		case agent.EventToolResult:
+			p := ev.Payload.(agent.ToolResultPayload)
+			rawArgs := toolArgs[[2]int{p.Iteration, p.Seq}]
+			normalizedArgs := rawArgs
+			if p.Name == "db" {
+				var parsed struct{ Command string }
+				if json.Unmarshal([]byte(rawArgs), &parsed) == nil && parsed.Command != "" {
+					cmd, err := tool.ParseDBCommand(parsed.Command)
+					if err == nil {
+						normalizedArgs = cmd.Normalize()
+					}
+				}
+			}
+			toolCalls = append(toolCalls, store.ToolCallRecord{
+				TraceID:        trace.ID,
+				Iteration:      p.Iteration,
+				Seq:            p.Seq,
+				ToolName:       p.Name,
+				Arguments:      rawArgs,
+				NormalizedArgs: normalizedArgs,
+				Result:         p.FullResult,
+				IsError:        p.IsError,
+				DurationMs:     p.DurationMs,
+			})
+		case agent.EventComposing:
+			if p, ok := ev.Payload.(agent.ComposingPayload); ok {
+				composing = &p
+			}
+		case agent.EventReply:
+			if p, ok := ev.Payload.(agent.ReplyPayload); ok {
+				replyPayload = &p
+			}
+		case agent.EventError:
+			if p, ok := ev.Payload.(agent.ErrorPayload); ok {
+				lastErr = p.Err
+			}
+		}
+	}
+
+	if w.traceStore != nil && trace.ID > 0 {
+		if composing != nil {
+			trace.Iterations = composing.Iterations
+			trace.Summary = composing.Summary
+			trace.TotalPromptTokens = composing.TotalPromptTokens
+			trace.TotalCompletionTokens = composing.TotalCompletionTokens
+		}
+		if replyPayload != nil {
+			trace.ReplyID = replyPayload.ReplyMsgID
+			trace.SynthPromptTokens = replyPayload.PromptTokens
+			trace.SynthCompletionTokens = replyPayload.CompletionTokens
+		}
+		trace.DurationMs = int(time.Since(start).Milliseconds())
+
+		if err := w.traceStore.FinishTrace(ctx, trace); err != nil {
+			slog.Warn("async task finish trace", "task_id", task.ID, "err", err)
+		}
+		if len(toolCalls) > 0 {
+			if err := w.traceStore.SaveToolCalls(ctx, toolCalls); err != nil {
+				slog.Warn("async task save tool calls", "task_id", task.ID, "err", err)
+			}
+		}
+	}
+
+	if lastErr != nil {
+		return "", lastErr
+	}
+	if replyPayload == nil {
+		return "", fmt.Errorf("agent produced no reply")
+	}
+	return replyPayload.Text, nil
 }
 
 func (w *Worker) fail(ctx context.Context, task *store.Task, err error) {
