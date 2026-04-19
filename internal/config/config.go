@@ -98,9 +98,10 @@ type DatabaseConfig struct {
 }
 
 type AgentConfig struct {
-	MaxIterations int           `yaml:"max_iterations"`
-	ContextWindow int           `yaml:"context_window"`
-	SystemPrompt  string        `yaml:"system_prompt"`
+	MaxIterations          int           `yaml:"max_iterations"`
+	ContextWindow          int           `yaml:"context_window"`           // synthesizer history window
+	OrchestratorContextWindow int        `yaml:"orchestrator_context_window"` // orchestrator history window (smaller)
+	SystemPrompt           string        `yaml:"system_prompt"`
 	WorkspaceDir  string        `yaml:"workspace_dir"`
 	SkillsDir     string        `yaml:"skills_dir"`
 	SkillRescan   time.Duration `yaml:"skill_rescan"`
@@ -204,6 +205,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Agent.ContextWindow == 0 {
 		c.Agent.ContextWindow = 20
+	}
+	if c.Agent.OrchestratorContextWindow == 0 {
+		c.Agent.OrchestratorContextWindow = 10
 	}
 	if c.Agent.WorkspaceDir == "" {
 		c.Agent.WorkspaceDir = "./workspace"

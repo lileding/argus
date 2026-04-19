@@ -40,7 +40,7 @@ func NewAnthropicClient(apiKey, modelName string, maxTokens int, timeout time.Du
 type anthropicRequest struct {
 	Model     string            `json:"model"`
 	MaxTokens int               `json:"max_tokens"`
-	System    string            `json:"system,omitempty"`
+	System    any               `json:"system,omitempty"` // string or []anthropicContentBlock (for cache_control)
 	Messages  []anthropicMsg    `json:"messages"`
 	Tools     []anthropicTool   `json:"tools,omitempty"`
 	Stream    bool              `json:"stream,omitempty"`
@@ -52,13 +52,14 @@ type anthropicMsg struct {
 }
 
 type anthropicContentBlock struct {
-	Type      string         `json:"type"`
-	Text      string         `json:"text,omitempty"`
-	ID        string         `json:"id,omitempty"`
-	Name      string         `json:"name,omitempty"`
-	Input     map[string]any `json:"input,omitempty"`
-	ToolUseID string         `json:"tool_use_id,omitempty"`
-	Content   string         `json:"content,omitempty"`
+	Type         string                 `json:"type"`
+	Text         string                 `json:"text,omitempty"`
+	ID           string                 `json:"id,omitempty"`
+	Name         string                 `json:"name,omitempty"`
+	Input        map[string]any         `json:"input,omitempty"`
+	ToolUseID    string                 `json:"tool_use_id,omitempty"`
+	Content      string                 `json:"content,omitempty"`
+	CacheControl map[string]string      `json:"cache_control,omitempty"`
 }
 
 type anthropicTool struct {
@@ -283,11 +284,17 @@ func (c *AnthropicClient) buildRequest(messages []Message, tools []ToolDef, stre
 		})
 	}
 
-	// Convert messages: system goes to top-level, rest to messages array.
+	// Convert messages: system goes to top-level with cache_control.
 	for _, msg := range messages {
 		switch msg.Role {
 		case RoleSystem:
-			req.System = msg.TextContent()
+			// Use structured system with cache_control for prompt caching.
+			// Cached tokens count at a reduced rate toward rate limits.
+			req.System = []anthropicContentBlock{{
+				Type:         "text",
+				Text:         msg.TextContent(),
+				CacheControl: map[string]string{"type": "ephemeral"},
+			}}
 
 		case RoleUser:
 			req.Messages = append(req.Messages, anthropicMsg{

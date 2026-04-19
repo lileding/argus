@@ -17,8 +17,8 @@ import (
 
 // loadHistory retrieves and curates conversation history for context.
 // Used by both orchestrator and synthesizer phases.
-func (a *Agent) loadHistory(ctx context.Context, chatID string, excludeID int64) ([]model.Message, error) {
-	recent, err := a.store.RecentMessages(ctx, chatID, a.contextWindow+1)
+func (a *Agent) loadHistory(ctx context.Context, chatID string, excludeID int64, contextWindow int) ([]model.Message, error) {
+	recent, err := a.store.RecentMessages(ctx, chatID, contextWindow+1)
 	if err != nil {
 		return nil, fmt.Errorf("load recent messages: %w", err)
 	}
@@ -70,8 +70,8 @@ func (a *Agent) loadHistory(ctx context.Context, chatID string, excludeID int64)
 		}
 		filtered = append(filtered, m)
 	}
-	if len(filtered) > a.contextWindow {
-		filtered = filtered[len(filtered)-a.contextWindow:]
+	if len(filtered) > contextWindow {
+		filtered = filtered[len(filtered)-contextWindow:]
 	}
 	curated := a.curateHistory(filtered)
 

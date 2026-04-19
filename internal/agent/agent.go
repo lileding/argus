@@ -25,12 +25,13 @@ type Agent struct {
 	toolRegistry  *tool.Registry
 	skillIndex    *skill.SkillIndex
 	embedder      *embedding.Client
-	workspaceDir  string
-	contextWindow int
-	maxIterations int
+	workspaceDir              string
+	contextWindow             int // synthesizer history window
+	orchestratorContextWindow int // orchestrator history window (smaller)
+	maxIterations             int
 }
 
-func New(orchestrator, synthesizer model.Client, st store.Store, toolReg *tool.Registry, skillIdx *skill.SkillIndex, embedder *embedding.Client, workspaceDir string, contextWindow, maxIterations int) *Agent {
+func New(orchestrator, synthesizer model.Client, st store.Store, toolReg *tool.Registry, skillIdx *skill.SkillIndex, embedder *embedding.Client, workspaceDir string, contextWindow, orchestratorContextWindow, maxIterations int) *Agent {
 	if maxIterations == 0 {
 		maxIterations = 10
 	}
@@ -41,8 +42,9 @@ func New(orchestrator, synthesizer model.Client, st store.Store, toolReg *tool.R
 		toolRegistry:  toolReg,
 		skillIndex:    skillIdx,
 		embedder:      embedder,
-		workspaceDir:  workspaceDir,
-		contextWindow: contextWindow,
+		workspaceDir:              workspaceDir,
+		contextWindow:             contextWindow,
+		orchestratorContextWindow: orchestratorContextWindow,
 		maxIterations: maxIterations,
 	}
 }
@@ -92,17 +94,15 @@ func (a *Agent) HandleStream(ctx context.Context, chatID string, userMsg model.M
 			return
 		}
 
-		// Load history for context (used by both phases).
-		history, err := a.loadHistory(ctx, chatID, savedMsg.ID)
+		userText := userMsg.TextContent()
+
+		// Phase 1: Orchestration — smaller context window to save tokens.
+		orchHistory, err := a.loadHistory(ctx, chatID, savedMsg.ID, a.orchestratorContextWindow)
 		if err != nil {
 			ch <- Event{Type: EventError, Payload: ErrorPayload{Err: err}}
 			return
 		}
-
-		userText := userMsg.TextContent()
-
-		// Phase 1: Orchestration — collect materials via tool calls.
-		toolResults, finishSummary, orchStats := a.runOrchestrator(ctx, ch, userMsg, userText, history)
+		toolResults, finishSummary, orchStats := a.runOrchestrator(ctx, ch, userMsg, userText, orchHistory)
 
 		// Signal transition with orchestrator stats for trace recording.
 		ch <- Event{Type: EventComposing, Payload: ComposingPayload{
@@ -112,8 +112,13 @@ func (a *Agent) HandleStream(ctx context.Context, chatID string, userMsg model.M
 			TotalCompletionTokens: orchStats.TotalCompletionTokens,
 		}}
 
-		// Phase 2: Synthesis — compose final answer from materials.
-		reply, synthPT, synthCT := a.runSynthesizer(ctx, ch, userMsg, userText, history, toolResults, finishSummary)
+		// Phase 2: Synthesis — full context window for richer answers.
+		synthHistory, err := a.loadHistory(ctx, chatID, savedMsg.ID, a.contextWindow)
+		if err != nil {
+			ch <- Event{Type: EventError, Payload: ErrorPayload{Err: err}}
+			return
+		}
+		reply, synthPT, synthCT := a.runSynthesizer(ctx, ch, userMsg, userText, synthHistory, toolResults, finishSummary)
 
 		// Save assistant reply.
 		savedReply := &store.StoredMessage{
@@ -146,20 +151,18 @@ func (a *Agent) HandleStreamQueued(ctx context.Context, chatID string, savedMsgI
 
 		ctx = tool.WithChatID(ctx, chatID)
 
-		// Load history (excluding the current message to avoid duplication).
-		history, err := a.loadHistory(ctx, chatID, savedMsgID)
+		// Reconstruct a simple text message from the stored content.
+		userMsg := model.NewTextMessage(model.RoleUser, userText)
+
+		// Phase 1: Orchestration — smaller context window.
+		orchHistory, err := a.loadHistory(ctx, chatID, savedMsgID, a.orchestratorContextWindow)
 		if err != nil {
 			ch <- Event{Type: EventError, Payload: ErrorPayload{Err: err}}
 			return
 		}
+		toolResults, finishSummary, orchStats := a.runOrchestrator(ctx, ch, userMsg, userText, orchHistory)
 
-		// Reconstruct a simple text message from the stored content.
-		userMsg := model.NewTextMessage(model.RoleUser, userText)
-
-		// Phase 1: Orchestration.
-		toolResults, finishSummary, orchStats := a.runOrchestrator(ctx, ch, userMsg, userText, history)
-
-		// Signal transition with orchestrator stats for trace recording.
+		// Signal transition.
 		ch <- Event{Type: EventComposing, Payload: ComposingPayload{
 			Iterations:            orchStats.Iterations,
 			Summary:               finishSummary,
@@ -167,8 +170,13 @@ func (a *Agent) HandleStreamQueued(ctx context.Context, chatID string, savedMsgI
 			TotalCompletionTokens: orchStats.TotalCompletionTokens,
 		}}
 
-		// Phase 2: Synthesis.
-		reply, synthPT, synthCT := a.runSynthesizer(ctx, ch, userMsg, userText, history, toolResults, finishSummary)
+		// Phase 2: Synthesis — full context window.
+		synthHistory, err := a.loadHistory(ctx, chatID, savedMsgID, a.contextWindow)
+		if err != nil {
+			ch <- Event{Type: EventError, Payload: ErrorPayload{Err: err}}
+			return
+		}
+		reply, synthPT, synthCT := a.runSynthesizer(ctx, ch, userMsg, userText, synthHistory, toolResults, finishSummary)
 
 		// Save assistant reply.
 		savedReply := &store.StoredMessage{
