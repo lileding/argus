@@ -294,6 +294,36 @@ This replaces the current config-only cron model. Static jobs in
 schedules must live in the database so they can be listed, edited,
 disabled, and recovered after restart.
 
+#### Agent-Facing Task Tools
+
+The orchestrator should manage async work through tools, not hidden
+prompt conventions:
+
+| Tool | Purpose |
+|------|---------|
+| `create_async_task` | Create a durable background task from the current sync turn |
+| `get_task_status` | Inspect queued/running/completed task state |
+| `cancel_task` | Mark a queued/running task as cancelled when possible |
+| `create_cron` | Store a user-visible schedule that creates async tasks |
+| `list_cron` | Show active and disabled schedules for the current user/chat |
+| `delete_cron` | Disable a schedule |
+
+The `create_async_task` tool should be conservative. It is appropriate
+for long-running code work, large document processing, multi-step
+research, explicit background requests, or work that needs to outlive the
+current sync reply. It should not be used for ordinary short questions,
+simple searches, or small structured data queries.
+
+Implementation order:
+
+1. Add `tasks`, async worker leases, and basic `create_async_task`.
+2. Add `outbox_events` and per-chat presentation serialization.
+3. Link traces to `task_id` / `parent_task_id`.
+4. Add `cron_schedules` and daily schedule execution.
+5. Add `create_cron`, `list_cron`, and `delete_cron`.
+6. Migrate config-only cron jobs into bootstrap schedules or deprecate
+   them once DB-backed schedules are stable.
+
 ---
 
 ## Multimodal Input
@@ -727,6 +757,12 @@ skills, but the final authoring remains human-controlled.
 | `forget` | Deactivate a pinned memory by ID | — |
 | `search_docs` | Semantic search over indexed document chunks | — |
 | `list_docs` | List all indexed documents in knowledge base | — |
+| `create_async_task` | Create a durable background task (planned) | — |
+| `get_task_status` | Inspect background task state (planned) | — |
+| `cancel_task` | Cancel a queued/running background task (planned) | — |
+| `create_cron` | Create a DB-backed schedule that emits async tasks (planned) | — |
+| `list_cron` | List schedules for the current user/chat (planned) | — |
+| `delete_cron` | Disable a schedule (planned) | — |
 
 Removed tools: `save_skill` (skills are human-authored), `db_exec` (replaced
 by the structured `db` tool).
@@ -898,9 +934,14 @@ Database is optional — server mode falls back to memory store if PostgreSQL is
 
 ## Scheduled Tasks
 
-Background goroutine runs a cron scheduler, independent of user interaction:
-- Jobs defined in config (name, hour, minute, target chat_id, prompt)
-- Each job runs `agent.Handle()` (synchronous wrapper over the two-phase stream) and pushes the result via Feishu
+Current implementation: a background goroutine reads static jobs from
+`config.yaml`, runs `agent.Handle()` directly, and pushes the result via
+Feishu.
+
+Planned implementation: cron schedules live in PostgreSQL and only create
+async tasks. The async task worker runs the Agent, records traces, and
+emits outbox events. This makes scheduled work visible, editable,
+recoverable, and consistent with user-created background tasks.
 
 ---
 
