@@ -22,7 +22,8 @@ type Message struct {
 	Content    interface{}   `json:"content,omitempty"`
 	ToolCalls  []ToolCall    `json:"tool_calls,omitempty"`
 	ToolCallID string        `json:"tool_call_id,omitempty"`
-	Meta       *MessageMeta  `json:"-"` // not serialized to LLM, used for storage metadata
+	ToolName   string        `json:"tool_name,omitempty"` // for RoleTool: the function name (needed by Gemini)
+	Meta       *MessageMeta  `json:"-"`
 }
 
 // MessageMeta carries source metadata for persistence.

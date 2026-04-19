@@ -49,29 +49,26 @@ func NewClientFromConfig(ctx context.Context, upstreams map[string]config.Upstre
 	}
 }
 
-// NewClientsForAgent creates orchestrator + synthesizer + fallback clients.
-func NewClientsForAgent(ctx context.Context, upstreams map[string]config.UpstreamConfig, model config.ModelConfig) (orchestrator, synthesizer, fallback, transcription Client, err error) {
-	orchestrator, err = NewClientFromConfig(ctx, upstreams, model.Orchestrator)
+// NewClientsForAgent creates orchestrator + synthesizer + transcription clients.
+// Each is wrapped in RetryClient for 429 handling. No fallback — errors are
+// returned directly to the user.
+func NewClientsForAgent(ctx context.Context, upstreams map[string]config.UpstreamConfig, model config.ModelConfig) (orchestrator, synthesizer, transcription Client, err error) {
+	orch, err := NewClientFromConfig(ctx, upstreams, model.Orchestrator)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("orchestrator: %w", err)
+		return nil, nil, nil, fmt.Errorf("orchestrator: %w", err)
 	}
 
-	synthesizer, err = NewClientFromConfig(ctx, upstreams, model.Synthesizer)
+	synth, err := NewClientFromConfig(ctx, upstreams, model.Synthesizer)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("synthesizer: %w", err)
+		return nil, nil, nil, fmt.Errorf("synthesizer: %w", err)
 	}
 
-	fallback, err = NewClientFromConfig(ctx, upstreams, model.Fallback)
+	trans, err := NewClientFromConfig(ctx, upstreams, model.Transcription)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("fallback: %w", err)
+		return nil, nil, nil, fmt.Errorf("transcription: %w", err)
 	}
 
-	transcription, err = NewClientFromConfig(ctx, upstreams, model.Transcription)
-	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("transcription: %w", err)
-	}
-
-	return orchestrator, synthesizer, fallback, transcription, nil
+	return NewRetryClient(orch), NewRetryClient(synth), trans, nil
 }
 
 func upstreamNames(m map[string]config.UpstreamConfig) []string {

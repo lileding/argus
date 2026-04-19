@@ -1,5 +1,5 @@
 server:
-  port: "8080"
+  port: "8088"
 
 feishu:
   app_id: ""
@@ -7,33 +7,72 @@ feishu:
   verification_token: ""
   encrypt_key: ""
 
+# Model provider backends. Each upstream has a type and credentials.
+# Supported types: openai, anthropic, gemini
+upstreams:
+  local:
+    type: openai
+    base_url: "http://localhost:8000/v1"
+    api_key: "omlx"
+    timeout: 240s
+  openai:
+    type: openai
+    base_url: "https://api.openai.com/v1"
+    api_key: ""  # your OpenAI API key
+    timeout: 120s
+  anthropic:
+    type: anthropic
+    api_key: ""  # your Anthropic API key
+    timeout: 120s
+  gemini:
+    type: gemini
+    api_key: ""  # your Gemini API key
+    timeout: 120s
+
+# Each agent role selects its own upstream + model.
+# No fallback — if the API fails, the user is notified.
 model:
-  base_url: "http://localhost:8000/v1"
-  model_name: "gemma-4-27b"
-  transcription_model: "whisper-large-v3-turbo"
-  api_key: ""
-  max_tokens: 4096
-  timeout: 120s
+  orchestrator:
+    upstream: anthropic
+    model_name: "claude-haiku-4-5"
+    max_tokens: 4096
+    # Alternative orchestrators:
+    # upstream: openai
+    # model_name: "gpt-5.4"
+    # upstream: gemini
+    # model_name: "gemini-2.5-flash"
+  synthesizer:
+    upstream: gemini
+    model_name: "gemini-2.5-flash-lite"
+    max_tokens: 32768
+  transcription:
+    upstream: local
+    model_name: "whisper-large-v3"
 
 database:
   dsn: "postgres://argus:argus@localhost:5432/argus?sslmode=disable"
 
 agent:
   max_iterations: 10
-  context_window: 20
-  skills_dir: ".skills"
+  context_window: 20                  # synthesizer history window
+  orchestrator_context_window: 10     # orchestrator history (smaller to save tokens)
   skill_rescan: 30s
-  system_prompt: "You are Argus, a personal assistant. You have memory, can use tools, and help users with various tasks. Be concise, accurate, and helpful. Respond in the user's language."
+
+search:
+  tavily_api_key: ""  # optional, falls back to DuckDuckGo
+  include_answer: true
+  max_results: 5
 
 embedding:
-  enabled: false           # set true when embedding model is available
-  model_name: "nomic-embed-text"
+  enabled: true
+  upstream: local
+  model_name: "modernbert-embed-base"
   batch_size: 32
   interval: 2s
 
 sandbox:
   type: local             # "local" for dev, "docker" for production
-  image: argus-sandbox    # docker image name (used when type=docker)
+  image: argus-sandbox
   timeout: 30s
   memory_limit: "512m"    # docker only
   network: "none"         # docker only
@@ -41,8 +80,8 @@ sandbox:
 cron:
   jobs: []
   # Example:
-  # - name: "daily-stock-analysis"
+  # - name: "daily-summary"
   #   hour: 9
   #   minute: 0
   #   chat_id: "p2p:ou_xxxxxxxx"
-  #   prompt: "请分析今日A股市场走势，给出简要总结。"
+  #   prompt: "总结一下今天的日程安排。"

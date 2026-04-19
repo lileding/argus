@@ -379,7 +379,10 @@ func (c *GeminiClient) buildRequest(messages []Message, tools []ToolDef) geminiR
 			if respData == nil {
 				respData = map[string]any{"result": text}
 			}
-			name := msg.ToolCallID
+			name := msg.ToolName
+			if name == "" {
+				name = msg.ToolCallID // fallback to call ID
+			}
 			if name == "" {
 				name = "tool"
 			}

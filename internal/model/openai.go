@@ -42,13 +42,14 @@ func NewOpenAIClient(cfg config.ModelConfig) *OpenAIClient {
 // NewOpenAIClientFromUpstream creates a client from upstream + role config.
 func NewOpenAIClientFromUpstream(up config.UpstreamConfig, role config.RoleConfig) *OpenAIClient {
 	return &OpenAIClient{
-		baseURL:          up.BaseURL,
-		apiKey:           up.APIKey,
-		modelName:        role.ModelName,
-		maxTokens:        role.MaxTokens,
-		maxReplyTokens:   role.MaxTokens,
-		useNewTokenField: strings.Contains(up.BaseURL, "api.openai.com"),
-		client:           &http.Client{Timeout: up.Timeout},
+		baseURL:            up.BaseURL,
+		apiKey:             up.APIKey,
+		modelName:          role.ModelName,
+		transcriptionModel: role.ModelName, // for Whisper: model_name IS the transcription model
+		maxTokens:          role.MaxTokens,
+		maxReplyTokens:     role.MaxTokens,
+		useNewTokenField:   strings.Contains(up.BaseURL, "api.openai.com"),
+		client:             &http.Client{Timeout: up.Timeout},
 	}
 }
 

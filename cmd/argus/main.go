@@ -177,15 +177,13 @@ func runServer(cfg *config.Config) {
 		defer db.Close()
 	}
 
-	// Build model clients for each role (orchestrator, synthesizer, fallback, transcription).
-	orchClient, synthClient, fbClient, transClient, err := model.NewClientsForAgent(ctx, cfg.Upstreams, cfg.Model)
+	// Build model clients (orchestrator, synthesizer, transcription).
+	// No fallback — errors are returned directly to the user.
+	orchClient, synthClient, transClient, err := model.NewClientsForAgent(ctx, cfg.Upstreams, cfg.Model)
 	if err != nil {
 		slog.Error("create model clients", "err", err)
 		os.Exit(1)
 	}
-	// Wrap orchestrator and synthesizer with fallback.
-	orchWithFallback := model.NewFallbackClient(orchClient, fbClient)
-	synthWithFallback := model.NewFallbackClient(synthClient, fbClient)
 
 	// Embedding client uses its own upstream (default: "local").
 	var embedClient *embedding.Client
@@ -213,7 +211,7 @@ func runServer(cfg *config.Config) {
 
 	sb := buildSandbox(cfg)
 	toolReg := buildToolRegistry(cfg, sb, loader, db, st)
-	ag := agent.New(orchWithFallback, synthWithFallback, st, toolReg, loader.Index(), embedClient, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.OrchestratorContextWindow, cfg.Agent.MaxIterations)
+	ag := agent.New(orchClient, synthClient, st, toolReg, loader.Index(), embedClient, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.OrchestratorContextWindow, cfg.Agent.MaxIterations)
 
 	feishuClient := feishu.NewClient(cfg.Feishu)
 	processor := render.NewProcessor(feishuClient)
@@ -243,7 +241,7 @@ func runServer(cfg *config.Config) {
 	defer dispatcher.Stop()
 
 	// Handler: inbound (store + push + spawn media goroutine).
-	handler := feishu.NewHandler(feishuClient, cfg.Feishu, cfg.Agent.WorkspaceDir, qs, dispatcher, transClient, transClient, docReg)
+	handler := feishu.NewHandler(feishuClient, cfg.Feishu, cfg.Agent.WorkspaceDir, qs, dispatcher, transClient, orchClient, docReg)
 
 	// Crash recovery: re-queue interrupted messages.
 	dispatcher.Recover(ctx, func(msg *store.StoredMessage, readyCh chan struct{}) {

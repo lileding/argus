@@ -77,9 +77,8 @@ type RoleConfig struct {
 // ModelConfig holds per-role model selection.
 // Upstreams are defined at Config level, not here.
 type ModelConfig struct {
-	Orchestrator RoleConfig                `yaml:"orchestrator"`
-	Synthesizer  RoleConfig                `yaml:"synthesizer"`
-	Fallback     RoleConfig                `yaml:"fallback"`
+	Orchestrator  RoleConfig               `yaml:"orchestrator"`
+	Synthesizer   RoleConfig               `yaml:"synthesizer"`
 	Transcription RoleConfig               `yaml:"transcription"`
 
 	// Legacy fields (still supported for backward compatibility)
@@ -172,9 +171,6 @@ func (c *Config) applyDefaults() {
 		if c.Model.Synthesizer.Upstream == "" {
 			c.Model.Synthesizer = RoleConfig{Upstream: "default", ModelName: modelName, MaxTokens: maxReplyTokens}
 		}
-		if c.Model.Fallback.Upstream == "" {
-			c.Model.Fallback = RoleConfig{Upstream: "default", ModelName: modelName, MaxTokens: maxTokens}
-		}
 		if c.Model.Transcription.Upstream == "" {
 			transModel := c.Model.TranscriptionModel
 			if transModel == "" {
@@ -195,9 +191,6 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Model.Synthesizer.MaxTokens == 0 {
 		c.Model.Synthesizer.MaxTokens = 16384
-	}
-	if c.Model.Fallback.MaxTokens == 0 {
-		c.Model.Fallback.MaxTokens = 4096
 	}
 	if c.Agent.MaxIterations == 0 {
 		c.Agent.MaxIterations = 10

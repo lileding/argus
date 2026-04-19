@@ -377,7 +377,7 @@ func (a *Agent) runOrchestrator(
 					Result: truncateResult(s.errMsg, 200), FullResult: s.errMsg,
 					IsError: true, Iteration: i, Seq: resultSeq,
 				}}
-				messages = append(messages, model.Message{Role: model.RoleTool, Content: s.errMsg, ToolCallID: s.tc.ID})
+				messages = append(messages, model.Message{Role: model.RoleTool, Content: s.errMsg, ToolCallID: s.tc.ID, ToolName: s.tc.Function.Name})
 			} else {
 				ch <- Event{Type: EventToolResult, Payload: ToolResultPayload{
 					Name: s.tc.Function.Name, CallID: s.tc.ID,
@@ -392,7 +392,7 @@ func (a *Agent) runOrchestrator(
 					Arguments: s.tc.Function.Arguments,
 					Result:    s.result,
 				})
-				messages = append(messages, model.Message{Role: model.RoleTool, Content: s.result, ToolCallID: s.tc.ID})
+				messages = append(messages, model.Message{Role: model.RoleTool, Content: s.result, ToolCallID: s.tc.ID, ToolName: s.tc.Function.Name})
 			}
 			resultSeq++
 		}
@@ -448,13 +448,14 @@ func (a *Agent) runSynthesizer(
 		materials.WriteString("(No tool results — answer from conversation context alone.)\n")
 	}
 
-	// Messages: system + history + user + materials.
+	// Messages: system + history + user + materials (as user, not system —
+	// Anthropic/Gemini only support one system message).
 	messages := make([]model.Message, 0, len(history)+3)
 	messages = append(messages, model.Message{Role: model.RoleSystem, Content: sysPrompt})
 	messages = append(messages, history...)
 	userMsg.Role = model.RoleUser
 	messages = append(messages, userMsg)
-	messages = append(messages, model.Message{Role: model.RoleSystem, Content: materials.String()})
+	messages = append(messages, model.Message{Role: model.RoleUser, Content: materials.String()})
 
 	slog.Info("synthesizer call", "materials_len", materials.Len(), "history_len", len(history))
 

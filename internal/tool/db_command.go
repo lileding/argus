@@ -148,15 +148,21 @@ func parseCreate(rest string) (*DBCommand, error) {
 	if err := json.Unmarshal([]byte(jsonStr), &cols); err != nil {
 		return nil, parseErr(fmt.Sprintf("invalid column definitions: %v", err), `create food_log {"name": "text!", "value": "number"}`)
 	}
-	// Validate column names and types.
+	// Normalize column names to lowercase and validate.
+	normalized := make(map[string]string, len(cols))
 	for name, typ := range cols {
-		if err := validateIdentifier(strings.ToLower(name), "column"); err != nil {
+		lower := strings.ToLower(name)
+		if err := validateIdentifier(lower, "column"); err != nil {
 			return nil, err
 		}
+		normalized[lower] = typ
+	}
+	cols = normalized
+	for col, typ := range cols {
 		base := strings.TrimSuffix(typ, "!")
 		if !isValidType(base) {
 			return nil, parseErr(
-				fmt.Sprintf("invalid type %q for column %q", base, name),
+				fmt.Sprintf("invalid type %q for column %q", base, col),
 				"valid types: text, number, date, boolean, timestamp, json",
 			)
 		}
