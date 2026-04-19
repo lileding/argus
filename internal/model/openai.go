@@ -22,6 +22,7 @@ type OpenAIClient struct {
 	transcriptionModel string
 	maxTokens          int // Phase 1 (orchestrator)
 	maxReplyTokens     int // Phase 2 (synthesizer)
+	useNewTokenField   bool // true = max_completion_tokens (GPT-5.x), false = max_tokens (local/legacy)
 	client             *http.Client
 }
 
@@ -41,12 +42,13 @@ func NewOpenAIClient(cfg config.ModelConfig) *OpenAIClient {
 // NewOpenAIClientFromUpstream creates a client from upstream + role config.
 func NewOpenAIClientFromUpstream(up config.UpstreamConfig, role config.RoleConfig) *OpenAIClient {
 	return &OpenAIClient{
-		baseURL:        up.BaseURL,
-		apiKey:         up.APIKey,
-		modelName:      role.ModelName,
-		maxTokens:      role.MaxTokens,
-		maxReplyTokens: role.MaxTokens, // same for non-synthesizer; factory sets correct value
-		client:         &http.Client{Timeout: up.Timeout},
+		baseURL:          up.BaseURL,
+		apiKey:           up.APIKey,
+		modelName:        role.ModelName,
+		maxTokens:        role.MaxTokens,
+		maxReplyTokens:   role.MaxTokens,
+		useNewTokenField: strings.Contains(up.BaseURL, "api.openai.com"),
+		client:           &http.Client{Timeout: up.Timeout},
 	}
 }
 
@@ -57,8 +59,18 @@ type chatRequest struct {
 	Messages            []Message `json:"messages"`
 	Tools               []ToolDef `json:"tools,omitempty"`
 	MaxTokens           int       `json:"max_tokens,omitempty"`
-	MaxCompletionTokens int       `json:"max_completion_tokens,omitempty"` // newer OpenAI models (GPT-5.x, o-series)
+	MaxCompletionTokens int       `json:"max_completion_tokens,omitempty"`
 	Stream              bool      `json:"stream,omitempty"`
+}
+
+func (c *OpenAIClient) newRequest(tokens int, stream bool) chatRequest {
+	req := chatRequest{Model: c.modelName, Stream: stream}
+	if c.useNewTokenField {
+		req.MaxCompletionTokens = tokens
+	} else {
+		req.MaxTokens = tokens
+	}
+	return req
 }
 
 type chatResponse struct {
@@ -84,12 +96,8 @@ type apiError struct {
 }
 
 func (c *OpenAIClient) Chat(ctx context.Context, messages []Message, tools []ToolDef) (*Response, error) {
-	reqBody := chatRequest{
-		Model:               c.modelName,
-		Messages:            messages,
-		MaxTokens:           c.maxTokens,
-		MaxCompletionTokens: c.maxTokens,
-	}
+	reqBody := c.newRequest(c.maxTokens, false)
+	reqBody.Messages = messages
 	if len(tools) > 0 {
 		reqBody.Tools = tools
 	}
@@ -158,13 +166,8 @@ func (c *OpenAIClient) Chat(ctx context.Context, messages []Message, tools []Too
 // When the model does call tools, the stream is consumed fully and a complete
 // Response (with ToolCalls) is returned — same as Chat().
 func (c *OpenAIClient) ChatWithEarlyAbort(ctx context.Context, messages []Message, tools []ToolDef, maxTextTokens int) (*Response, error) {
-	reqBody := chatRequest{
-		Model:               c.modelName,
-		Messages:            messages,
-		MaxTokens:           c.maxTokens,
-		MaxCompletionTokens: c.maxTokens,
-		Stream:              true,
-	}
+	reqBody := c.newRequest(c.maxTokens, true)
+	reqBody.Messages = messages
 	if len(tools) > 0 {
 		reqBody.Tools = tools
 	}
@@ -312,13 +315,8 @@ func (c *OpenAIClient) ChatWithEarlyAbort(ctx context.Context, messages []Messag
 func (c *OpenAIClient) ChatStream(ctx context.Context, messages []Message, tools []ToolDef) (<-chan StreamChunk, error) {
 	// Phase 2 (synthesizer) uses maxReplyTokens — typically much larger
 	// than maxTokens to allow long final replies.
-	reqBody := chatRequest{
-		Model:               c.modelName,
-		Messages:            messages,
-		MaxTokens:           c.maxReplyTokens,
-		MaxCompletionTokens: c.maxReplyTokens,
-		Stream:              true,
-	}
+	reqBody := c.newRequest(c.maxReplyTokens, true)
+	reqBody.Messages = messages
 	if len(tools) > 0 {
 		reqBody.Tools = tools
 	}

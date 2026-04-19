@@ -30,6 +30,7 @@ type SearchConfig struct {
 
 type EmbeddingConfig struct {
 	Enabled   bool          `yaml:"enabled"`
+	Upstream  string        `yaml:"upstream"`   // which upstream to use (default: "local")
 	ModelName string        `yaml:"model_name"`
 	BatchSize int           `yaml:"batch_size"`
 	Interval  time.Duration `yaml:"interval"`
@@ -218,6 +219,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Agent.SkillRescan == 0 {
 		c.Agent.SkillRescan = 30 * time.Second
+	}
+	if c.Embedding.Upstream == "" {
+		c.Embedding.Upstream = "local"
 	}
 	if c.Search.MaxResults == 0 {
 		c.Search.MaxResults = 5

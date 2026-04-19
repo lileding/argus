@@ -187,12 +187,11 @@ func runServer(cfg *config.Config) {
 	orchWithFallback := model.NewFallbackClient(orchClient, fbClient)
 	synthWithFallback := model.NewFallbackClient(synthClient, fbClient)
 
-	// Embedding client (shared by worker and agent for query embedding).
-	// Use the fallback upstream's config for embedding (typically local).
+	// Embedding client uses its own upstream (default: "local").
 	var embedClient *embedding.Client
 	if cfg.Embedding.Enabled {
-		fallbackUp := cfg.Upstreams[cfg.Model.Fallback.Upstream]
-		embedClient = embedding.NewClient(fallbackUp.BaseURL, fallbackUp.APIKey, cfg.Embedding.ModelName)
+		embedUp := cfg.Upstreams[cfg.Embedding.Upstream]
+		embedClient = embedding.NewClient(embedUp.BaseURL, embedUp.APIKey, cfg.Embedding.ModelName)
 
 		// Start background embedding worker if store supports it.
 		if ss, ok := st.(store.SemanticStore); ok {
