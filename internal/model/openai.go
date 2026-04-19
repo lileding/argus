@@ -53,11 +53,12 @@ func NewOpenAIClientFromUpstream(up config.UpstreamConfig, role config.RoleConfi
 // openAI request/response types for the chat completions API.
 
 type chatRequest struct {
-	Model     string    `json:"model"`
-	Messages  []Message `json:"messages"`
-	Tools     []ToolDef `json:"tools,omitempty"`
-	MaxTokens int       `json:"max_tokens,omitempty"`
-	Stream    bool      `json:"stream,omitempty"`
+	Model               string    `json:"model"`
+	Messages            []Message `json:"messages"`
+	Tools               []ToolDef `json:"tools,omitempty"`
+	MaxTokens           int       `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int       `json:"max_completion_tokens,omitempty"` // newer OpenAI models (GPT-5.x, o-series)
+	Stream              bool      `json:"stream,omitempty"`
 }
 
 type chatResponse struct {
@@ -84,9 +85,10 @@ type apiError struct {
 
 func (c *OpenAIClient) Chat(ctx context.Context, messages []Message, tools []ToolDef) (*Response, error) {
 	reqBody := chatRequest{
-		Model:     c.modelName,
-		Messages:  messages,
-		MaxTokens: c.maxTokens,
+		Model:               c.modelName,
+		Messages:            messages,
+		MaxTokens:           c.maxTokens,
+		MaxCompletionTokens: c.maxTokens,
 	}
 	if len(tools) > 0 {
 		reqBody.Tools = tools
@@ -157,10 +159,11 @@ func (c *OpenAIClient) Chat(ctx context.Context, messages []Message, tools []Too
 // Response (with ToolCalls) is returned — same as Chat().
 func (c *OpenAIClient) ChatWithEarlyAbort(ctx context.Context, messages []Message, tools []ToolDef, maxTextTokens int) (*Response, error) {
 	reqBody := chatRequest{
-		Model:     c.modelName,
-		Messages:  messages,
-		MaxTokens: c.maxTokens,
-		Stream:    true,
+		Model:               c.modelName,
+		Messages:            messages,
+		MaxTokens:           c.maxTokens,
+		MaxCompletionTokens: c.maxTokens,
+		Stream:              true,
 	}
 	if len(tools) > 0 {
 		reqBody.Tools = tools
@@ -310,10 +313,11 @@ func (c *OpenAIClient) ChatStream(ctx context.Context, messages []Message, tools
 	// Phase 2 (synthesizer) uses maxReplyTokens — typically much larger
 	// than maxTokens to allow long final replies.
 	reqBody := chatRequest{
-		Model:     c.modelName,
-		Messages:  messages,
-		MaxTokens: c.maxReplyTokens,
-		Stream:    true,
+		Model:               c.modelName,
+		Messages:            messages,
+		MaxTokens:           c.maxReplyTokens,
+		MaxCompletionTokens: c.maxReplyTokens,
+		Stream:              true,
 	}
 	if len(tools) > 0 {
 		reqBody.Tools = tools

@@ -94,6 +94,17 @@ type ToolCall struct {
 	Function FunctionCall `json:"function"`
 }
 
+// MarshalJSON ensures Type is always "function" (never empty string).
+// Some providers (GPT-5.x) reject empty type values.
+func (tc ToolCall) MarshalJSON() ([]byte, error) {
+	type alias ToolCall
+	t := alias(tc)
+	if t.Type == "" {
+		t.Type = "function"
+	}
+	return json.Marshal(t)
+}
+
 type FunctionCall struct {
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"`
