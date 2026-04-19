@@ -10,49 +10,47 @@ import (
 	"google.golang.org/genai"
 )
 
-// vertexClient implements Client for all models on Vertex AI (Gemini, Claude, etc.)
-// using the unified GenerateContent API via the Google GenAI SDK.
-type vertexClient struct {
+// GeminiClient implements Client using Google's Gemini API.
+type GeminiClient struct {
 	client    *genai.Client
 	modelName string
 	maxTokens int
 }
 
-func newVertexClient(ctx context.Context, project, location, modelName string, maxTokens int) (Client, error) {
+func NewGeminiClient(ctx context.Context, apiKey, modelName string, maxTokens int) (*GeminiClient, error) {
 	client, err := genai.NewClient(ctx, &genai.ClientConfig{
-		Backend:  genai.BackendVertexAI,
-		Project:  project,
-		Location: location,
+		Backend: genai.BackendGeminiAPI,
+		APIKey:  apiKey,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("create vertex client: %w", err)
+		return nil, fmt.Errorf("create gemini client: %w", err)
 	}
-	return &vertexClient{
+	return &GeminiClient{
 		client:    client,
 		modelName: modelName,
 		maxTokens: maxTokens,
 	}, nil
 }
 
-func (c *vertexClient) Chat(ctx context.Context, messages []Message, tools []ToolDef) (*Response, error) {
+func (c *GeminiClient) Chat(ctx context.Context, messages []Message, tools []ToolDef) (*Response, error) {
 	config, history, userParts := c.prepare(messages, tools)
 	chat, err := c.client.Chats.Create(ctx, c.modelName, config, history)
 	if err != nil {
-		return nil, fmt.Errorf("vertex create chat: %w", err)
+		return nil, fmt.Errorf("gemini create chat: %w", err)
 	}
 
 	resp, err := chat.SendMessage(ctx, userParts...)
 	if err != nil {
-		return nil, fmt.Errorf("vertex chat: %w", err)
+		return nil, fmt.Errorf("gemini chat: %w", err)
 	}
 	return c.convertResponse(resp), nil
 }
 
-func (c *vertexClient) ChatStream(ctx context.Context, messages []Message, tools []ToolDef) (<-chan StreamChunk, error) {
+func (c *GeminiClient) ChatStream(ctx context.Context, messages []Message, tools []ToolDef) (<-chan StreamChunk, error) {
 	config, history, userParts := c.prepare(messages, tools)
 	chat, err := c.client.Chats.Create(ctx, c.modelName, config, history)
 	if err != nil {
-		return nil, fmt.Errorf("vertex create chat: %w", err)
+		return nil, fmt.Errorf("gemini create chat: %w", err)
 	}
 
 	ch := make(chan StreamChunk, 32)
@@ -61,7 +59,7 @@ func (c *vertexClient) ChatStream(ctx context.Context, messages []Message, tools
 		var usage Usage
 		for resp, err := range chat.SendMessageStream(ctx, userParts...) {
 			if err != nil {
-				ch <- StreamChunk{Done: true, Err: fmt.Errorf("vertex stream: %w", err), Usage: usage}
+				ch <- StreamChunk{Done: true, Err: fmt.Errorf("gemini stream: %w", err), Usage: usage}
 				return
 			}
 			if len(resp.Candidates) > 0 && resp.Candidates[0].Content != nil {
@@ -81,11 +79,11 @@ func (c *vertexClient) ChatStream(ctx context.Context, messages []Message, tools
 	return ch, nil
 }
 
-func (c *vertexClient) ChatWithEarlyAbort(ctx context.Context, messages []Message, tools []ToolDef, maxTextTokens int) (*Response, error) {
+func (c *GeminiClient) ChatWithEarlyAbort(ctx context.Context, messages []Message, tools []ToolDef, maxTextTokens int) (*Response, error) {
 	config, history, userParts := c.prepare(messages, tools)
 	chat, err := c.client.Chats.Create(ctx, c.modelName, config, history)
 	if err != nil {
-		return nil, fmt.Errorf("vertex create chat: %w", err)
+		return nil, fmt.Errorf("gemini create chat: %w", err)
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -100,7 +98,7 @@ func (c *vertexClient) ChatWithEarlyAbort(ctx context.Context, messages []Messag
 			if content.Len() > 0 || len(functionCalls) > 0 {
 				break
 			}
-			return nil, fmt.Errorf("vertex stream: %w", err)
+			return nil, fmt.Errorf("gemini stream: %w", err)
 		}
 
 		if len(resp.Candidates) > 0 && resp.Candidates[0].Content != nil {
@@ -134,7 +132,7 @@ func (c *vertexClient) ChatWithEarlyAbort(ctx context.Context, messages []Messag
 
 		// Early abort: too much text, no tool calls.
 		if len(functionCalls) == 0 && content.Len()/4 > maxTextTokens {
-			slog.Info("vertex early abort", "tokens_estimate", content.Len()/4, "max", maxTextTokens)
+			slog.Info("gemini early abort", "tokens_estimate", content.Len()/4, "max", maxTextTokens)
 			cancel()
 			return &Response{
 				Content:      content.String(),
@@ -157,13 +155,13 @@ func (c *vertexClient) ChatWithEarlyAbort(ctx context.Context, messages []Messag
 	}, nil
 }
 
-func (c *vertexClient) Transcribe(_ context.Context, _ []byte, _ string) (*TranscriptionResult, error) {
-	return nil, fmt.Errorf("vertex_ai does not support transcription (use openai upstream with Whisper)")
+func (c *GeminiClient) Transcribe(_ context.Context, _ []byte, _ string) (*TranscriptionResult, error) {
+	return nil, fmt.Errorf("gemini does not support transcription (use openai upstream with Whisper)")
 }
 
 // --- Internal helpers ---
 
-func (c *vertexClient) prepare(messages []Message, tools []ToolDef) (*genai.GenerateContentConfig, []*genai.Content, []genai.Part) {
+func (c *GeminiClient) prepare(messages []Message, tools []ToolDef) (*genai.GenerateContentConfig, []*genai.Content, []genai.Part) {
 	config := &genai.GenerateContentConfig{
 		MaxOutputTokens: int32(c.maxTokens),
 	}
@@ -241,7 +239,7 @@ func (c *vertexClient) prepare(messages []Message, tools []ToolDef) (*genai.Gene
 	return config, history, userParts
 }
 
-func (c *vertexClient) convertResponse(resp *genai.GenerateContentResponse) *Response {
+func (c *GeminiClient) convertResponse(resp *genai.GenerateContentResponse) *Response {
 	result := &Response{FinishReason: "stop"}
 
 	if resp.UsageMetadata != nil {

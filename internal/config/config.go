@@ -60,12 +60,10 @@ type FeishuConfig struct {
 
 // UpstreamConfig defines a model provider backend.
 type UpstreamConfig struct {
-	Type     string        `yaml:"type"`      // "openai" or "vertex_ai"
-	BaseURL  string        `yaml:"base_url"`  // openai only
-	APIKey   string        `yaml:"api_key"`   // openai / anthropic direct
-	Project  string        `yaml:"project"`   // vertex_ai only
-	Location string        `yaml:"location"`  // vertex_ai only
-	Timeout  time.Duration `yaml:"timeout"`
+	Type    string        `yaml:"type"`    // "openai", "anthropic", or "gemini"
+	BaseURL string        `yaml:"base_url"` // openai only
+	APIKey  string        `yaml:"api_key"`  // openai / anthropic / gemini
+	Timeout time.Duration `yaml:"timeout"`
 }
 
 // RoleConfig selects an upstream + model for a specific agent role.

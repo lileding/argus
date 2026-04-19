@@ -25,13 +25,13 @@ func NewClientFromConfig(ctx context.Context, upstreams map[string]config.Upstre
 		)
 		return client, nil
 
-	case "vertex_ai":
-		client, err := NewVertexAIClient(ctx, up.Project, up.Location, role.ModelName, role.MaxTokens)
+	case "gemini":
+		client, err := NewGeminiClient(ctx, up.APIKey, role.ModelName, role.MaxTokens)
 		if err != nil {
-			return nil, fmt.Errorf("vertex_ai client for %q: %w", role.ModelName, err)
+			return nil, fmt.Errorf("gemini client for %q: %w", role.ModelName, err)
 		}
 		slog.Info("model client created",
-			"upstream", role.Upstream, "type", "vertex_ai",
+			"upstream", role.Upstream, "type", "gemini",
 			"model", role.ModelName, "max_tokens", role.MaxTokens,
 		)
 		return client, nil
