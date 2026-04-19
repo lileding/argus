@@ -215,7 +215,7 @@ func runServer(cfg *config.Config) {
 	}
 
 	// Build model clients for each role (orchestrator, synthesizer, fallback, transcription).
-	orchClient, synthClient, fbClient, transClient, err := model.NewClientsForAgent(ctx, cfg.Model)
+	orchClient, synthClient, fbClient, transClient, err := model.NewClientsForAgent(ctx, cfg.Upstreams, cfg.Model)
 	if err != nil {
 		slog.Error("create model clients", "err", err)
 		os.Exit(1)
@@ -228,7 +228,7 @@ func runServer(cfg *config.Config) {
 	// Use the fallback upstream's config for embedding (typically local).
 	var embedClient *embedding.Client
 	if cfg.Embedding.Enabled {
-		fallbackUp := cfg.Model.Upstreams[cfg.Model.Fallback.Upstream]
+		fallbackUp := cfg.Upstreams[cfg.Model.Fallback.Upstream]
 		embedClient = embedding.NewClient(fallbackUp.BaseURL, fallbackUp.APIKey, cfg.Embedding.ModelName)
 
 		// Start background embedding worker if store supports it.

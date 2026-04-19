@@ -9,15 +9,16 @@ import (
 )
 
 type Config struct {
-	Server    ServerConfig    `yaml:"server"`
-	Feishu    FeishuConfig    `yaml:"feishu"`
-	Model     ModelConfig     `yaml:"model"`
-	Database  DatabaseConfig  `yaml:"database"`
-	Agent     AgentConfig     `yaml:"agent"`
-	Sandbox   SandboxConfig   `yaml:"sandbox"`
-	Embedding EmbeddingConfig `yaml:"embedding"`
-	Search    SearchConfig    `yaml:"search"`
-	Cron      CronConfig      `yaml:"cron"`
+	Server    ServerConfig                 `yaml:"server"`
+	Feishu    FeishuConfig                 `yaml:"feishu"`
+	Upstreams map[string]UpstreamConfig    `yaml:"upstreams"` // top-level upstream definitions
+	Model     ModelConfig                  `yaml:"model"`
+	Database  DatabaseConfig               `yaml:"database"`
+	Agent     AgentConfig                  `yaml:"agent"`
+	Sandbox   SandboxConfig                `yaml:"sandbox"`
+	Embedding EmbeddingConfig              `yaml:"embedding"`
+	Search    SearchConfig                 `yaml:"search"`
+	Cron      CronConfig                   `yaml:"cron"`
 }
 
 type SearchConfig struct {
@@ -74,11 +75,9 @@ type RoleConfig struct {
 	MaxTokens int    `yaml:"max_tokens"`
 }
 
-// ModelConfig holds the multi-backend model configuration.
-// Supports both legacy (flat) and new (upstreams + roles) format.
+// ModelConfig holds per-role model selection.
+// Upstreams are defined at Config level, not here.
 type ModelConfig struct {
-	// New: upstream map + per-role config
-	Upstreams    map[string]UpstreamConfig `yaml:"upstreams"`
 	Orchestrator RoleConfig                `yaml:"orchestrator"`
 	Synthesizer  RoleConfig                `yaml:"synthesizer"`
 	Fallback     RoleConfig                `yaml:"fallback"`
@@ -138,7 +137,7 @@ func (c *Config) applyDefaults() {
 	}
 	// Legacy config migration: if no upstreams defined but legacy fields exist,
 	// create a "default" upstream from the legacy fields.
-	if len(c.Model.Upstreams) == 0 {
+	if len(c.Upstreams) == 0 {
 		baseURL := c.Model.BaseURL
 		if baseURL == "" {
 			baseURL = "http://localhost:11434/v1"
@@ -147,7 +146,7 @@ func (c *Config) applyDefaults() {
 		if timeout == 0 {
 			timeout = 120 * time.Second
 		}
-		c.Model.Upstreams = map[string]UpstreamConfig{
+		c.Upstreams = map[string]UpstreamConfig{
 			"default": {
 				Type:    "openai",
 				BaseURL: baseURL,
@@ -185,10 +184,10 @@ func (c *Config) applyDefaults() {
 		}
 	}
 	// Apply defaults for new-style config missing individual role fields.
-	for name, up := range c.Model.Upstreams {
+	for name, up := range c.Upstreams {
 		if up.Timeout == 0 {
 			up.Timeout = 120 * time.Second
-			c.Model.Upstreams[name] = up
+			c.Upstreams[name] = up
 		}
 	}
 	if c.Model.Orchestrator.MaxTokens == 0 {

@@ -42,24 +42,23 @@ func NewClientFromConfig(ctx context.Context, upstreams map[string]config.Upstre
 }
 
 // NewClientsForAgent creates orchestrator + synthesizer + fallback clients.
-// Returns (orchestrator, synthesizer, fallback, transcriptionClient, error).
-func NewClientsForAgent(ctx context.Context, cfg config.ModelConfig) (orchestrator, synthesizer, fallback, transcription Client, err error) {
-	orchestrator, err = NewClientFromConfig(ctx, cfg.Upstreams, cfg.Orchestrator)
+func NewClientsForAgent(ctx context.Context, upstreams map[string]config.UpstreamConfig, model config.ModelConfig) (orchestrator, synthesizer, fallback, transcription Client, err error) {
+	orchestrator, err = NewClientFromConfig(ctx, upstreams, model.Orchestrator)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("orchestrator: %w", err)
 	}
 
-	synthesizer, err = NewClientFromConfig(ctx, cfg.Upstreams, cfg.Synthesizer)
+	synthesizer, err = NewClientFromConfig(ctx, upstreams, model.Synthesizer)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("synthesizer: %w", err)
 	}
 
-	fallback, err = NewClientFromConfig(ctx, cfg.Upstreams, cfg.Fallback)
+	fallback, err = NewClientFromConfig(ctx, upstreams, model.Fallback)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("fallback: %w", err)
 	}
 
-	transcription, err = NewClientFromConfig(ctx, cfg.Upstreams, cfg.Transcription)
+	transcription, err = NewClientFromConfig(ctx, upstreams, model.Transcription)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("transcription: %w", err)
 	}
