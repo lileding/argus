@@ -120,8 +120,10 @@ into two narrow roles dramatically improves reliability:
   the orchestrator's summary. No tools are available — it must work from
   what Phase 1 gathered.
 
-Both phases use the same model; the difference is purely the system prompt
-and the tool list (empty for Phase 2).
+Both phases share the same conversation/material pipeline, but may use
+different role-specific model clients (e.g. Claude for orchestration,
+Gemini for synthesis). The difference is the system prompt, the tool list
+(empty for Phase 2), and potentially the upstream provider.
 
 ### Tool vs Sandbox Orthogonality
 
@@ -198,14 +200,40 @@ The transcription prompt includes hints for:
   Prokofiev 普罗科菲耶夫, Rachmaninoff 拉赫玛尼诺夫, …). Paired translit
   helps Whisper disambiguate proper names across languages.
 
-Every transcription is post-processed by the main LLM to add punctuation and fix misheard words. The raw and corrected text are both logged for debugging.
+Low-confidence transcriptions (avg_logprob < -0.15) are post-processed by
+the orchestrator LLM to add punctuation and fix misheard terms. High-
+confidence transcriptions skip this step (~5-10s savings). When correction
+occurs, both raw and corrected text are logged for debugging.
 
-### Document RAG
+### Document RAG (Personal Knowledge Base)
 
 Non-image files (PDF, docx, etc.) go through the `docindex` ingester:
 download → extract text via sandbox CLI (`pdftotext`, `pandoc`) → chunk →
-embed each chunk → store in `chunks` table with pgvector index. The model
-can semantically search ingested documents via the agent's semantic recall.
+embed each chunk → store in `chunks` table with pgvector index.
+
+Retrieval happens through two complementary paths:
+
+1. **Passive recall.** The harness's `curateHistory` embeds the current
+   message and searches chunk embeddings via pgvector. Only chunks above
+   a similarity threshold (0.35) are injected, with a total byte budget
+   (4 KB) to prevent context pollution. When the knowledge base grows
+   large, low-relevance chunks are silently dropped — the Orchestrator
+   can always use `search_docs` for explicit retrieval.
+
+2. **Active retrieval.** The Orchestrator has two tools for on-demand
+   document access:
+   - `list_docs` — lists all documents (ready, pending, processing, error)
+     with chunk count and status. Shows errors for failed ingestions to
+     help users troubleshoot.
+   - `search_docs` — semantic search over chunks. Accepts a `query`,
+     optional `limit` (default 5, max 20), and optional `filename` filter.
+     The query is embedded via `EmbedOne`, then matched against chunk
+     embeddings. When `filename` is specified, the tool over-fetches 5×
+     and filters in Go (simpler than SQL-level filtering for small corpora).
+
+The Orchestrator prompt instructs the model to use `list_docs` → `search_docs`
+for user-uploaded documents, and explicitly prohibits reading binary files
+via `read_file` or `cli`.
 
 ---
 
@@ -530,7 +558,7 @@ skills, but the final authoring remains human-controlled.
 | `read_file` | Read file contents (anywhere in workspace) | — |
 | `write_file` | Write file (restricted to `.users/` directory) | 3/turn |
 | `cli` | Execute shell commands via sandbox | 5/turn |
-| `search` | Web search (DuckDuckGo, no API key) | 3/turn |
+| `search` | Web search (Tavily API, DuckDuckGo fallback) | 3/turn |
 | `fetch` | URL → readable text | 4/turn |
 | `current_time` | Date/time with timezone support | — |
 | `activate_skill` | Load a skill's full instructions on demand | — |
@@ -538,6 +566,8 @@ skills, but the final authoring remains human-controlled.
 | `db` | Structured data access (see below) | 6/turn |
 | `remember` | Pin a persistent memory (pgvector indexed) | 3/turn |
 | `forget` | Deactivate a pinned memory by ID | — |
+| `search_docs` | Semantic search over indexed document chunks | — |
+| `list_docs` | List all indexed documents in knowledge base | — |
 
 Removed tools: `save_skill` (skills are human-authored), `db_exec` (replaced
 by the structured `db` tool).
@@ -729,24 +759,59 @@ feishu:
   verification_token: ""
   encrypt_key: ""
 
+# Named upstream providers. Supported types: openai, anthropic, gemini.
+upstreams:
+  local:
+    type: openai
+    base_url: "http://localhost:8000/v1"
+    api_key: "omlx"
+    timeout: 240s
+  openai:
+    type: openai
+    base_url: "https://api.openai.com/v1"
+    api_key: ""
+    timeout: 120s
+  anthropic:
+    type: anthropic
+    api_key: ""
+    timeout: 120s
+  gemini:
+    type: gemini
+    api_key: ""
+    timeout: 120s
+
+# Each agent role selects its own upstream + model.
+# No fallback — if the API fails, the user is notified.
 model:
-  base_url: "http://localhost:8000/v1"
-  model_name: "Qwen3.5-35B-A3B-8bit"     # MoE; 4bit also works (trade accuracy for speed)
-  transcription_model: "whisper-large-v3"
-  api_key: "omlx"
-  max_tokens: 4096
-  timeout: 240s
+  orchestrator:
+    upstream: anthropic
+    model_name: "claude-haiku-4-5"
+    max_tokens: 4096
+  synthesizer:
+    upstream: gemini
+    model_name: "gemini-2.5-flash-lite"
+    max_tokens: 32768
+  transcription:
+    upstream: local
+    model_name: "whisper-large-v3"
 
 database:
   dsn: "postgres://argus:argus@localhost:5432/argus?sslmode=disable"
 
 agent:
   max_iterations: 10
-  context_window: 20
+  context_window: 20                  # synthesizer history window
+  orchestrator_context_window: 10     # smaller to save tokens
   skill_rescan: 30s
+
+search:
+  tavily_api_key: ""  # optional, falls back to DuckDuckGo
+  include_answer: true
+  max_results: 5
 
 embedding:
   enabled: true
+  upstream: local                     # uses its own upstream
   model_name: "modernbert-embed-base"
   batch_size: 32
   interval: 2s
@@ -761,6 +826,10 @@ sandbox:
 cron:
   jobs: []
 ```
+
+The legacy single-model format (`model.base_url`, `model.model_name`, etc.)
+is still accepted via migration in `config.Load()` for backward compatibility,
+but new deployments should use the `upstreams` + per-role `model` structure.
 
 ---
 
@@ -832,13 +901,14 @@ internal/
     registry.go              Registry with name lookup
     file.go                  read_file (workspace) + write_file (.users/ only)
     cli.go                   Shell commands (delegates to sandbox)
-    search.go                DuckDuckGo web search
+    search.go                Web search (Tavily + DuckDuckGo fallback)
     fetch.go                 URL fetcher with HTML-to-text conversion
     current_time.go          Date/time with timezone support
     db_structured.go         Structured db tool (single CLI+JSON interface)
     db_command.go            Parser, executor, validator, normalizer
     activate_skill.go        Load skill prompt on demand
     remember.go / forget.go  Pinned memory management
+    search_docs.go           Document search + list tools (knowledge base)
     finish_task.go           Sentinel tool (orchestrator exit signal)
     context.go               ChatID context key for tools
 third_party/ratex/           Embedded Rust LaTeX renderer (CGo)
@@ -857,7 +927,7 @@ third_party/ratex/           Embedded Rust LaTeX renderer (CGo)
 | Embedding | modernbert-embed-base (768 dim) via `/v1/embeddings` |
 | Database | PostgreSQL + pgvector (optional, memory store fallback) |
 | Sandbox | Local (dev) / Docker (prod) |
-| Web Search | DuckDuckGo HTML (no API key) |
+| Web Search | Tavily API (DuckDuckGo fallback when no API key) |
 | LaTeX | RaTeX (Rust, CGo-embedded) → PNG → Feishu image |
 | Output Format | Feishu interactive cards (schema 2.0, update_multi) |
 | Streaming | SSE from model → burst first 3 tokens + throttled 500ms |
@@ -891,21 +961,11 @@ third_party/ratex/           Embedded Rust LaTeX renderer (CGo)
   enter the same timeline? Be embedded for semantic recall? How to handle
   privacy / group-chat permission boundaries?
 
-- **Document RAG retrieval.** The `docindex` ingester chunks and embeds
-  uploaded files into the `chunks` table, but the agent has no explicit
-  retrieval path — `loadHistory` only searches message embeddings, not
-  chunk embeddings. Two options: (a) add chunk search to `loadHistory`
-  for automatic context injection, (b) provide a `search_documents` tool
-  for the Orchestrator. Option (b) is more controllable and avoids
-  injecting irrelevant chunks into every query.
+- ~~**Document RAG retrieval.**~~ Implemented: `search_docs` + `list_docs`
+  tools for active retrieval, plus passive chunk recall in `curateHistory`.
 
-- **Multi-modal image re-injection.** Current implementation scans
-  `.files/` and matches filenames via `strings.Contains(content, name)`.
-  This is fragile (false positives on substring matches, O(n) directory
-  scan). A cleaner approach: `ProcessMedia` populates
-  `StoredMessage.FilePaths`, and `curateHistory` re-injects images
-  strictly from that field. This also enables proper cleanup of expired
-  files and per-message attachment tracking.
+- ~~**Multi-modal image re-injection.**~~ Implemented: `StoredMessage.FilePaths`
+  populated by `ProcessMedia`, `curateHistory` re-injects from that field.
 
 ---
 

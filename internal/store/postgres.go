@@ -348,10 +348,9 @@ func (s *PostgresStore) SearchChunks(ctx context.Context, embedding []float32, l
 
 func (s *PostgresStore) ListDocuments(ctx context.Context) ([]Document, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT d.id, d.filename, d.file_path, d.status, d.created_at,
+		SELECT d.id, d.filename, d.file_path, d.status, d.error_msg, d.created_at,
 			(SELECT COUNT(*) FROM chunks c WHERE c.document_id = d.id) AS chunk_count
 		FROM documents d
-		WHERE d.status = 'ready'
 		ORDER BY d.created_at DESC
 	`)
 	if err != nil {
@@ -363,11 +362,14 @@ func (s *PostgresStore) ListDocuments(ctx context.Context) ([]Document, error) {
 	for rows.Next() {
 		var d Document
 		var chunkCount int
-		if err := rows.Scan(&d.ID, &d.Filename, &d.FilePath, &d.Status, &d.CreatedAt, &chunkCount); err != nil {
+		var errorMsg sql.NullString
+		if err := rows.Scan(&d.ID, &d.Filename, &d.FilePath, &d.Status, &errorMsg, &d.CreatedAt, &chunkCount); err != nil {
 			return nil, err
 		}
-		// Store chunk count in ErrorMsg field (reuse, not ideal but avoids schema change)
-		d.ErrorMsg = fmt.Sprintf("%d chunks", chunkCount)
+		if errorMsg.Valid {
+			d.ErrorMsg = errorMsg.String
+		}
+		d.ChunkCount = chunkCount
 		docs = append(docs, d)
 	}
 	return docs, nil

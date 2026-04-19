@@ -149,10 +149,19 @@ func (t *ListDocsTool) Execute(ctx context.Context, _ string) (string, error) {
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Indexed documents (%d):\n", len(docs)))
+	sb.WriteString(fmt.Sprintf("Documents (%d):\n", len(docs)))
 	for i, d := range docs {
-		sb.WriteString(fmt.Sprintf("%d. %s (%s, indexed %s)\n",
-			i+1, d.Filename, d.ErrorMsg, d.CreatedAt.Format("2006-01-02")))
+		switch d.Status {
+		case "ready":
+			sb.WriteString(fmt.Sprintf("%d. %s (%d chunks, indexed %s)\n",
+				i+1, d.Filename, d.ChunkCount, d.CreatedAt.Format("2006-01-02")))
+		case "error":
+			sb.WriteString(fmt.Sprintf("%d. %s (error: %s, uploaded %s)\n",
+				i+1, d.Filename, d.ErrorMsg, d.CreatedAt.Format("2006-01-02")))
+		default: // pending, processing
+			sb.WriteString(fmt.Sprintf("%d. %s (%s, uploaded %s)\n",
+				i+1, d.Filename, d.Status, d.CreatedAt.Format("2006-01-02")))
+		}
 	}
 	return sb.String(), nil
 }

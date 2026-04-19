@@ -137,13 +137,14 @@ type DocumentStore interface {
 }
 
 type Document struct {
-	ID        int64
-	Filename  string
-	FilePath  string
-	Channel   string
-	Status    string // "pending", "processing", "ready", "error"
-	ErrorMsg  string
-	CreatedAt time.Time
+	ID         int64
+	Filename   string
+	FilePath   string
+	Channel    string
+	Status     string // "pending", "processing", "ready", "error"
+	ErrorMsg   string
+	ChunkCount int    // populated by ListDocuments
+	CreatedAt  time.Time
 }
 
 type Chunk struct {

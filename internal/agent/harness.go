@@ -53,19 +53,41 @@ func (a *Agent) loadHistory(ctx context.Context, chatID string, excludeID int64,
 						}
 					}
 
-					// Search document chunks (RAG).
+					// Search document chunks (RAG) — passive recall.
+					// Only inject chunks above similarity threshold; cap total bytes
+					// to avoid polluting context with irrelevant excerpts.
 					if ds, ok := a.store.(store.DocumentStore); ok {
+						const (
+							chunkSimThreshold = 0.35 // cosine similarity minimum
+							chunkBytesBudget  = 4000 // max total bytes injected
+						)
 						chunks, err := ds.SearchChunks(ctx, queryVec, 3)
-						if err == nil && len(chunks) > 0 {
+						if err == nil {
 							var sb strings.Builder
-							sb.WriteString("[Relevant document excerpts]\n")
+							totalBytes := 0
 							for _, c := range chunks {
-								sb.WriteString(fmt.Sprintf("\n--- From: %s ---\n%s\n", c.DocFilename, c.Content))
+								if c.Similarity < chunkSimThreshold {
+									continue
+								}
+								content := c.Content
+								if totalBytes+len(content) > chunkBytesBudget {
+									content = content[:chunkBytesBudget-totalBytes]
+								}
+								if sb.Len() == 0 {
+									sb.WriteString("[Relevant document excerpts]\n")
+								}
+								sb.WriteString(fmt.Sprintf("\n--- From: %s ---\n%s\n", c.DocFilename, content))
+								totalBytes += len(content)
+								if totalBytes >= chunkBytesBudget {
+									break
+								}
 							}
-							recalled = append(recalled, model.Message{
-								Role:    model.RoleUser,
-								Content: sb.String(),
-							})
+							if sb.Len() > 0 {
+								recalled = append(recalled, model.Message{
+									Role:    model.RoleUser,
+									Content: sb.String(),
+								})
+							}
 						}
 					}
 				}
