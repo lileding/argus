@@ -15,6 +15,7 @@ import (
 
 type Worker struct {
 	store         store.TaskStore
+	outbox        store.OutboxStore
 	agent         *agent.Agent
 	workerID      string
 	pollInterval  time.Duration
@@ -41,6 +42,11 @@ func NewWorker(st store.TaskStore, ag *agent.Agent, workerID string, pollInterva
 		leaseDuration: leaseDuration,
 		quit:          make(chan struct{}),
 	}
+}
+
+func (w *Worker) WithOutbox(outbox store.OutboxStore) *Worker {
+	w.outbox = outbox
+	return w
 }
 
 func (w *Worker) Start() {
@@ -91,7 +97,7 @@ func (w *Worker) processOne(ctx context.Context, task *store.Task) {
 
 	prompt, err := taskPrompt(task.Input)
 	if err != nil {
-		w.fail(ctx, task.ID, err)
+		w.fail(ctx, task, err)
 		return
 	}
 
@@ -103,21 +109,50 @@ func (w *Worker) processOne(ctx context.Context, task *store.Task) {
 	}
 	reply, err := w.agent.Handle(ctx, task.ChatID, msg)
 	if err != nil {
-		w.fail(ctx, task.ID, err)
+		w.fail(ctx, task, err)
 		return
 	}
 	if err := w.store.CompleteTask(ctx, task.ID, reply); err != nil {
 		slog.Warn("complete async task", "task_id", task.ID, "err", err)
 		return
 	}
+	w.enqueueOutbox(ctx, task, "async_done", map[string]string{
+		"title":  task.Title,
+		"result": reply,
+	})
 
 	slog.Info("async task succeeded", "task_id", task.ID)
 }
 
-func (w *Worker) fail(ctx context.Context, taskID int64, err error) {
-	slog.Warn("async task failed", "task_id", taskID, "err", err)
-	if failErr := w.store.FailTask(ctx, taskID, err.Error()); failErr != nil {
-		slog.Warn("mark async task failed", "task_id", taskID, "err", failErr)
+func (w *Worker) fail(ctx context.Context, task *store.Task, err error) {
+	slog.Warn("async task failed", "task_id", task.ID, "err", err)
+	if failErr := w.store.FailTask(ctx, task.ID, err.Error()); failErr != nil {
+		slog.Warn("mark async task failed", "task_id", task.ID, "err", failErr)
+	}
+	w.enqueueOutbox(ctx, task, "async_failed", map[string]string{
+		"title": task.Title,
+		"error": err.Error(),
+	})
+}
+
+func (w *Worker) enqueueOutbox(ctx context.Context, task *store.Task, kind string, payload map[string]string) {
+	if w.outbox == nil || task.ChatID == "" {
+		return
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		slog.Warn("marshal async task outbox payload", "task_id", task.ID, "err", err)
+		return
+	}
+	event := &store.OutboxEvent{
+		ChatID:   task.ChatID,
+		TaskID:   &task.ID,
+		Kind:     kind,
+		Payload:  data,
+		Priority: task.Priority,
+	}
+	if err := w.outbox.CreateOutboxEvent(ctx, event); err != nil {
+		slog.Warn("create async task outbox event", "task_id", task.ID, "err", err)
 	}
 }
 

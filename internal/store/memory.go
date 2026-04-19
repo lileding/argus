@@ -13,10 +13,12 @@ type MemoryStore struct {
 	nextID   int64
 	tasks    []Task
 	nextTask int64
+	outbox   []OutboxEvent
+	nextOut  int64
 }
 
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{nextID: 1, nextTask: 1}
+	return &MemoryStore{nextID: 1, nextTask: 1, nextOut: 1}
 }
 
 func (s *MemoryStore) SaveMessage(_ context.Context, msg *StoredMessage) error {
@@ -298,6 +300,112 @@ func (s *MemoryStore) RecoverExpiredTasks(_ context.Context, now time.Time) (int
 			s.tasks[i].Status = "queued"
 			s.tasks[i].LeaseOwner = ""
 			s.tasks[i].LeaseUntil = nil
+			recovered++
+		}
+	}
+	return recovered, nil
+}
+
+// --- OutboxStore (in-memory, for tests / no-DB mode) ---
+
+func (s *MemoryStore) CreateOutboxEvent(_ context.Context, event *OutboxEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	event.ID = s.nextOut
+	s.nextOut++
+	if event.Kind == "" {
+		event.Kind = "notice"
+	}
+	if event.Status == "" {
+		event.Status = "pending"
+	}
+	if len(event.Payload) == 0 {
+		event.Payload = []byte(`{}`)
+	}
+	if event.CreatedAt.IsZero() {
+		event.CreatedAt = time.Now()
+	}
+	s.outbox = append(s.outbox, *event)
+	return nil
+}
+
+func (s *MemoryStore) PendingOutboxChats(_ context.Context) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	seen := map[string]bool{}
+	var chats []string
+	for _, e := range s.outbox {
+		if e.Status == "pending" && !seen[e.ChatID] {
+			seen[e.ChatID] = true
+			chats = append(chats, e.ChatID)
+		}
+	}
+	return chats, nil
+}
+
+func (s *MemoryStore) ClaimNextOutboxEvent(_ context.Context, chatID string) (*OutboxEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bestIdx := -1
+	for i := range s.outbox {
+		if s.outbox[i].ChatID != chatID || s.outbox[i].Status != "pending" {
+			continue
+		}
+		if bestIdx == -1 ||
+			s.outbox[i].Priority > s.outbox[bestIdx].Priority ||
+			(s.outbox[i].Priority == s.outbox[bestIdx].Priority && s.outbox[i].CreatedAt.Before(s.outbox[bestIdx].CreatedAt)) {
+			bestIdx = i
+		}
+	}
+	if bestIdx == -1 {
+		return nil, nil
+	}
+	s.outbox[bestIdx].Status = "sending"
+	event := s.outbox[bestIdx]
+	return &event, nil
+}
+
+func (s *MemoryStore) MarkOutboxSent(_ context.Context, eventID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	for i := range s.outbox {
+		if s.outbox[i].ID == eventID {
+			s.outbox[i].Status = "sent"
+			s.outbox[i].Error = ""
+			s.outbox[i].SentAt = &now
+			return nil
+		}
+	}
+	return nil
+}
+
+func (s *MemoryStore) MarkOutboxError(_ context.Context, eventID int64, errorMsg string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i := range s.outbox {
+		if s.outbox[i].ID == eventID {
+			s.outbox[i].Status = "failed"
+			s.outbox[i].Error = errorMsg
+			return nil
+		}
+	}
+	return nil
+}
+
+func (s *MemoryStore) RecoverOutbox(_ context.Context) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	recovered := 0
+	for i := range s.outbox {
+		if s.outbox[i].Status == "sending" {
+			s.outbox[i].Status = "pending"
 			recovered++
 		}
 	}

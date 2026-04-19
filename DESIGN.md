@@ -317,7 +317,7 @@ simple searches, or small structured data queries.
 Implementation order:
 
 1. ~~Add `tasks`, async worker leases, worker execution, and basic task tools.~~
-2. Add `outbox_events` and per-chat presentation serialization.
+2. ~~Add `outbox_events` and per-chat presentation serialization.~~
 3. Link traces to `task_id` / `parent_task_id`.
 4. Add `cron_schedules` and daily schedule execution.
 5. Add `create_cron`, `list_cron`, and `delete_cron`.
@@ -946,8 +946,9 @@ recoverable, and consistent with user-created background tasks.
 Current async task status: `tasks` persistence, lease-based worker claim,
 `create_async_task`, `get_task_status`, and `cancel_task` are implemented.
 The worker executes queued task prompts through the existing Agent and
-stores the final result on the task row. Outbox delivery and Feishu
-completion notifications are the next step.
+stores the final result on the task row. Completed and failed async tasks
+now emit `outbox_events`; the Feishu outbox presenter delivers those
+events only when the chat presentation lock is free.
 
 ---
 
@@ -1069,6 +1070,8 @@ internal/
     card.go                  Interactive card builders + per-tool humanizer
     event.go                 Event type definitions
     dedup.go                 Event ID deduplication
+    outbox_presenter.go      Outbox events → proactive Feishu cards
+    presentation.go          Per-chat presentation lock
   model/
     model.go                 Client interface (Chat, ChatStream,
                              ChatWithEarlyAbort, Transcribe)

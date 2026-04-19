@@ -183,6 +183,11 @@ func runServer(cfg *config.Config) {
 					slog.Info("recovered expired async tasks", "count", n)
 				}
 			}
+			if os, ok := st.(store.OutboxStore); ok {
+				if n, err := os.RecoverOutbox(ctx); err == nil && n > 0 {
+					slog.Info("recovered outbox events", "count", n)
+				}
+			}
 		} else {
 			slog.Warn("database unavailable, using memory store", "err", err)
 			db = nil
@@ -232,8 +237,15 @@ func runServer(cfg *config.Config) {
 	toolReg := buildToolRegistry(cfg, sb, loader, db, st, embedClient)
 	ag := agent.New(orchClient, synthClient, st, toolReg, loader.Index(), embedClient, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.OrchestratorContextWindow, cfg.Agent.MaxIterations)
 
+	var outboxStore store.OutboxStore
+	if os, ok := st.(store.OutboxStore); ok {
+		outboxStore = os
+	}
 	if ts, ok := st.(store.TaskStore); ok {
 		taskWorker := task.NewWorker(ts, ag, "argus-task-worker", 2*time.Second, 30*time.Minute)
+		if outboxStore != nil {
+			taskWorker.WithOutbox(outboxStore)
+		}
 		taskWorker.Start()
 		defer taskWorker.Stop()
 	}
@@ -241,6 +253,13 @@ func runServer(cfg *config.Config) {
 	feishuClient := feishu.NewClient(cfg.Feishu)
 	processor := render.NewProcessor(feishuClient)
 	adapter := feishu.NewAdapter(feishuClient, processor)
+	presentation := feishu.NewPresentationLock()
+
+	if outboxStore != nil {
+		outboxPresenter := feishu.NewOutboxPresenter(outboxStore, feishuClient, processor, presentation, 2*time.Second)
+		outboxPresenter.Start()
+		defer outboxPresenter.Stop()
+	}
 
 	// Document store for RAG indexing (nil if not available).
 	var docReg feishu.DocRegisterer
@@ -263,6 +282,7 @@ func runServer(cfg *config.Config) {
 
 	// Dispatcher: per-chat serial agent processing (channel-per-chat).
 	dispatcher := feishu.NewDispatcher(qs, ag, adapter, feishuClient, cfg.Model.Orchestrator.ModelName, cfg.Model.Synthesizer.ModelName)
+	dispatcher.SetPresentationLock(presentation)
 	defer dispatcher.Stop()
 
 	// Handler: inbound (store + push + spawn media goroutine).
@@ -310,7 +330,7 @@ func setupCron(cfg *config.Config, ag *agent.Agent, feishuClient *feishu.Client,
 
 			md := processor.ProcessMarkdown(reply)
 			cardJSON := feishu.MarkdownToCard(md)
-			receiveIDType, receiveID := parseCronChatID(job.ChatID)
+			receiveIDType, receiveID := feishu.ParseChatID(job.ChatID)
 			if err := feishuClient.SendMessageRich(receiveIDType, receiveID, "interactive", cardJSON); err != nil {
 				slog.Error("cron job send failed", "job", job.Name, "err", err)
 			}
@@ -318,14 +338,4 @@ func setupCron(cfg *config.Config, ag *agent.Agent, feishuClient *feishu.Client,
 	}
 
 	return scheduler
-}
-
-func parseCronChatID(chatID string) (receiveIDType, receiveID string) {
-	if len(chatID) > 4 && chatID[:4] == "p2p:" {
-		return "open_id", chatID[4:]
-	}
-	if len(chatID) > 6 && chatID[:6] == "group:" {
-		return "chat_id", chatID[6:]
-	}
-	return "chat_id", chatID
 }

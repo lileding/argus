@@ -156,6 +156,29 @@ type Task struct {
 	FinishedAt       *time.Time
 }
 
+// OutboxStore manages deferred user-visible delivery events.
+type OutboxStore interface {
+	CreateOutboxEvent(ctx context.Context, event *OutboxEvent) error
+	PendingOutboxChats(ctx context.Context) ([]string, error)
+	ClaimNextOutboxEvent(ctx context.Context, chatID string) (*OutboxEvent, error)
+	MarkOutboxSent(ctx context.Context, eventID int64) error
+	MarkOutboxError(ctx context.Context, eventID int64, errorMsg string) error
+	RecoverOutbox(ctx context.Context) (int, error)
+}
+
+type OutboxEvent struct {
+	ID        int64
+	ChatID    string
+	TaskID    *int64
+	Kind      string // async_done / async_failed / reminder / notice
+	Payload   []byte // JSON object
+	Status    string // pending / sending / sent / failed
+	Priority  int
+	Error     string
+	CreatedAt time.Time
+	SentAt    *time.Time
+}
+
 // DocumentStore manages document ingestion and RAG.
 type DocumentStore interface {
 	SaveDocument(ctx context.Context, doc *Document) error

@@ -32,6 +32,7 @@ type Dispatcher struct {
 	agent             *agent.Agent
 	adapter           *Adapter
 	client            *Client
+	presentation      *PresentationLock
 	orchestratorModel string // for trace logging
 	synthesizerModel  string // for trace logging
 
@@ -51,6 +52,10 @@ func NewDispatcher(st store.QueueStore, ag *agent.Agent, adapter *Adapter, clien
 		orchestratorModel: orchestratorModel,
 		synthesizerModel:  synthesizerModel,
 	}
+}
+
+func (d *Dispatcher) SetPresentationLock(lock *PresentationLock) {
+	d.presentation = lock
 }
 
 // ChatChan returns (or creates) the per-chat message channel.
@@ -146,6 +151,10 @@ func (d *Dispatcher) processChat(chatID string, ch chan QueuedMessage) {
 			"chat_id", chatID, "msg_id", msg.MsgID,
 		)
 
+		if d.presentation != nil {
+			d.presentation.Begin(chatID)
+		}
+
 		// Open thinking card immediately — user sees instant feedback.
 		replyChannelID := ""
 		if msg.TriggerMsgID != "" {
@@ -171,6 +180,9 @@ func (d *Dispatcher) processChat(chatID string, ch chan QueuedMessage) {
 			if replyChannelID != "" {
 				d.client.UpdateMessage(replyChannelID, MarkdownToCard("⚠️ Message processing timed out."))
 			}
+			if d.presentation != nil {
+				d.presentation.End(chatID)
+			}
 			continue
 		}
 
@@ -178,10 +190,16 @@ func (d *Dispatcher) processChat(chatID string, ch chan QueuedMessage) {
 		claimed, err := d.store.ClaimNextReply(ctx, chatID)
 		if err != nil {
 			slog.Error("dispatcher: claim", "chat_id", chatID, "err", err)
+			if d.presentation != nil {
+				d.presentation.End(chatID)
+			}
 			continue
 		}
 		if claimed == nil {
 			slog.Warn("dispatcher: nothing to claim after readyCh", "chat_id", chatID)
+			if d.presentation != nil {
+				d.presentation.End(chatID)
+			}
 			continue
 		}
 
@@ -197,6 +215,9 @@ func (d *Dispatcher) processChat(chatID string, ch chan QueuedMessage) {
 		)
 
 		d.processAndTrace(ctx, chatID, claimed, replyChannelID)
+		if d.presentation != nil {
+			d.presentation.End(chatID)
+		}
 
 		slog.Info("dispatcher: done", "chat_id", chatID, "msg_id", claimed.ID)
 
@@ -229,7 +250,13 @@ func (d *Dispatcher) drainReady(ctx context.Context, chatID string) {
 			}
 		}
 
+		if d.presentation != nil {
+			d.presentation.Begin(chatID)
+		}
 		d.processAndTrace(ctx, chatID, claimed, replyChannelID)
+		if d.presentation != nil {
+			d.presentation.End(chatID)
+		}
 		slog.Info("dispatcher: drain-done", "chat_id", chatID, "msg_id", claimed.ID)
 	}
 }

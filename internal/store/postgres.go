@@ -672,6 +672,119 @@ func (s *PostgresStore) RecoverExpiredTasks(ctx context.Context, now time.Time) 
 	return int(n), nil
 }
 
+// --- OutboxStore ---
+
+func (s *PostgresStore) CreateOutboxEvent(ctx context.Context, event *OutboxEvent) error {
+	if event.Kind == "" {
+		event.Kind = "notice"
+	}
+	if event.Status == "" {
+		event.Status = "pending"
+	}
+	if len(event.Payload) == 0 {
+		event.Payload = []byte(`{}`)
+	}
+
+	err := s.db.QueryRowContext(ctx, `
+		INSERT INTO outbox_events (chat_id, task_id, kind, payload, status, priority)
+		VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+		RETURNING id, created_at
+	`, event.ChatID, event.TaskID, event.Kind, string(event.Payload), event.Status, event.Priority).
+		Scan(&event.ID, &event.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("create outbox event: %w", err)
+	}
+	return nil
+}
+
+func (s *PostgresStore) PendingOutboxChats(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT chat_id
+		FROM outbox_events
+		WHERE status = 'pending'
+		ORDER BY chat_id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var chats []string
+	for rows.Next() {
+		var chatID string
+		if err := rows.Scan(&chatID); err != nil {
+			return nil, err
+		}
+		chats = append(chats, chatID)
+	}
+	return chats, nil
+}
+
+func (s *PostgresStore) ClaimNextOutboxEvent(ctx context.Context, chatID string) (*OutboxEvent, error) {
+	var e OutboxEvent
+	var taskID sql.NullInt64
+	var sentAt sql.NullTime
+	var payload []byte
+
+	err := s.db.QueryRowContext(ctx, `
+		UPDATE outbox_events
+		SET status = 'sending'
+		WHERE id = (
+			SELECT id FROM outbox_events
+			WHERE chat_id = $1 AND status = 'pending'
+			ORDER BY priority DESC, created_at
+			LIMIT 1
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING id, chat_id, task_id, kind, payload, status, priority, error, created_at, sent_at
+	`, chatID).Scan(&e.ID, &e.ChatID, &taskID, &e.Kind, &payload, &e.Status, &e.Priority, &e.Error, &e.CreatedAt, &sentAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("claim outbox event: %w", err)
+	}
+	e.Payload = payload
+	if taskID.Valid {
+		e.TaskID = &taskID.Int64
+	}
+	if sentAt.Valid {
+		e.SentAt = &sentAt.Time
+	}
+	return &e, nil
+}
+
+func (s *PostgresStore) MarkOutboxSent(ctx context.Context, eventID int64) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE outbox_events
+		SET status = 'sent', error = '', sent_at = NOW()
+		WHERE id = $1
+	`, eventID)
+	return err
+}
+
+func (s *PostgresStore) MarkOutboxError(ctx context.Context, eventID int64, errorMsg string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE outbox_events
+		SET status = 'failed', error = $1
+		WHERE id = $2
+	`, errorMsg, eventID)
+	return err
+}
+
+func (s *PostgresStore) RecoverOutbox(ctx context.Context) (int, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE outbox_events
+		SET status = 'pending'
+		WHERE status = 'sending'
+	`)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 // --- QueueStore (message pipeline) ---
 
 func (s *PostgresStore) SaveMessageQueued(ctx context.Context, msg *StoredMessage) error {
