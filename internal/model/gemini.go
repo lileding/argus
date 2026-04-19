@@ -186,12 +186,16 @@ func (c *GeminiClient) prepare(messages []Message, tools []ToolDef) (*genai.Gene
 				Parts: []*genai.Part{{Text: msg.TextContent()}},
 			}
 		case RoleUser:
+			text := msg.TextContent()
+			if text == "" {
+				text = " " // Gemini rejects empty Parts
+			}
 			if i == len(messages)-1 {
-				userParts = append(userParts, genai.Part{Text: msg.TextContent()})
+				userParts = append(userParts, genai.Part{Text: text})
 			} else {
 				history = append(history, &genai.Content{
 					Role:  "user",
-					Parts: []*genai.Part{{Text: msg.TextContent()}},
+					Parts: []*genai.Part{{Text: text}},
 				})
 			}
 		case RoleAssistant:
@@ -214,17 +218,27 @@ func (c *GeminiClient) prepare(messages []Message, tools []ToolDef) (*genai.Gene
 				history = append(history, &genai.Content{Role: "model", Parts: parts})
 			}
 		case RoleTool:
+			text := msg.TextContent()
+			if text == "" {
+				continue // skip empty tool results
+			}
 			var respData map[string]any
-			json.Unmarshal([]byte(msg.TextContent()), &respData)
+			json.Unmarshal([]byte(text), &respData)
 			if respData == nil {
-				respData = map[string]any{"result": msg.TextContent()}
+				respData = map[string]any{"result": text}
+			}
+			// ToolCallID may contain the tool name or a call ID.
+			// Gemini needs a non-empty name for FunctionResponse.
+			name := msg.ToolCallID
+			if name == "" {
+				name = "tool"
 			}
 			history = append(history, &genai.Content{
 				Role: "user",
 				Parts: []*genai.Part{{
 					FunctionResponse: &genai.FunctionResponse{
 						ID:       msg.ToolCallID,
-						Name:     msg.ToolCallID, // best effort: ID often contains tool name
+						Name:     name,
 						Response: respData,
 					},
 				}},
@@ -233,7 +247,7 @@ func (c *GeminiClient) prepare(messages []Message, tools []ToolDef) (*genai.Gene
 	}
 
 	if len(userParts) == 0 {
-		userParts = []genai.Part{{Text: ""}}
+		userParts = []genai.Part{{Text: " "}}
 	}
 
 	return config, history, userParts
