@@ -7,12 +7,11 @@ import (
 	"log/slog"
 	"strings"
 
-	"cloud.google.com/go/vertexai/genai"
-	"google.golang.org/api/iterator"
+	"google.golang.org/genai"
 )
 
 // vertexClient implements Client for all models on Vertex AI (Gemini, Claude, etc.)
-// using the unified GenerateContent API via the Google genai SDK.
+// using the unified GenerateContent API via the Google GenAI SDK.
 type vertexClient struct {
 	client    *genai.Client
 	modelName string
@@ -20,7 +19,11 @@ type vertexClient struct {
 }
 
 func newVertexClient(ctx context.Context, project, location, modelName string, maxTokens int) (Client, error) {
-	client, err := genai.NewClient(ctx, project, location)
+	client, err := genai.NewClient(ctx, &genai.ClientConfig{
+		Backend:  genai.BackendVertexAI,
+		Project:  project,
+		Location: location,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("create vertex client: %w", err)
 	}
@@ -32,11 +35,13 @@ func newVertexClient(ctx context.Context, project, location, modelName string, m
 }
 
 func (c *vertexClient) Chat(ctx context.Context, messages []Message, tools []ToolDef) (*Response, error) {
-	model, history, userParts := c.prepare(messages, tools)
-	cs := model.StartChat()
-	cs.History = history
+	config, history, userParts := c.prepare(messages, tools)
+	chat, err := c.client.Chats.Create(ctx, c.modelName, config, history)
+	if err != nil {
+		return nil, fmt.Errorf("vertex create chat: %w", err)
+	}
 
-	resp, err := cs.SendMessage(ctx, userParts...)
+	resp, err := chat.SendMessage(ctx, userParts...)
 	if err != nil {
 		return nil, fmt.Errorf("vertex chat: %w", err)
 	}
@@ -44,81 +49,77 @@ func (c *vertexClient) Chat(ctx context.Context, messages []Message, tools []Too
 }
 
 func (c *vertexClient) ChatStream(ctx context.Context, messages []Message, tools []ToolDef) (<-chan StreamChunk, error) {
-	model, history, userParts := c.prepare(messages, tools)
-	cs := model.StartChat()
-	cs.History = history
+	config, history, userParts := c.prepare(messages, tools)
+	chat, err := c.client.Chats.Create(ctx, c.modelName, config, history)
+	if err != nil {
+		return nil, fmt.Errorf("vertex create chat: %w", err)
+	}
 
-	iter := cs.SendMessageStream(ctx, userParts...)
 	ch := make(chan StreamChunk, 32)
-
 	go func() {
 		defer close(ch)
-		for {
-			resp, err := iter.Next()
-			if err == iterator.Done {
-				merged := iter.MergedResponse()
-				usage := Usage{}
-				if merged != nil && merged.UsageMetadata != nil {
-					usage.PromptTokens = int(merged.UsageMetadata.PromptTokenCount)
-					usage.CompletionTokens = int(merged.UsageMetadata.CandidatesTokenCount)
-				}
-				ch <- StreamChunk{Done: true, Usage: usage}
-				return
-			}
+		var usage Usage
+		for resp, err := range chat.SendMessageStream(ctx, userParts...) {
 			if err != nil {
-				ch <- StreamChunk{Done: true, Err: fmt.Errorf("vertex stream: %w", err)}
+				ch <- StreamChunk{Done: true, Err: fmt.Errorf("vertex stream: %w", err), Usage: usage}
 				return
 			}
 			if len(resp.Candidates) > 0 && resp.Candidates[0].Content != nil {
 				for _, part := range resp.Candidates[0].Content.Parts {
-					if t, ok := part.(genai.Text); ok {
-						ch <- StreamChunk{Delta: string(t)}
+					if part.Text != "" {
+						ch <- StreamChunk{Delta: part.Text}
 					}
 				}
 			}
+			if resp.UsageMetadata != nil {
+				usage.PromptTokens = int(resp.UsageMetadata.PromptTokenCount)
+				usage.CompletionTokens = int(resp.UsageMetadata.CandidatesTokenCount)
+			}
 		}
+		ch <- StreamChunk{Done: true, Usage: usage}
 	}()
 	return ch, nil
 }
 
 func (c *vertexClient) ChatWithEarlyAbort(ctx context.Context, messages []Message, tools []ToolDef, maxTextTokens int) (*Response, error) {
-	model, history, userParts := c.prepare(messages, tools)
-	cs := model.StartChat()
-	cs.History = history
+	config, history, userParts := c.prepare(messages, tools)
+	chat, err := c.client.Chats.Create(ctx, c.modelName, config, history)
+	if err != nil {
+		return nil, fmt.Errorf("vertex create chat: %w", err)
+	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-
-	iter := cs.SendMessageStream(ctx, userParts...)
 
 	var content strings.Builder
 	var functionCalls []ToolCall
 	var usage Usage
 
-	for {
-		resp, err := iter.Next()
-		if err == iterator.Done {
-			break
-		}
+	for resp, err := range chat.SendMessageStream(ctx, userParts...) {
 		if err != nil {
 			if content.Len() > 0 || len(functionCalls) > 0 {
-				break // use what we have
+				break
 			}
 			return nil, fmt.Errorf("vertex stream: %w", err)
 		}
 
 		if len(resp.Candidates) > 0 && resp.Candidates[0].Content != nil {
 			for _, part := range resp.Candidates[0].Content.Parts {
-				switch p := part.(type) {
-				case genai.Text:
-					content.WriteString(string(p))
-				case genai.FunctionCall:
-					argsJSON, _ := json.Marshal(p.Args)
+				if part.Text != "" {
+					content.WriteString(part.Text)
+				}
+				if part.FunctionCall != nil {
+					fc := part.FunctionCall
+					argsJSON, _ := json.Marshal(fc.Args)
+					id := fc.ID
+					if id == "" {
+						id = fmt.Sprintf("call_%s_%d", fc.Name, len(functionCalls))
+					}
 					functionCalls = append(functionCalls, ToolCall{
-						ID:   fmt.Sprintf("call_%s_%d", p.Name, len(functionCalls)),
+						ID:   id,
 						Type: "function",
 						Function: FunctionCall{
-							Name:      p.Name,
+							Name:      fc.Name,
 							Arguments: string(argsJSON),
 						},
 					})
@@ -143,13 +144,6 @@ func (c *vertexClient) ChatWithEarlyAbort(ctx context.Context, messages []Messag
 		}
 	}
 
-	// Get final usage from merged response.
-	merged := iter.MergedResponse()
-	if merged != nil && merged.UsageMetadata != nil {
-		usage.PromptTokens = int(merged.UsageMetadata.PromptTokenCount)
-		usage.CompletionTokens = int(merged.UsageMetadata.CandidatesTokenCount)
-	}
-
 	finishReason := "stop"
 	if len(functionCalls) > 0 {
 		finishReason = "tool_calls"
@@ -169,11 +163,10 @@ func (c *vertexClient) Transcribe(_ context.Context, _ []byte, _ string) (*Trans
 
 // --- Internal helpers ---
 
-// prepare builds the genai model, history, and user message parts from our
-// internal Message/ToolDef types. Returns (model, history, userParts).
-func (c *vertexClient) prepare(messages []Message, tools []ToolDef) (*genai.GenerativeModel, []*genai.Content, []genai.Part) {
-	model := c.client.GenerativeModel(c.modelName)
-	model.GenerationConfig.SetMaxOutputTokens(int32(c.maxTokens))
+func (c *vertexClient) prepare(messages []Message, tools []ToolDef) (*genai.GenerateContentConfig, []*genai.Content, []genai.Part) {
+	config := &genai.GenerateContentConfig{
+		MaxOutputTokens: int32(c.maxTokens),
+	}
 
 	// Convert tools.
 	if len(tools) > 0 {
@@ -181,7 +174,7 @@ func (c *vertexClient) prepare(messages []Message, tools []ToolDef) (*genai.Gene
 		for _, t := range tools {
 			decls = append(decls, convertToolDef(t))
 		}
-		model.Tools = []*genai.Tool{{FunctionDeclarations: decls}}
+		config.Tools = []*genai.Tool{{FunctionDeclarations: decls}}
 	}
 
 	// Split messages into system, history, and final user turn.
@@ -191,60 +184,61 @@ func (c *vertexClient) prepare(messages []Message, tools []ToolDef) (*genai.Gene
 	for i, msg := range messages {
 		switch msg.Role {
 		case RoleSystem:
-			model.SystemInstruction = &genai.Content{
-				Parts: []genai.Part{genai.Text(msg.TextContent())},
+			config.SystemInstruction = &genai.Content{
+				Parts: []*genai.Part{{Text: msg.TextContent()}},
 			}
 		case RoleUser:
 			if i == len(messages)-1 {
-				// Last user message → sent via SendMessage.
-				userParts = append(userParts, genai.Text(msg.TextContent()))
+				userParts = append(userParts, genai.Part{Text: msg.TextContent()})
 			} else {
-				history = append(history, genai.NewUserContent(genai.Text(msg.TextContent())))
+				history = append(history, &genai.Content{
+					Role:  "user",
+					Parts: []*genai.Part{{Text: msg.TextContent()}},
+				})
 			}
 		case RoleAssistant:
-			parts := []genai.Part{}
-			if msg.Content != nil {
-				if text := msg.TextContent(); text != "" {
-					parts = append(parts, genai.Text(text))
-				}
+			parts := []*genai.Part{}
+			if text := msg.TextContent(); text != "" {
+				parts = append(parts, &genai.Part{Text: text})
 			}
 			for _, tc := range msg.ToolCalls {
 				var args map[string]any
 				json.Unmarshal([]byte(tc.Function.Arguments), &args)
-				parts = append(parts, genai.FunctionCall{
-					Name: tc.Function.Name,
-					Args: args,
+				parts = append(parts, &genai.Part{
+					FunctionCall: &genai.FunctionCall{
+						ID:   tc.ID,
+						Name: tc.Function.Name,
+						Args: args,
+					},
 				})
 			}
 			if len(parts) > 0 {
 				history = append(history, &genai.Content{Role: "model", Parts: parts})
 			}
 		case RoleTool:
-			// Tool results go as FunctionResponse in a user content.
 			var respData map[string]any
 			json.Unmarshal([]byte(msg.TextContent()), &respData)
 			if respData == nil {
 				respData = map[string]any{"result": msg.TextContent()}
 			}
-			toolName := ""
-			if msg.ToolCallID != "" {
-				// Extract tool name from the call ID if available.
-				// Our IDs are "call_<name>_<seq>", but original OpenAI IDs
-				// don't have the name. Fall back to checking history.
-				toolName = msg.ToolCallID
-			}
-			history = append(history, genai.NewUserContent(
-				genai.FunctionResponse{Name: toolName, Response: respData},
-			))
+			history = append(history, &genai.Content{
+				Role: "user",
+				Parts: []*genai.Part{{
+					FunctionResponse: &genai.FunctionResponse{
+						ID:       msg.ToolCallID,
+						Name:     msg.ToolCallID, // best effort: ID often contains tool name
+						Response: respData,
+					},
+				}},
+			})
 		}
 	}
 
-	// Ensure we have at least one user part.
 	if len(userParts) == 0 {
-		userParts = []genai.Part{genai.Text("")}
+		userParts = []genai.Part{{Text: ""}}
 	}
 
-	return model, history, userParts
+	return config, history, userParts
 }
 
 func (c *vertexClient) convertResponse(resp *genai.GenerateContentResponse) *Response {
@@ -267,16 +261,21 @@ func (c *vertexClient) convertResponse(resp *genai.GenerateContentResponse) *Res
 
 	var textParts []string
 	for _, part := range cand.Content.Parts {
-		switch p := part.(type) {
-		case genai.Text:
-			textParts = append(textParts, string(p))
-		case genai.FunctionCall:
-			argsJSON, _ := json.Marshal(p.Args)
+		if part.Text != "" {
+			textParts = append(textParts, part.Text)
+		}
+		if part.FunctionCall != nil {
+			fc := part.FunctionCall
+			argsJSON, _ := json.Marshal(fc.Args)
+			id := fc.ID
+			if id == "" {
+				id = fmt.Sprintf("call_%s_%d", fc.Name, len(result.ToolCalls))
+			}
 			result.ToolCalls = append(result.ToolCalls, ToolCall{
-				ID:   fmt.Sprintf("call_%s_%d", p.Name, len(result.ToolCalls)),
+				ID:   id,
 				Type: "function",
 				Function: FunctionCall{
-					Name:      p.Name,
+					Name:      fc.Name,
 					Arguments: string(argsJSON),
 				},
 			})
@@ -302,8 +301,6 @@ func convertToolDef(t ToolDef) *genai.FunctionDeclaration {
 	return fd
 }
 
-// convertJSONSchema recursively converts a JSON Schema (as map[string]any)
-// to a genai.Schema.
 func convertJSONSchema(raw json.RawMessage) *genai.Schema {
 	var schema map[string]any
 	if err := json.Unmarshal(raw, &schema); err != nil {
