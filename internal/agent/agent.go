@@ -20,25 +20,46 @@ import (
 	"argus/internal/tool"
 )
 
+const (
+	maxImagesPerMessage = 4          // max images injected per message
+	maxImageBytes       = 1 << 20    // 1 MB per image file
+)
+
 // buildUserMessage creates a text or multimodal message from stored content.
-// If filePaths contains image files, they are loaded from disk and encoded
-// as base64 data URLs for vision-capable models.
+// Limits: at most maxImagesPerMessage images, each at most maxImageBytes.
+// Excess images get a text placeholder.
 func buildUserMessage(text string, filePaths []string, workspaceDir string) model.Message {
 	var dataURLs []string
+	skipped := 0
 	for _, p := range filePaths {
 		ext := strings.ToLower(filepath.Ext(p))
 		if !imageExts[ext] {
 			continue
 		}
+		if len(dataURLs) >= maxImagesPerMessage {
+			skipped++
+			continue
+		}
 		absPath := filepath.Join(workspaceDir, p)
+		info, err := os.Stat(absPath)
+		if err != nil {
+			continue
+		}
+		if info.Size() > maxImageBytes {
+			slog.Info("skip oversized image", "path", p, "size", info.Size())
+			skipped++
+			continue
+		}
 		data, err := os.ReadFile(absPath)
 		if err != nil {
-			slog.Debug("skip image file", "path", p, "err", err)
 			continue
 		}
 		contentType := http.DetectContentType(data)
 		dataURLs = append(dataURLs, fmt.Sprintf("data:%s;base64,%s",
 			contentType, base64.StdEncoding.EncodeToString(data)))
+	}
+	if skipped > 0 {
+		text += fmt.Sprintf("\n[%d image(s) omitted: exceeded size or count limit]", skipped)
 	}
 	if len(dataURLs) > 0 {
 		return model.NewMultimodalMessage(model.RoleUser, text, dataURLs...)
@@ -334,11 +355,12 @@ func (a *Agent) runOrchestrator(
 		// the list of tools to actually execute.
 		type toolSlot struct {
 			tc         model.ToolCall
-			rejected   bool   // budget exhausted
-			errMsg     string // rejection message
-			result     string // filled by execution (truncated)
-			fullResult string // full result for trace
-			durationMs int    // execution time
+			rejected   bool
+			errMsg     string
+			result     string
+			fullResult string
+			durationMs int
+			seq        int // stable index for trace pairing
 		}
 		slots := make([]toolSlot, len(resp.ToolCalls))
 		forceStop := false
@@ -365,15 +387,19 @@ func (a *Agent) runOrchestrator(
 			}
 		}
 
+		// Assign a stable seq to each slot (used by both ToolCall and ToolResult
+		// events so dispatcher can pair them for trace recording).
+		for idx := range slots {
+			slots[idx].seq = idx
+		}
+
 		// Emit EventToolCall for non-rejected tools.
-		seq := 0
 		for idx := range slots {
 			if !slots[idx].rejected {
 				ch <- Event{Type: EventToolCall, Payload: ToolCallPayload{
 					Name: slots[idx].tc.Function.Name, Arguments: slots[idx].tc.Function.Arguments,
-					CallID: slots[idx].tc.ID, Iteration: i, Seq: seq,
+					CallID: slots[idx].tc.ID, Iteration: i, Seq: idx,
 				}}
-				seq++
 			}
 		}
 
@@ -398,14 +424,13 @@ func (a *Agent) runOrchestrator(
 		wg.Wait()
 
 		// Append results to messages and records in original order.
-		resultSeq := 0
 		for idx := range slots {
 			s := &slots[idx]
 			if s.rejected {
 				ch <- Event{Type: EventToolResult, Payload: ToolResultPayload{
 					Name: s.tc.Function.Name, CallID: s.tc.ID,
 					Result: truncateResult(s.errMsg, 200), FullResult: s.errMsg,
-					IsError: true, Iteration: i, Seq: resultSeq,
+					IsError: true, Iteration: i, Seq: s.seq,
 				}}
 				messages = append(messages, model.Message{Role: model.RoleTool, Content: s.errMsg, ToolCallID: s.tc.ID, ToolName: s.tc.Function.Name})
 			} else {
@@ -415,7 +440,7 @@ func (a *Agent) runOrchestrator(
 					FullResult: s.fullResult,
 					IsError:    strings.HasPrefix(s.result, "error:"),
 					DurationMs: s.durationMs,
-					Iteration:  i, Seq: resultSeq,
+					Iteration:  i, Seq: s.seq,
 				}}
 				results = append(results, toolCallRecord{
 					Name:      s.tc.Function.Name,
@@ -424,7 +449,6 @@ func (a *Agent) runOrchestrator(
 				})
 				messages = append(messages, model.Message{Role: model.RoleTool, Content: s.result, ToolCallID: s.tc.ID, ToolName: s.tc.Function.Name})
 			}
-			resultSeq++
 		}
 
 		if forceStop {

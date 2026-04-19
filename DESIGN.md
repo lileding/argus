@@ -166,10 +166,14 @@ Feishu image/post → download to .files/ → file_paths saved to DB
     → Gemini: {inlineData:{mimeType, data}}
 ```
 
-**Context budget**: only the most recent image-bearing message in
-history gets real image data injected (~130KB base64 per image). Older
-image messages are replaced with `"[Image(s) omitted from context]"`
-text placeholder. The current user message always gets full images.
+**Context budget**:
+- Only the most recent image-bearing message in history gets real
+  image data. Older image messages → text placeholder.
+- Per-message hard limits: max 4 images, max 1 MB per image file.
+  Excess images → `"[N image(s) omitted]"` text placeholder.
+- Semantic recall returns text-only (no image re-injection); image
+  messages that appear in both recall and sliding window stay in the
+  sliding window path to preserve image data.
 
 **Storage**: images are NOT stored as base64 in the DB (too heavy).
 `messages.file_paths` stores the relative path to `.files/`; images
@@ -395,7 +399,7 @@ Studio). This worked for basic queries but had fundamental limitations:
 ### Multi-Backend Architecture
 
 Argus supports multiple model providers via named **upstreams**. Each
-agent role (orchestrator, synthesizer, fallback, transcription) selects
+agent role (orchestrator, synthesizer, transcription) selects
 its own upstream and model independently.
 
 ```yaml
@@ -408,7 +412,7 @@ upstreams:
 model:
   orchestrator:  {upstream: openai,    model_name: "gpt-5.4"}
   synthesizer:   {upstream: gemini,    model_name: "gemini-2.5-flash-lite"}
-  fallback:      {upstream: local,     model_name: "Qwen3.5-35B-A3B-8bit"}
+  # No fallback — errors returned to user; message stays in queue for retry
   transcription: {upstream: local,     model_name: "whisper-large-v3"}
 ```
 
@@ -420,9 +424,10 @@ Four upstream types, all implemented with plain `net/http` (no SDKs):
 | `anthropic` | Anthropic Messages API | `x-api-key` header |
 | `gemini` | Google Gemini REST API | API key in URL |
 
-**FallbackClient** wraps each role's primary with a fallback. On error,
-retries 429 (rate limit) up to 2× with 30s delay, then degrades to
-the fallback model. Other errors fall back immediately.
+**RetryClient** wraps each role's client. On 429 (rate limit), retries
+up to 2× with 30s context-aware delay. Other errors are returned
+directly to the user — no silent quality degradation. The user's
+message stays in the DB queue and can be retried later.
 
 ### Recommended Configurations
 
@@ -432,12 +437,10 @@ the fallback model. Other errors fall back immediately.
 | Claude Haiku 4.5 | Gemini 2.5 Flash Lite | ~$5/mo | Good quality, best value |
 | Qwen 3.5 (local) | Qwen 3.5 (local) | $0 | Functional but needs all harness guardrails |
 
-### Local Models (Fallback + Transcription)
+### Local Models (Transcription + Embedding)
 
-Local models still serve two roles:
-- **Fallback**: when commercial APIs are down or rate-limited
-- **Transcription**: Whisper Large v3 via omlx (no commercial
-  equivalent needed — Whisper is excellent)
+Local models serve two specialized roles:
+- **Transcription**: Whisper Large v3 via omlx
 - **Embedding**: modernbert-embed-base (768 dim) via omlx
 
 KV cache 4-bit quantization recommended for local MoE models on
@@ -764,7 +767,7 @@ cron:
 ## Project Structure
 
 ```
-cmd/argus/main.go            Entry point, --workspace and --mode flags
+cmd/argus/main.go            Entry point, --workspace flag (default ~/.argus)
 internal/
   agent/
     agent.go                 Two-phase orchestrator + streaming synthesizer;
@@ -797,7 +800,7 @@ internal/
     openai.go                OpenAI-compatible (local + api.openai.com)
     anthropic.go             Anthropic Messages API (Claude)
     gemini.go                Google Gemini REST API
-    fallback.go              FallbackClient wrapper (retry 429 + degrade)
+    fallback.go              RetryClient wrapper (429 retry, no fallback)
     factory.go               NewClientFromConfig / NewClientsForAgent
     types.go                 Message, ToolCall, Response, Usage
   render/
@@ -849,7 +852,7 @@ third_party/ratex/           Embedded Rust LaTeX renderer (CGo)
 |-----------|--------|
 | Language | Go |
 | IM | Feishu Bot API (text, image, audio, file, rich text, interactive cards) |
-| Chat Model | Multi-backend: OpenAI (GPT-5.4), Anthropic (Claude), Gemini, local MoE fallback |
+| Chat Model | Multi-backend: OpenAI (GPT-5.4), Anthropic (Claude), Gemini |
 | Transcription | Whisper Large v3 via `/v1/audio/transcriptions` |
 | Embedding | modernbert-embed-base (768 dim) via `/v1/embeddings` |
 | Database | PostgreSQL + pgvector (optional, memory store fallback) |

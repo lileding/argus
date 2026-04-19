@@ -57,13 +57,15 @@ func (a *Agent) loadHistory(ctx context.Context, chatID string, excludeID int64,
 	}
 
 	// Filter recent messages: remove excluded (just-saved) and dedup vs recalled.
+	// Exception: keep messages with image file_paths in recent (not recalled)
+	// so they go through curateHistory for proper image re-injection.
 	var filtered []store.StoredMessage
 	for _, m := range recent {
 		if m.ID == excludeID {
 			continue
 		}
-		if recalledIDs != nil && recalledIDs[m.ID] {
-			continue
+		if recalledIDs != nil && recalledIDs[m.ID] && !hasImagePaths(m.FilePaths) {
+			continue // dedup against recalled, but keep image messages in recent
 		}
 		filtered = append(filtered, m)
 	}
