@@ -1,11 +1,9 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"database/sql"
 	"flag"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -29,8 +27,7 @@ import (
 )
 
 func main() {
-	mode := flag.String("run-mode", "server", "run mode: server or cli")
-	workspace := flag.String("workspace", ".", "workspace directory (contains config.yaml and .skills/)")
+	workspace := flag.String("workspace", defaultWorkspace(), "workspace directory (contains config.yaml and .skills/)")
 	flag.Parse()
 
 	// Resolve workspace to absolute path.
@@ -52,18 +49,21 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Override workspace dir to absolute path.
 	cfg.Agent.WorkspaceDir = absWorkspace
+	runServer(cfg)
+}
 
-	switch *mode {
-	case "cli":
-		runCLI(cfg)
-	case "server":
-		runServer(cfg)
-	default:
-		slog.Error("unknown mode", "mode", *mode)
-		os.Exit(1)
+// defaultWorkspace returns ~/.argus if it exists, otherwise ~/.local/share/argus.
+func defaultWorkspace() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "."
 	}
+	dotArgus := filepath.Join(home, ".argus")
+	if info, err := os.Stat(dotArgus); err == nil && info.IsDir() {
+		return dotArgus
+	}
+	return filepath.Join(home, ".local", "share", "argus")
 }
 
 // setupSkills initializes the skill loader: loads builtins + user skills, starts background rescan.
@@ -123,43 +123,6 @@ func buildToolRegistry(cfg *config.Config, sb sandbox.Sandbox, loader *skill.Fil
 	}
 
 	return registry
-}
-
-func runCLI(cfg *config.Config) {
-	loader := setupSkills(cfg)
-	defer loader.Stop()
-
-	// CLI mode: use legacy single-client (all roles use same model).
-	modelClient := model.NewOpenAIClient(cfg.Model)
-	memStore := store.NewMemoryStore()
-	sb := buildSandbox(cfg)
-	toolReg := buildToolRegistry(cfg, sb, loader, nil, memStore)
-	ag := agent.New(modelClient, modelClient, memStore, toolReg, loader.Index(), nil, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.MaxIterations)
-
-	chatID := "cli:local"
-	ctx := context.Background()
-
-	fmt.Println("Argus CLI mode. Type messages, Ctrl+C to quit.")
-	fmt.Printf("Workspace: %s\n", cfg.Agent.WorkspaceDir)
-	fmt.Printf("Skills: %d loaded\n", len(loader.Index().All()))
-	scanner := bufio.NewScanner(os.Stdin)
-	fmt.Print("> ")
-	for scanner.Scan() {
-		text := scanner.Text()
-		if text == "" {
-			fmt.Print("> ")
-			continue
-		}
-
-		msg := model.NewTextMessage(model.RoleUser, text)
-		msg.Meta = &model.MessageMeta{SourceIM: "cli", Channel: "local", MsgType: "text"}
-		reply, err := ag.Handle(ctx, chatID, msg)
-		if err != nil {
-			fmt.Printf("Error: %v\n> ", err)
-			continue
-		}
-		fmt.Printf("Argus: %s\n> ", reply)
-	}
 }
 
 func runServer(cfg *config.Config) {

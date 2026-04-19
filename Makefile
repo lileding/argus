@@ -1,4 +1,4 @@
-.PHONY: build run run-cli test clean sandbox up down ratex ratex-clean
+.PHONY: build run test clean sandbox up down ratex ratex-clean
 
 # Path to the RaTeX static library produced by cargo.
 RATEX_LIB := third_party/ratex/target/release/libratex_bridge.a
@@ -21,10 +21,7 @@ build: $(RATEX_LIB)
 	go build -o bin/argus ./cmd/argus
 
 run: build
-	./bin/argus --run-mode server --workspace ./workspace
-
-run-cli: build
-	./bin/argus --run-mode cli --workspace ./workspace
+	./bin/argus --workspace ./workspace
 
 test: $(RATEX_LIB)
 	go test ./...
