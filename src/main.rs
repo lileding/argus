@@ -37,10 +37,12 @@ async fn main() {
     tokio::signal::ctrl_c().await.ok();
     info!("shutdown initiated");
 
-    feishu.stop().await;
+    // Shutdown order: agent first (finishes in-flight task + closes events),
+    // then feishu (outbound drains remaining messages, then exits).
     agent.stop().await;
-    let _ = feishu_handle.await;
     let _ = agent_handle.await;
+    feishu.stop().await;
+    let _ = feishu_handle.await;
 
     info!("argus stopped");
 }

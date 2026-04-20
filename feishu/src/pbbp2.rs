@@ -43,19 +43,21 @@ pub struct Frame {
 pub const METHOD_CONTROL: i32 = 0;
 pub const METHOD_DATA: i32 = 1;
 
-/// Well-known header keys.
+// Protocol constants — all part of the pbbp2 spec. Some not yet referenced
+// in code but kept for completeness; suppress dead_code warnings.
 pub const HEADER_TYPE: &str = "type";
 pub const HEADER_MESSAGE_ID: &str = "message_id";
 pub const HEADER_SUM: &str = "sum";
 pub const HEADER_SEQ: &str = "seq";
-pub const HEADER_TRACE_ID: &str = "trace_id";
 pub const HEADER_BIZ_RT: &str = "biz_rt";
+#[allow(dead_code)]
+pub const HEADER_TRACE_ID: &str = "trace_id";
 
-/// Well-known header type values.
 pub const TYPE_PING: &str = "ping";
 pub const TYPE_PONG: &str = "pong";
-pub const TYPE_EVENT: &str = "event";
 pub const TYPE_CARD: &str = "card";
+#[allow(dead_code)]
+pub const TYPE_EVENT: &str = "event";
 
 impl Frame {
     /// Get a header value by key.

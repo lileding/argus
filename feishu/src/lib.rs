@@ -1,7 +1,8 @@
 pub mod api;
-pub mod auth;
-pub mod pbbp2;
 pub mod types;
+
+pub(crate) mod auth;
+pub(crate) mod pbbp2;
 pub mod ws;
 
 mod client;

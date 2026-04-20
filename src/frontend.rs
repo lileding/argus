@@ -114,23 +114,33 @@ impl Feishu {
         };
 
         // Extract fields from the nested Feishu event JSON.
-        let msg_id = event_data
-            .get("message")
-            .and_then(|m| m.get("message_id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let message = match event_data.get("message") {
+            Some(m) => m,
+            None => {
+                warn!("inbound event missing 'message' field");
+                return;
+            }
+        };
 
-        let chat_id = event_data
-            .get("message")
-            .and_then(|m| m.get("chat_id"))
+        let msg_id = message
+            .get("message_id")
             .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+            .unwrap_or("");
+        let chat_id = message
+            .get("chat_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
-        let raw_content = event_data
-            .get("message")
-            .and_then(|m| m.get("content"))
+        if msg_id.is_empty() || chat_id.is_empty() {
+            warn!(msg_id, chat_id, "inbound event missing msg_id or chat_id");
+            return;
+        }
+
+        let msg_id = msg_id.to_string();
+        let chat_id = chat_id.to_string();
+
+        let raw_content = message
+            .get("content")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
@@ -204,8 +214,24 @@ impl Feishu {
                     debug!(msg_id = %msg.msg_id, "message events exhausted, card closed");
                 }
                 _ = self.cancel.cancelled() => {
-                    info!("outbound render loop shutting down");
+                    info!("outbound render loop shutting down, draining remaining messages");
                     break;
+                }
+            }
+        }
+        // Drain: consume any messages already in the queue so their
+        // replies still get sent. Events channels will close once the
+        // Agent finishes (Agent stops before Frontend).
+        while let Ok(mut msg) = rx.try_recv() {
+            info!(msg_id = %msg.msg_id, "draining message");
+            while let Some(event) = msg.events.recv().await {
+                match event {
+                    Event::Reply { text } => {
+                        let content = serde_json::json!({"text": text}).to_string();
+                        if let Err(e) = api.reply_message(&msg.msg_id, "text", &content).await {
+                            warn!(msg_id = %msg.msg_id, error = %e, "drain reply failed");
+                        }
+                    }
                 }
             }
         }
