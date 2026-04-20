@@ -25,84 +25,235 @@ One assistant, one memory, one timeline. The user never needs to "start a new se
 
 ## Architecture
 
-### Handler + Dispatcher (Channel-per-Chat)
+### Three Decoupled Layers
 
-Message processing has two components. The `messages.reply_status` column
-is the DB-side state machine:
-
-```
-received → ready → processing → done
-```
+Argus is structured as three layers with strict import boundaries:
 
 ```
-IM message arrives
-    ↓
-HANDLER (fully reentrant, sub-millisecond)
-  ├─ parse webhook
-  ├─ INSERT raw message JSON → status=received
-  ├─ push QueuedMessage{ReadyCh} to Dispatcher's per-chat channel
-  └─ go ProcessMedia(msg, readyCh)
-       ├─ download media / transcribe audio / LLM correction
-       ├─ UPDATE content → processed text
-       ├─ UPDATE status → ready
-       └─ close(readyCh)
-    ↓
-DISPATCHER (one goroutine per chat, MPSC channel)
-  ├─ pop from channel
-  ├─ open thinking card IMMEDIATELY (one card per chat)
-  ├─ <-msg.ReadyCh  ← blocks until media goroutine finishes
-  │     (text = instant, audio = ~5s while card shows "thinking")
-  ├─ ClaimNextReply from DB (ready → processing)
-  ├─ Orchestrator (Phase 1): tools only, hard budgets
-  ├─ Synthesizer (Phase 2): SSE streaming → throttled card updates
-  ├─ FinishReply (processing → done)
-  └─ loop: pop next message from channel
+┌────────────────────────────────┐
+│  Frontend                      │  IM adapter, data prep, rendering
+│  (Feishu; future CLI/Slack)    │
+└────────────────────────────────┘
+              │  SubmitTask
+              ▼
+┌────────────────────────────────┐
+│  Agent                         │  task scheduler, two-phase execution,
+│  (scheduler + HandleStream)    │  trace persistence
+└────────────────────────────────┘
+              │  uses
+              ▼
+┌────────────────────────────────┐
+│  Backend                       │  LLM clients, tools, sandbox,
+│  (model / tool / sandbox /     │  embedding, render, skills
+│   embedding / render / skill)  │
+└────────────────────────────────┘
 ```
 
-There is no separate Filter stage. Media processing is an async goroutine
-per message, synchronized with the Dispatcher via a `chan struct{}`
-(`ReadyCh`). This solves the card-timing problem:
+Import direction is **Frontend → Agent → Backend**, never reversed.
+The Agent does not `import` any Frontend implementation; each Task
+carries its own Frontend reference, so UI callbacks route themselves.
 
-- **Card opens immediately**: Dispatcher pops → opens card before
-  waiting on ReadyCh. The user sees "💭 thinking" the instant the
-  Dispatcher reaches their message.
-- **At most one card per chat**: Dispatcher processes one message at a
-  time per chat. The next message's card only appears after the
-  previous reply is sent.
-- **No wasted wait for text messages**: ProcessMedia for text is just
-  a JSON parse — ReadyCh is closed before the Dispatcher even reads it.
+The two inter-layer interfaces:
 
-### Per-Chat FIFO Serialization
+```go
+type Agent interface {
+    SubmitTask(Task)                   // mpsc entry; sync tasks only
+    Run(ctx context.Context) error     // graceful start/stop
+}
 
-Each chat gets a buffered `chan QueuedMessage` (MPSC: Handler pushes,
-Dispatcher's goroutine consumes). Created lazily on first push via
-`sync.Map.LoadOrStore`. Different chats run fully in parallel.
+type Frontend interface {
+    SubmitMessage(*Message)            // mpsc entry; rendering queue
+    Run(ctx context.Context) error     // graceful start/stop
+}
+```
 
-The Handler's inbound path is completely reentrant — 5 messages arriving
-simultaneously for the same chat each do INSERT + channel push in
-sub-millisecond time. The Dispatcher drains them strictly FIFO.
+Async tasks (future: cron-driven, trace self-introspection, subagent
+orchestration) are produced **inside** the Agent and never traverse
+`SubmitTask`. The external surface stays minimal.
 
-### Crash Recovery
+### Task, Message, Payload
 
-On startup, `Dispatcher.Recover`:
-1. `processing → ready` in DB (agent was mid-run → re-process)
-2. `received` messages → re-spawn `ProcessMedia` goroutines
-   (media download was interrupted → retry from scratch)
-3. `ready` messages → push to chat channels with pre-closed ReadyCh
+```go
+type Task struct {
+    ChatID   string
+    Frontend Frontend              // reply channel for this task's UI
+    ReadyCh  <-chan Payload        // readiness signal + payload in one
+    // ...metadata (db message id, kind, lang, ...)
+}
 
-DB `source_im` + `msg_type` tell the recovery code which media
-processor to spawn (currently only Feishu; future IMs register their
-own processors).
+type Payload struct {
+    Content   string
+    FilePaths []string
+}
+
+type Message struct {
+    Events <-chan Event            // Agent produces, Frontend consumes
+    // ...minimal metadata (chat id, db msg id)
+}
+```
+
+`ReadyCh` is a buffered (cap 1) channel that carries the processed
+payload directly — no DB round-trip between Frontend and Agent after
+media is ready. `msg.Events` closing is the sole "this message is done"
+signal; no explicit `Close()` method.
+
+### Per-Task Lifecycle
+
+```
+Frontend inbound loop                 Agent run loop
+─────────────────────                 ──────────────
+webhook arrives                       task ← queue
+  INSERT raw message                  msg := new Message
+  Task{ReadyCh} constructed           task.Frontend.SubmitMessage(msg)
+  agent.SubmitTask(task)              payload := <-task.ReadyCh
+  go media.download+process           execute(payload, msg.Events)
+                                      close(msg.Events)
+media goroutine
+──────────────                        Frontend render loop
+download bytes → DB(downloaded)       ────────────────────
+process → DB(processed)               msg ← outbound queue
+payload → task.ReadyCh                open card
+                                      for ev := range msg.Events:
+                                          patch card
+                                      close card
+```
+
+Agent calls `SubmitMessage` **before** waiting on `ReadyCh` — this
+preserves the "thinking card appears instantly, even while audio is
+transcribing" UX.
+
+### Content State Machine
+
+Two independent state columns on `messages`:
+
+```
+content_status:  raw → downloaded → processed
+reply_status:    received → processing → done
+```
+
+- **raw**: webhook JSON stored; no bytes downloaded yet
+- **downloaded**: media bytes saved to `.files/`; transcription/extraction
+  pending. *Not interruptible* during graceful shutdown: Feishu file
+  resources expire and re-download may fail.
+- **processed**: transcription / OCR / post extraction done.
+  *Reproducible from local bytes* — safe to re-run after crash or
+  clean shutdown.
+
+### Single Active Card Per Chat
+
+This is a **Frontend implementation detail**, not an Agent scheduler
+concern. The Feishu Frontend uses a per-chat mpsc render loop; at most
+one card is "open" per chat at any instant. Agents may issue concurrent
+`SubmitMessage` calls — the Frontend serializes rendering within each
+chat because the IM UX requires it.
+
+### Replay Subsystem (Crash Recovery)
+
+Recovery is a standalone subsystem, not a Frontend feature. A
+**Registry** indexed by `source_im` lets the replay subsystem route
+each unfinished message back to the correct Frontend:
+
+```
+On startup:
+  1. Each Frontend registers itself in Registry (by source_im tag)
+  2. Replay subsystem scans messages WHERE reply_status != done
+  3. For each row: lookup Registry[source_im] → construct Task → SubmitTask
+  4. Agent processes replayed tasks identically to fresh ones
+```
+
+Replay handles the state combinations:
+- `content_status=raw`: re-spawn download (may fail if Feishu resource expired — logged, moved to error)
+- `content_status=downloaded`, not `processed`: re-run processing from local bytes
+- `content_status=processed`, `reply_status != done`: direct SubmitTask
+
+**Cards are not re-attached.** Feishu mostly rejects `update` calls on
+older message IDs after a process restart. Replay opens a fresh card
+per replayed task rather than relying on `reply_channel_id` continuity
+(the old value is retained for audit only).
+
+**Replay responsibility split**:
+- Agent guarantees *every task is idempotent and fully replayable* from
+  the DB state (key status transitions land on disk before the work starts)
+- Replay subsystem decides *when* and *what* to resubmit
+- Frontend provides the reply surface for replayed tasks via Registry
+
+### "Don't Lose IM Bytes" Shutdown
+
+One `ctx` cancel notifies everyone. Each loop decides how to exit
+based on its own semantics; ordering falls out naturally from the
+producer/consumer graph, no external staging controller.
+
+**Inbound loop** (Frontend) on `ctx.Done`:
+- close HTTP listener (no new webhooks accepted)
+- drain inbound channel: remaining events get `INSERT` + `SubmitTask`
+- exit
+
+**Media goroutines** (Frontend) — *do not observe ctx*:
+- each continues until its download phase lands bytes on disk
+- processing phase (transcription / extraction) is replayable, so it
+  may continue to completion or be abandoned at process exit; either
+  way `Frontend.Run` waits on a `WaitGroup` tracking these goroutines
+  before returning
+
+**Agent run loop** on `ctx.Done`:
+- stop taking new tasks from its queue
+- **finish the task currently in hand** (user-experience priority: the
+  Agent is slow relative to the Frontend, so the in-flight task is
+  almost always what the user is watching). `msg.Events` gets closed
+  normally at the end
+- queued-but-not-started tasks are dropped; they are persisted and
+  replayable on next startup
+- exit
+
+**Outbound (render) loop** (Frontend) on `ctx.Done`:
+- drain the outbound queue: for each queued `msg`, consume
+  `msg.Events` until closed, then close the card
+- this naturally synchronizes with the Agent: the loop blocks on
+  `msg.Events` exactly until the Agent's in-hand task closes it
+- exit when the queue is empty
+
+`Frontend.Run` returns after inbound + outbound + mediaWG all complete.
+`Agent.Run` returns after its in-hand task completes.
+
+```
+ctx cancel
+    │  (everyone sees it)
+    ├── inbound loop:    drain inbound → exit
+    ├── agent loop:      finish in-hand task (closes msg.Events) → exit
+    ├── outbound loop:   drain outbound queue (events closed by the
+    │                    exiting agent) → exit
+    └── media goroutines: finish download + process → readyCh <- payload
+
+Frontend.Run waits on (inbound + outbound + mediaWG), returns
+Agent.Run   waits on (in-hand task), returns
+```
+
+**Principle**: only IM-provided bytes are protected by the shutdown
+path; derived data relies on replay. A single ctx lets each loop
+express its own "what must I finish before exiting" rule locally,
+without a controller orchestrating stages.
+
+### Per-Chat FIFO Within Agent
+
+The per-chat MPSC channel structure that used to live in
+`feishu/dispatcher.go` moves **into the Agent scheduler**. Semantics
+are unchanged at this milestone:
+
+- One consumer goroutine per chat (created lazily via `sync.Map.LoadOrStore`)
+- Cross-chat parallelism preserved
+- Sync tasks ordered per chat; async tasks (future work) will run on a
+  global pool alongside this path, not replace it
 
 ### reply_channel_id Abstraction
 
-The reply card handle is IM-agnostic:
-- **Feishu**: message_id from ReplyRichWithID (used for PATCH updates)
+The reply card handle remains IM-agnostic:
+- **Feishu**: message_id from `ReplyRichWithID` (used for PATCH updates)
 - **Slack** (future): message ts
 - **CLI**: empty string
 
-The Adapter uses this handle to drive the card lifecycle without knowing
-which IM created it.
+It lives in `messages.reply_channel_id`, written by the Frontend when
+it opens a card. Agents never touch it; the audit role survives replay
+even though the card itself does not.
 
 ### Two-Phase Agent (Orchestrator + Synthesizer)
 
@@ -143,17 +294,19 @@ Argus handles all Feishu message types natively:
 
 | Message Type | Processing |
 |-------------|-----------|
-| **text** | Handler stores raw JSON → `ProcessMedia` extracts text (instant) |
-| **image** | Handler stores raw JSON → `ProcessMedia` downloads to `.files/` + saves `file_paths` to DB |
-| **post** (rich text) | Handler stores raw JSON → `ProcessMedia` extracts text + downloads images + saves `file_paths` to DB |
-| **audio** | Handler stores raw JSON → `ProcessMedia` downloads `.opus` → Whisper → LLM correction |
-| **file** (PDF, docx, etc.) | Handler stores raw JSON → `ProcessMedia` downloads to `.files/` → registers for RAG |
+| **text** | Frontend inbound stores raw JSON → media goroutine extracts text (instant) |
+| **image** | Frontend inbound stores raw JSON → media goroutine downloads to `.files/` + saves `file_paths` to DB |
+| **post** (rich text) | Frontend inbound stores raw JSON → media goroutine extracts text + downloads images + saves `file_paths` to DB |
+| **audio** | Frontend inbound stores raw JSON → media goroutine downloads `.opus` → Whisper → LLM correction |
+| **file** (PDF, docx, etc.) | Frontend inbound stores raw JSON → media goroutine downloads to `.files/` → registers for RAG |
 
-All media processing runs in an async goroutine (`ProcessMedia`) spawned
-by the Handler. The Handler's inbound path is sub-millisecond: INSERT +
-channel push + goroutine spawn. The Dispatcher opens the thinking card
-immediately on pop, then blocks on the goroutine's `ReadyCh` until
-content is ready.
+Media processing runs in async goroutines spawned by the Frontend
+inbound loop. The inbound path is sub-millisecond: INSERT + construct
+Task + `agent.SubmitTask` + spawn media goroutine. The media goroutine
+sends the processed `Payload` through `task.ReadyCh` when complete.
+The Agent opens the thinking card (via `task.Frontend.SubmitMessage`)
+immediately on task pop, then blocks on `ReadyCh` until content is
+ready.
 
 ### Vision (Multimodal Image Understanding)
 
@@ -161,7 +314,7 @@ Images flow end-to-end to vision-capable models (GPT-5.4, Gemini, Claude):
 
 ```
 Feishu image/post → download to .files/ → file_paths saved to DB
-    → HandleStreamQueued loads from disk → base64 data URL
+    → Agent loads from disk via Payload.FilePaths → base64 data URL
     → NewMultimodalMessage(text, dataURLs...)
     → OpenAI: ContentPart array (native)
     → Anthropic: {type:"image", source:{type:"base64",...}}
@@ -244,7 +397,7 @@ via `read_file` or `cli`.
 The LLM never sees raw conversation history. Both phases go through a curation pipeline, but they build different system prompts:
 
 ```
-Dispatcher pops a message, waits on ReadyCh, claims from DB
+Agent pops a task, opens card via Frontend, waits on ReadyCh for Payload
         ↓
 [1] History Curation (shared by both phases)
     - Load recent N messages from store
@@ -357,8 +510,8 @@ Phase 2 (synthesizer) streams its output via Server-Sent Events:
 ## Request Tracing
 
 Every message processing is recorded in `traces` + `tool_calls` tables.
-The Dispatcher tees the agent event stream — one path to the Adapter
-(UI), one path to the trace collector (DB).
+The Agent tees its own event stream — one path through `msg.Events` to
+the Frontend (UI), one path to the trace collector (DB).
 
 `traces`: one row per user-message → reply cycle. Fields: `message_id`,
 `reply_id`, `chat_id`, `orchestrator_model`, `synthesizer_model`,
@@ -480,15 +633,16 @@ unified-memory Macs.
 
 All agent output is delivered as **Feishu interactive cards** (`msg_type: "interactive"`), schema 2.0 with `update_multi: true` so the same card can be PATCHed multiple times as state evolves:
 
-1. **Thinking card** — sent by Dispatcher on pop ("💭 正在思考…")
+1. **Thinking card** — opened by the Frontend render loop on `SubmitMessage` pop ("💭 正在思考…")
 2. **Tool status card** — humanized per tool (e.g. `🔍 正在搜索: X`)
 3. **Composing card** — Phase 1→2 transition ("✍️ 正在撰写回复…")
 4. **Streaming reply card** — first 3 updates instant, then ~500 ms throttle
 5. **Final reply card** — full markdown + LaTeX images
 
-All cards are PATCHed onto the same `reply_channel_id` created by the
-thinking card. The adapter receives events from the Dispatcher (which
-runs the agent) and drives the card lifecycle.
+All cards are PATCHed onto the same `reply_channel_id` created when the
+Frontend opens the thinking card. The Frontend render loop consumes
+`msg.Events` pushed by the Agent and drives the card lifecycle; closing
+`msg.Events` is the signal to close (finalize) the card.
 
 ### LaTeX Rendering
 
@@ -680,7 +834,7 @@ CREATE TABLE messages (
     tool_name   TEXT,
     tool_call_id TEXT,
     -- metadata
-    source_im   TEXT NOT NULL DEFAULT 'unknown',  -- feishu / cli / cron
+    source_im   TEXT NOT NULL DEFAULT 'unknown',  -- feishu / cli / ...
     channel     TEXT NOT NULL DEFAULT '',
     source_ts   TIMESTAMPTZ,
     msg_type    TEXT NOT NULL DEFAULT 'text',     -- text / image / audio / file
@@ -688,9 +842,10 @@ CREATE TABLE messages (
     sender_id   TEXT,
     embedding   vector(768),                      -- nullable; async-filled
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    -- Pipeline queue (user messages only; NULL for assistant/tool msgs)
-    reply_status     TEXT,                        -- received/ready/processing/done
-    reply_channel_id TEXT,                        -- IM-abstract card handle (set on ACK)
+    -- Pipeline state (user messages only; NULL for assistant/tool msgs)
+    content_status   TEXT,                        -- raw/downloaded/processed
+    reply_status     TEXT,                        -- received/processing/done
+    reply_channel_id TEXT,                        -- IM-abstract card handle (Frontend-written)
     trigger_msg_id   TEXT                         -- IM trigger message ID (reply thread root)
 );
 
@@ -734,14 +889,6 @@ is applied transparently by the tool layer.
 Database is optional — server mode falls back to memory store if PostgreSQL is unavailable, though semantic recall, pinned memories, and document RAG are disabled in that mode.
 
 `docker-compose.yaml` provided for one-command PostgreSQL+pgvector setup: `make up`.
-
----
-
-## Scheduled Tasks
-
-Background goroutine runs a cron scheduler, independent of user interaction:
-- Jobs defined in config (name, hour, minute, target chat_id, prompt)
-- Each job runs `agent.Handle()` (synchronous wrapper over the two-phase stream) and pushes the result via Feishu
 
 ---
 
@@ -822,9 +969,6 @@ sandbox:
   timeout: 30s
   memory_limit: "512m"    # docker only
   network: "none"         # docker only
-
-cron:
-  jobs: []
 ```
 
 The legacy single-model format (`model.base_url`, `model.model_name`, etc.)
@@ -839,26 +983,39 @@ but new deployments should use the `upstreams` + per-role `model` structure.
 cmd/argus/main.go            Entry point, --workspace flag (default ~/.argus)
 internal/
   agent/
-    agent.go                 Two-phase orchestrator + streaming synthesizer;
-                             HandleStreamQueued for pipeline mode,
-                             HandleStream/Handle for CLI/Cron
+    agent.go                 Interface: SubmitTask + Run; Task/Payload/Message
+                             types. Two-phase orchestrator + streaming synthesizer.
+    scheduler.go             Per-chat MPSC channel, sync.Map chat registry,
+                             graceful shutdown (drain current in-hand task)
+    task_store.go            reply_status state transitions (processing → done)
+                             wrapping messages table semantics
     harness.go               Context curation: history + two prompt builders
     prompts.go               OrchestratorPrompt + SynthesizerPrompt constants
     event.go                 Event types: Thinking, ToolCall, ToolResult,
                              ReplyDelta, Reply, Error
+  frontend/
+    frontend.go              Frontend interface (SubmitMessage / Run /
+                             StopInbound); Registry indexed by source_im
+  replay/
+    replay.go                Startup replay subsystem: scan messages
+                             WHERE reply_status != done; route by
+                             source_im → Registry → construct Task →
+                             agent.SubmitTask
   config/config.go           YAML config + env overrides
-  cron/cron.go               Daily job scheduler
   docindex/ingest.go         Document RAG ingester (chunk + embed)
   embedding/
     client.go                Embedding HTTP client (OpenAI-compatible)
     worker.go                Async worker: embed unembedded messages/memories/chunks
-  feishu/
-    handler.go               Webhook inbound (INSERT + channel push +
-                             spawn ProcessMedia goroutine); media
-                             processing (download, Whisper, LLM correction)
-    dispatcher.go            Per-chat MPSC channel, thinking card on pop,
-                             ReadyCh wait, agent dispatch, crash recovery
-    adapter.go               Agent events → card PATCHes (throttled streaming)
+  feishu/                    Frontend implementation for Feishu
+    frontend.go              Implements frontend.Frontend; owns inbound +
+                             outbound mpsc loops, per-chat render serialization
+    handler.go               HTTP webhook handler: parse → inbound channel
+    inbound.go               Inbound loop: INSERT raw → construct Task →
+                             SubmitTask → spawn media goroutines
+    media.go                 Download (protected) + process (replayable):
+                             Whisper transcription, LLM correction, post extract
+    render.go                Render loop: open card → consume msg.Events →
+                             patch card → close card
     client.go                Feishu API: reply, send, upload image, download
     card.go                  Interactive card builders + per-tool humanizer
     event.go                 Event type definitions
@@ -938,12 +1095,14 @@ third_party/ratex/           Embedded Rust LaTeX renderer (CGo)
 
 ## Deployment Constraints
 
-- **Single instance only.** Per-chat serialization relies on in-memory
-  `sync.Map` + goroutine-per-chat. The DB uses `FOR UPDATE SKIP LOCKED`
-  which is multi-process-safe at the claim level, but the thinking card
-  lifecycle and ReadyCh coordination assume a single server process. To
-  support horizontal scaling, the per-chat "only one consumer" guarantee
-  would need to be promoted to a DB advisory lock or lease mechanism.
+- **Single instance only.** Per-chat serialization (inside Agent
+  scheduler and Frontend render loop) relies on in-memory `sync.Map`
+  + goroutine-per-chat. ReadyCh coordination between Frontend media
+  goroutines and Agent task execution assumes a single server process.
+  To support horizontal scaling, the "one consumer per chat" guarantee
+  at both layers would need to be promoted to DB advisory locks or
+  leases, and the ReadyCh channel replaced with a DB-poll or pub/sub
+  mechanism that can cross process boundaries.
 
 - **Webhook security.** The Handler currently parses the Feishu webhook
   envelope and deduplicates by event ID, but does not verify the
@@ -1045,15 +1204,29 @@ decision should be revisited.
   not prompts
 - Two narrow roles beat one wide role (Orchestrator + Synthesizer)
 - Tool calls and execution are orthogonal (tool layer × sandbox layer)
-- **Store first, process later** — MQTT QoS=1: persist the message before
-  any processing or acknowledgment. Crash at any point = no data loss
-- **Per-chat serial, cross-chat parallel** — MPSC channel per chat with
-  async media goroutines; `ReadyCh` synchronizes content readiness without
-  polling or state tracking
+- **Three layers, strict import direction** — Frontend → Agent → Backend.
+  Agent does not know which Frontend a task came from; Task carries its
+  own Frontend reference. Layers communicate through value types
+  (Task / Message / Event / Payload), not service registries
+- **Protect IM bytes, replay everything else** — the shutdown path
+  guarantees webhook bytes + downloaded media land on disk. Transcription,
+  extraction, agent execution, card rendering are all re-playable
+- **Finish the task currently in hand** at shutdown — Agent is slower
+  than Frontend, so the in-flight task is almost always the user's
+  visible thinking card. Completing it preserves UX; dropped queue
+  items are recovered by replay
+- **Single active card per chat is a Frontend concern** — the Agent
+  may be concurrent across chats; rendering serialization is implemented
+  in the Frontend's per-chat render loop because the IM UX requires it
+- **Store first, process later** — persist the message before any
+  processing or acknowledgment. Crash at any point = no data loss
+- **Async tasks are internal** — `SubmitTask` accepts only synchronous,
+  IM-originated tasks. Cron-driven, self-introspection, and subagent
+  tasks are produced inside the Agent and never traverse the external
+  interface; this keeps the surface minimal and future-proof
 - Builtin skills compiled in with platform build tags; user skills are files
 - Skills grow organically through use, not through code changes
 - All media saved to workspace for memory system reference
-- Local models handle everything; API cost approaches zero
 - **Use the best model for each role** — commercial APIs for orchestrator
   (tool calling quality) and synthesizer (answer quality); local models
   for fallback, transcription, and embedding. The harness guardrails
