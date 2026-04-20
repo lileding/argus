@@ -266,15 +266,14 @@ into two narrow roles dramatically improves reliability:
   ("your text output is DISCARDED"). It loops until it calls `finish_task`
   with a summary, gets force-stopped by the harness (see below), or hits
   `max_iterations`.
-- **Synthesizer** only writes the answer. It receives the user question, the
-  curated history, and a `Materials` block containing every tool result and
-  the orchestrator's summary. No tools are available — it must work from
-  what Phase 1 gathered.
+- **Synthesizer** only writes the answer. It receives the user question
+  and a `Materials` block containing every tool result and the orchestrator's
+  summary. No conversation history, no tools — it composes purely from what
+  Phase 1 gathered. This keeps the synthesizer cheap and immune to context
+  pollution.
 
-Both phases share the same conversation/material pipeline, but may use
-different role-specific model clients (e.g. Claude for orchestration,
-Gemini for synthesis). The difference is the system prompt, the tool list
-(empty for Phase 2), and potentially the upstream provider.
+Both phases may use different role-specific model clients (e.g. Claude for
+orchestration, Gemini for synthesis).
 
 ### Tool vs Sandbox Orthogonality
 
@@ -394,16 +393,20 @@ via `read_file` or `cli`.
 
 **Core principle: context is a scarce, finite resource. Only high-signal content goes in.**
 
-The LLM never sees raw conversation history. Both phases go through a curation pipeline, but they build different system prompts:
+The LLM never sees raw conversation history. The orchestrator goes through a
+curation pipeline; the synthesizer receives no history at all (only user
+question + materials from Phase 1).
 
 ```
 Agent pops a task, opens card via Frontend, waits on ReadyCh for Payload
         ↓
-[1] History Curation (shared by both phases)
+[1] History Curation (orchestrator only)
     - Load recent N messages from store
     - Semantic recall: embed current message, pgvector search older messages
     - Filter: user messages + assistant final replies only
     - Remove: tool_call / tool_result noise
+    - Summarize: long assistant replies (>800 runes) replaced with
+      async-generated summary, or truncated as fallback
     - Re-inject images from .files/ for multi-turn vision
         ↓
 [2a] Orchestrator Prompt                [2b] Synthesizer Prompt
@@ -411,15 +414,31 @@ Agent pops a task, opens card via Frontend, waits on ReadyCh for Payload
        rules, loop prevention)                 rules, language matching)
      - Environment (date, workspace)          - Environment
      - Pinned memories                        - Pinned memories
-     - Builtin skill prompts                  (no skills/tools — just compose)
+     - Builtin skill prompts                  (no history, no skills/tools)
      - User skill catalog (name + desc)
         ↓                                        ↓
 [3] Assemble                            [3] Assemble
-    [sys] + [history] + [user]              [sys] + [history] + [user]
+    [sys] + [history] + [user]              [sys] + [user]
                                               + [materials from Phase 1]
         ↓                                        ↓
    Model.Chat (with tools)                  Model.ChatStream (no tools)
 ```
+
+### Assistant Reply Summarization
+
+Long assistant replies in context can dominate the orchestrator's attention
+and cause it to respond to old topics instead of the current message. To
+prevent this while preserving context capability:
+
+- **Async summaries**: a background worker (sharing the embedding worker
+  loop) calls the synthesizer model to generate 2-3 sentence summaries for
+  assistant messages exceeding ~800 runes. Stored in `messages.summary`.
+- **In curateHistory**: if `summary` is available, the long reply is replaced
+  with `[Summary of previous reply] <summary>`. Otherwise, truncated to
+  800 runes as fallback.
+- **On-demand retrieval**: the `search_history` tool lets the orchestrator
+  retrieve full original text via semantic search when a summary isn't
+  sufficient (e.g., user says "expand on your third point earlier").
 
 ### Safety
 
@@ -722,6 +741,7 @@ skills, but the final authoring remains human-controlled.
 | `forget` | Deactivate a pinned memory by ID | — |
 | `search_docs` | Semantic search over indexed document chunks | — |
 | `list_docs` | List all indexed documents in knowledge base | — |
+| `search_history` | Semantic search over conversation history | — |
 
 Removed tools: `save_skill` (skills are human-authored), `db_exec` (replaced
 by the structured `db` tool).
@@ -808,7 +828,7 @@ Argus has three memory layers, all active:
 
 | Layer | Scope | Mechanism |
 |-------|-------|-----------|
-| **Sliding window** | Last `context_window` messages | Direct load from `messages` table |
+| **Sliding window** | Last `orchestrator_context_window` messages | Direct load from `messages` table; long replies replaced with summaries |
 | **Semantic recall** | All historical messages | pgvector cosine search on the current message's embedding, deduped against the window |
 | **Pinned memories** | User-curated persistent notes | `memories` table; agent uses `remember`/`forget` tools; pgvector embeds them for recall |
 
@@ -947,8 +967,7 @@ database:
 
 agent:
   max_iterations: 10
-  context_window: 20                  # synthesizer history window
-  orchestrator_context_window: 10     # smaller to save tokens
+  orchestrator_context_window: 10     # orchestrator history window
   skill_rescan: 30s
 
 search:
@@ -1053,6 +1072,7 @@ internal/
       001_init.sql           messages table
       002_memory_system.sql  pgvector + memories + documents + chunks
       003_message_queue.sql  reply_status + reply_channel_id + trigger_msg_id
+      005_message_summary.sql summary column for async assistant reply summarization
   tool/
     tool.go                  Tool interface + ToolDef conversion
     registry.go              Registry with name lookup
@@ -1066,6 +1086,7 @@ internal/
     activate_skill.go        Load skill prompt on demand
     remember.go / forget.go  Pinned memory management
     search_docs.go           Document search + list tools (knowledge base)
+    search_history.go        Conversation history semantic search
     finish_task.go           Sentinel tool (orchestrator exit signal)
     context.go               ChatID context key for tools
 third_party/ratex/           Embedded Rust LaTeX renderer (CGo)
@@ -1176,6 +1197,25 @@ model round-trip (5-10s on local MoE) to every message — the latency cost
 exceeds the retrieval quality gain. The sliding window of recent messages
 already provides pronoun context for most practical cases. Revisit if a
 sub-100ms rewrite model becomes available locally.
+
+**Full assistant replies in orchestrator context (removed).** The original
+design passed raw conversation history — including full-length assistant
+replies — to both orchestrator and synthesizer. A production bug exposed
+the flaw: the user sent a short voice message about Mozart (msg 381), but
+the orchestrator's 10-message sliding window contained a previous 3000+
+character reply about AI video storyboard tools (msg 376). GPT-5.4's
+attention was dominated by the voluminous old topic and it ran 4 search
+iterations about AI video tools, completely ignoring the current message.
+The trace confirmed semantic recall was not at fault — the pollution came
+entirely from the sliding window's unabridged assistant replies.
+
+The fix has three parts: (1) long assistant replies (>800 runes) in history
+are replaced with async-generated summaries (background worker, synthesizer
+model), or truncated as fallback; (2) a `search_history` tool lets the
+orchestrator retrieve full original text on demand; (3) the synthesizer
+receives no conversation history at all — only the user's current message
+and materials gathered by Phase 1. This treats past replies like uploaded
+documents: summaries in context, full text retrievable on demand.
 
 **Tool output dynamic summarization.** Instead of byte-truncating tool
 results at 16 KB, run a small model to summarize long outputs (web pages,

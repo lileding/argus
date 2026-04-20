@@ -19,6 +19,7 @@ type StoredMessage struct {
 	MsgType    string     // "text", "image", "audio", "file", "post"
 	FilePaths  []string   // paths to saved media files
 	SenderID   string     // user identity from source IM
+	Summary    *string   // async-generated summary for long assistant replies
 	CreatedAt  time.Time
 
 	// Queue fields — only meaningful for user messages in the pipeline.
@@ -40,6 +41,10 @@ type SemanticStore interface {
 	SearchMessages(ctx context.Context, embedding []float32, chatID string, limit int) ([]StoredMessage, error)
 	UnembeddedMessages(ctx context.Context, limit int) ([]StoredMessage, error)
 	SetMessageEmbedding(ctx context.Context, messageID int64, embedding []float32) error
+	// UnsummarizedMessages returns long assistant messages that need summary generation.
+	UnsummarizedMessages(ctx context.Context, limit int) ([]StoredMessage, error)
+	// SetMessageSummary stores the async-generated summary.
+	SetMessageSummary(ctx context.Context, messageID int64, summary string) error
 }
 
 // PinnedMemoryStore manages pinned user memories.

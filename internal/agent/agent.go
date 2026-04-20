@@ -77,12 +77,11 @@ type Agent struct {
 	skillIndex                *skill.SkillIndex
 	embedder                  *embedding.Client
 	workspaceDir              string
-	contextWindow             int // synthesizer history window
-	orchestratorContextWindow int // orchestrator history window (smaller)
+	orchestratorContextWindow int // orchestrator history window
 	maxIterations             int
 }
 
-func New(orchestrator, synthesizer model.Client, st store.Store, toolReg *tool.Registry, skillIdx *skill.SkillIndex, embedder *embedding.Client, workspaceDir string, contextWindow, orchestratorContextWindow, maxIterations int) *Agent {
+func New(orchestrator, synthesizer model.Client, st store.Store, toolReg *tool.Registry, skillIdx *skill.SkillIndex, embedder *embedding.Client, workspaceDir string, orchestratorContextWindow, maxIterations int) *Agent {
 	if maxIterations == 0 {
 		maxIterations = 10
 	}
@@ -94,7 +93,6 @@ func New(orchestrator, synthesizer model.Client, st store.Store, toolReg *tool.R
 		skillIndex:                skillIdx,
 		embedder:                  embedder,
 		workspaceDir:              workspaceDir,
-		contextWindow:             contextWindow,
 		orchestratorContextWindow: orchestratorContextWindow,
 		maxIterations:             maxIterations,
 	}
@@ -163,13 +161,8 @@ func (a *Agent) HandleStream(ctx context.Context, chatID string, userMsg model.M
 			TotalCompletionTokens: orchStats.TotalCompletionTokens,
 		}}
 
-		// Phase 2: Synthesis — full context window for richer answers.
-		synthHistory, err := a.loadHistory(ctx, chatID, savedMsg.ID, a.contextWindow)
-		if err != nil {
-			ch <- Event{Type: EventError, Payload: ErrorPayload{Err: err}}
-			return
-		}
-		reply, synthPT, synthCT := a.runSynthesizer(ctx, ch, userMsg, userText, synthHistory, toolResults, finishSummary)
+		// Phase 2: Synthesis — no history, only materials from Phase 1.
+		reply, synthPT, synthCT := a.runSynthesizer(ctx, ch, userMsg, userText, toolResults, finishSummary)
 
 		// Save assistant reply.
 		savedReply := &store.StoredMessage{
@@ -221,13 +214,8 @@ func (a *Agent) HandleStreamQueued(ctx context.Context, chatID string, savedMsgI
 			TotalCompletionTokens: orchStats.TotalCompletionTokens,
 		}}
 
-		// Phase 2: Synthesis — full context window.
-		synthHistory, err := a.loadHistory(ctx, chatID, savedMsgID, a.contextWindow)
-		if err != nil {
-			ch <- Event{Type: EventError, Payload: ErrorPayload{Err: err}}
-			return
-		}
-		reply, synthPT, synthCT := a.runSynthesizer(ctx, ch, userMsg, userText, synthHistory, toolResults, finishSummary)
+		// Phase 2: Synthesis — no history needed, only materials from Phase 1.
+		reply, synthPT, synthCT := a.runSynthesizer(ctx, ch, userMsg, userText, toolResults, finishSummary)
 
 		// Save assistant reply.
 		savedReply := &store.StoredMessage{
@@ -476,7 +464,6 @@ func (a *Agent) runSynthesizer(
 	ch chan<- Event,
 	userMsg model.Message,
 	userText string,
-	history []model.Message,
 	toolResults []toolCallRecord,
 	summary string,
 ) (text string, promptTokens, completionTokens int) {
@@ -502,16 +489,16 @@ func (a *Agent) runSynthesizer(
 		materials.WriteString("(No tool results — answer from conversation context alone.)\n")
 	}
 
-	// Messages: system + history + user + materials (as user, not system —
-	// Anthropic/Gemini only support one system message).
-	messages := make([]model.Message, 0, len(history)+3)
-	messages = append(messages, model.Message{Role: model.RoleSystem, Content: sysPrompt})
-	messages = append(messages, history...)
+	// Messages: system + user + materials. No history — the orchestrator
+	// has already gathered all needed context into materials.
+	messages := []model.Message{
+		{Role: model.RoleSystem, Content: sysPrompt},
+	}
 	userMsg.Role = model.RoleUser
 	messages = append(messages, userMsg)
 	messages = append(messages, model.Message{Role: model.RoleUser, Content: materials.String()})
 
-	slog.Info("synthesizer call", "materials_len", materials.Len(), "history_len", len(history))
+	slog.Info("synthesizer call", "materials_len", materials.Len())
 
 	stream, err := a.synthesizer.ChatStream(ctx, messages, nil) // no tools
 	if err != nil {

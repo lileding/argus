@@ -110,7 +110,7 @@ func (s *PostgresStore) SaveMessage(ctx context.Context, msg *StoredMessage) err
 func (s *PostgresStore) RecentMessages(ctx context.Context, chatID string, limit int) ([]StoredMessage, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, chat_id, role, content, tool_name, tool_call_id,
-			source_im, channel, source_ts, msg_type, file_paths, sender_id, created_at
+			source_im, channel, source_ts, msg_type, file_paths, sender_id, summary, created_at
 		FROM messages
 		WHERE chat_id = $1
 		ORDER BY created_at DESC
@@ -125,7 +125,7 @@ func (s *PostgresStore) RecentMessages(ctx context.Context, chatID string, limit
 	for rows.Next() {
 		var m StoredMessage
 		if err := rows.Scan(&m.ID, &m.ChatID, &m.Role, &m.Content, &m.ToolName, &m.ToolCallID,
-			&m.SourceIM, &m.Channel, &m.SourceTS, &m.MsgType, pq.Array(&m.FilePaths), &m.SenderID, &m.CreatedAt); err != nil {
+			&m.SourceIM, &m.Channel, &m.SourceTS, &m.MsgType, pq.Array(&m.FilePaths), &m.SenderID, &m.Summary, &m.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan message: %w", err)
 		}
 		messages = append(messages, m)
@@ -195,6 +195,36 @@ func (s *PostgresStore) UnembeddedMessages(ctx context.Context, limit int) ([]St
 func (s *PostgresStore) SetMessageEmbedding(ctx context.Context, messageID int64, embedding []float32) error {
 	vec := pgvector.NewVector(embedding)
 	_, err := s.db.ExecContext(ctx, `UPDATE messages SET embedding = $1 WHERE id = $2`, vec, messageID)
+	return err
+}
+
+func (s *PostgresStore) UnsummarizedMessages(ctx context.Context, limit int) ([]StoredMessage, error) {
+	// 2400 bytes ≈ 800 CJK runes. Only assistant replies above this threshold need summaries.
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, content
+		FROM messages
+		WHERE summary IS NULL AND role = 'assistant' AND LENGTH(content) > 2400
+		ORDER BY id
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query unsummarized messages: %w", err)
+	}
+	defer rows.Close()
+
+	var msgs []StoredMessage
+	for i := 0; rows.Next(); i++ {
+		var m StoredMessage
+		if err := rows.Scan(&m.ID, &m.Content); err != nil {
+			return nil, fmt.Errorf("scan unsummarized: %w", err)
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs, nil
+}
+
+func (s *PostgresStore) SetMessageSummary(ctx context.Context, messageID int64, summary string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE messages SET summary = $1 WHERE id = $2`, summary, messageID)
 	return err
 }
 

@@ -97,8 +97,8 @@ type DatabaseConfig struct {
 
 type AgentConfig struct {
 	MaxIterations             int           `yaml:"max_iterations"`
-	ContextWindow             int           `yaml:"context_window"`              // synthesizer history window
-	OrchestratorContextWindow int           `yaml:"orchestrator_context_window"` // orchestrator history window (smaller)
+	ContextWindow             int           `yaml:"context_window"`              // deprecated: synthesizer no longer uses history
+	OrchestratorContextWindow int           `yaml:"orchestrator_context_window"` // orchestrator history window
 	SystemPrompt              string        `yaml:"system_prompt"`
 	WorkspaceDir              string        `yaml:"workspace_dir"`
 	SkillsDir                 string        `yaml:"skills_dir"`

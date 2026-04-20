@@ -219,7 +219,20 @@ func (a *Agent) curateHistory(messages []store.StoredMessage) []model.Message {
 			}
 		case "assistant":
 			if m.Content != "" && m.ToolCallID == nil {
-				curated = append(curated, model.Message{Role: model.RoleAssistant, Content: m.Content})
+				content := m.Content
+				// For long assistant replies: use async-generated summary if
+				// available, otherwise truncate as fallback. This prevents old
+				// verbose answers from overshadowing the current user message.
+				// The orchestrator can use search_history to retrieve full text.
+				const maxAssistantHistoryRunes = 800
+				if runes := []rune(content); len(runes) > maxAssistantHistoryRunes {
+					if m.Summary != nil && *m.Summary != "" {
+						content = "[Summary of previous reply] " + *m.Summary
+					} else {
+						content = string(runes[:maxAssistantHistoryRunes]) + " …[truncated, use search_history for full text]"
+					}
+				}
+				curated = append(curated, model.Message{Role: model.RoleAssistant, Content: content})
 			}
 		}
 	}

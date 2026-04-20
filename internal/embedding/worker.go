@@ -2,24 +2,28 @@ package embedding
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
+	"argus/internal/model"
 	"argus/internal/store"
 )
 
-// Worker runs a background loop that embeds unembedded messages and chunks.
+// Worker runs a background loop that embeds unembedded messages/chunks
+// and generates summaries for long assistant replies.
 type Worker struct {
-	client    *Client
-	semantic  store.SemanticStore
-	pinned    store.PinnedMemoryStore
-	docs      store.DocumentStore
-	batchSize int
-	interval  time.Duration
-	notify    chan struct{}
-	quit      chan struct{}
-	wg        sync.WaitGroup
+	client       *Client
+	semantic     store.SemanticStore
+	pinned       store.PinnedMemoryStore
+	docs         store.DocumentStore
+	summarizer   model.Client // cheap/fast model for summary generation (may be nil)
+	batchSize    int
+	interval     time.Duration
+	notify       chan struct{}
+	quit         chan struct{}
+	wg           sync.WaitGroup
 }
 
 func NewWorker(client *Client, semantic store.SemanticStore, pinned store.PinnedMemoryStore, docs store.DocumentStore, batchSize int, interval time.Duration) *Worker {
@@ -79,6 +83,11 @@ func (w *Worker) run() {
 	}
 }
 
+// SetSummarizer configures the model client used for async summary generation.
+func (w *Worker) SetSummarizer(client model.Client) {
+	w.summarizer = client
+}
+
 func (w *Worker) processAll() {
 	ctx := context.Background()
 
@@ -90,6 +99,11 @@ func (w *Worker) processAll() {
 	// Embed unembedded chunks.
 	if w.docs != nil {
 		w.embedChunks(ctx)
+	}
+
+	// Summarize long assistant replies.
+	if w.summarizer != nil && w.semantic != nil {
+		w.summarizeMessages(ctx)
 	}
 }
 
@@ -178,4 +192,38 @@ func (w *Worker) embedChunks(ctx context.Context) {
 	}
 
 	slog.Info("embedded chunks", "count", len(chunks))
+}
+
+const summaryPrompt = `Summarize the following assistant reply in 2-3 concise sentences.
+Preserve the key facts, conclusions, and any specific data points.
+Use the same language as the original. Output ONLY the summary, nothing else.`
+
+func (w *Worker) summarizeMessages(ctx context.Context) {
+	msgs, err := w.semantic.UnsummarizedMessages(ctx, 5)
+	if err != nil {
+		slog.Warn("fetch unsummarized messages", "err", err)
+		return
+	}
+	if len(msgs) == 0 {
+		return
+	}
+
+	for _, m := range msgs {
+		messages := []model.Message{
+			{Role: model.RoleSystem, Content: summaryPrompt},
+			{Role: model.RoleUser, Content: m.Content},
+		}
+		resp, err := w.summarizer.Chat(ctx, messages, nil)
+		if err != nil {
+			slog.Warn("summarize message failed", "id", m.ID, "err", err)
+			// Set empty summary to avoid retrying failed messages forever.
+			w.semantic.SetMessageSummary(ctx, m.ID, fmt.Sprintf("[summary failed: %v]", err))
+			continue
+		}
+		if err := w.semantic.SetMessageSummary(ctx, m.ID, resp.Content); err != nil {
+			slog.Warn("set message summary", "id", m.ID, "err", err)
+		}
+	}
+
+	slog.Info("summarized messages", "count", len(msgs))
 }

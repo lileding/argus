@@ -128,6 +128,11 @@ func buildToolRegistry(cfg *config.Config, sb sandbox.Sandbox, loader *skill.Fil
 		registry.Register(tool.NewListDocsTool(ds))
 	}
 
+	// Conversation history search (available when store supports semantic search).
+	if ss, ok := st.(store.SemanticStore); ok && embedClient != nil {
+		registry.Register(tool.NewSearchHistoryTool(ss, embedClient))
+	}
+
 	return registry
 }
 
@@ -208,6 +213,7 @@ func runServer(cfg *config.Config) {
 				ds = d
 			}
 			embedWorker := embedding.NewWorker(embedClient, ss, ps, ds, cfg.Embedding.BatchSize, cfg.Embedding.Interval)
+			embedWorker.SetSummarizer(synthClient) // cheap model for async summary generation
 			embedWorker.Start()
 			defer embedWorker.Stop()
 		} else {
@@ -217,7 +223,7 @@ func runServer(cfg *config.Config) {
 
 	sb := buildSandbox(cfg)
 	toolReg := buildToolRegistry(cfg, sb, loader, db, st, embedClient)
-	ag := agent.New(orchClient, synthClient, st, toolReg, loader.Index(), embedClient, cfg.Agent.WorkspaceDir, cfg.Agent.ContextWindow, cfg.Agent.OrchestratorContextWindow, cfg.Agent.MaxIterations)
+	ag := agent.New(orchClient, synthClient, st, toolReg, loader.Index(), embedClient, cfg.Agent.WorkspaceDir, cfg.Agent.OrchestratorContextWindow, cfg.Agent.MaxIterations)
 
 	feishuClient := feishu.NewClient(cfg.Feishu)
 	processor := render.NewProcessor(feishuClient)
