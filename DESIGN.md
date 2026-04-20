@@ -63,8 +63,7 @@ type Agent interface {
 
 type Frontend interface {
     SubmitMessage(*Message)            // mpsc entry; rendering queue
-    Run(ctx context.Context) error
-    StopInbound(ctx context.Context)   // stage-1 shutdown (see below)
+    Run(ctx context.Context) error     // graceful start/stop
 }
 ```
 
@@ -180,42 +179,59 @@ per replayed task rather than relying on `reply_channel_id` continuity
 
 ### "Don't Lose IM Bytes" Shutdown
 
-Three-stage shutdown guarantees at-least-once persistence of external
-data. The principle: **only IM-provided bytes are protected by the
-shutdown path; derived data relies on replay**.
+One `ctx` cancel notifies everyone. Each loop decides how to exit
+based on its own semantics; ordering falls out naturally from the
+producer/consumer graph, no external staging controller.
 
-**Stage 1 — Seal inbound.** `Frontend.StopInbound`:
+**Inbound loop** (Frontend) on `ctx.Done`:
 - close HTTP listener (no new webhooks accepted)
 - drain inbound channel: remaining events get `INSERT` + `SubmitTask`
-- wait for all *download* goroutines to finish (bytes land in `.files/`)
-- *processing* goroutines (transcription / extraction) are **not**
-  waited on — they are replayable from local bytes
+- exit
 
-**Stage 2 — Finish current work.** Agent receives `ctx.Done`:
+**Media goroutines** (Frontend) — *do not observe ctx*:
+- each continues until its download phase lands bytes on disk
+- processing phase (transcription / extraction) is replayable, so it
+  may continue to completion or be abandoned at process exit; either
+  way `Frontend.Run` waits on a `WaitGroup` tracking these goroutines
+  before returning
+
+**Agent run loop** on `ctx.Done`:
 - stop taking new tasks from its queue
 - **finish the task currently in hand** (user-experience priority: the
   Agent is slow relative to the Frontend, so the in-flight task is
-  almost always what the user is watching right now)
+  almost always what the user is watching). `msg.Events` gets closed
+  normally at the end
 - queued-but-not-started tasks are dropped; they are persisted and
   replayable on next startup
+- exit
 
-**Stage 3 — Seal outbound.** `Frontend.Run` exits:
-- render loop drains its current msg (its `Events` was just closed by
-  the exiting Agent)
-- close outbound mpsc; return
+**Outbound (render) loop** (Frontend) on `ctx.Done`:
+- drain the outbound queue: for each queued `msg`, consume
+  `msg.Events` until closed, then close the card
+- this naturally synchronizes with the Agent: the loop blocks on
+  `msg.Events` exactly until the Agent's in-hand task closes it
+- exit when the queue is empty
+
+`Frontend.Run` returns after inbound + outbound + mediaWG all complete.
+`Agent.Run` returns after its in-hand task completes.
 
 ```
 ctx cancel
-    │
-    ▼
-frontend.StopInbound()          ← stage 1: IM bytes safe
-    │
-    ▼
-agent cancel + wait             ← stage 2: in-hand task done
-    │
-    ▼
-frontend.Run returns            ← stage 3: UI settled
+    │  (everyone sees it)
+    ├── inbound loop:    drain inbound → exit
+    ├── agent loop:      finish in-hand task (closes msg.Events) → exit
+    ├── outbound loop:   drain outbound queue (events closed by the
+    │                    exiting agent) → exit
+    └── media goroutines: finish download + process → readyCh <- payload
+
+Frontend.Run waits on (inbound + outbound + mediaWG), returns
+Agent.Run   waits on (in-hand task), returns
 ```
+
+**Principle**: only IM-provided bytes are protected by the shutdown
+path; derived data relies on replay. A single ctx lets each loop
+express its own "what must I finish before exiting" rule locally,
+without a controller orchestrating stages.
 
 ### Per-Chat FIFO Within Agent
 
