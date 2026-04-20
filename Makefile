@@ -1,41 +1,17 @@
-.PHONY: build run test clean sandbox up down ratex ratex-clean
+.PHONY: build run test check clean
 
-# Path to the RaTeX static library produced by cargo.
-RATEX_LIB := third_party/ratex/target/release/libratex_bridge.a
+build:
+	cargo build
 
-# Build the Rust static library (RaTeX LaTeX renderer, linked into the Go
-# binary via CGo). Requires cargo + rustc on PATH. Output is consumed by
-# internal/render/latex.go — see its #cgo LDFLAGS directive.
-ratex: $(RATEX_LIB)
+run:
+	RUST_LOG=info,argus=debug,feishu=debug FEISHU_APP_ID=cli_a957a04745f8dbcf FEISHU_APP_SECRET=rRuVxRDkXGEyGZ6UlLlPghVAaS7pZPrH cargo run
 
-$(RATEX_LIB):
-	cd third_party/ratex && cargo build --release
+test:
+	cargo test --workspace
 
-ratex-clean:
-	cd third_party/ratex && cargo clean
+check:
+	cargo clippy --workspace -- -D warnings
+	cargo test --workspace
 
-# Main build depends on the RaTeX static library. First invocation pulls
-# Rust crates from the network and may take several minutes; subsequent
-# builds are incremental via cargo's cache.
-build: $(RATEX_LIB)
-	go build -o bin/argus ./cmd/argus
-
-run: build
-	./bin/argus --workspace ./workspace
-
-test: $(RATEX_LIB)
-	go test ./...
-
-sandbox:
-	docker build -f Dockerfile.sandbox -t argus-sandbox:latest .
-
-up:
-	docker compose up -d postgres
-
-down:
-	docker compose down
-
-# `clean` removes only the Go binary. Use `ratex-clean` separately to rebuild
-# the Rust static library from scratch.
 clean:
-	rm -rf bin/
+	cargo clean

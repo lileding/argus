@@ -144,8 +144,8 @@ func (s *PostgresStore) RecentMessages(ctx context.Context, chatID string, limit
 func (s *PostgresStore) SearchMessages(ctx context.Context, embedding []float32, chatID string, limit int) ([]StoredMessage, error) {
 	vec := pgvector.NewVector(embedding)
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, chat_id, role, content, source_im, channel, msg_type, created_at,
-			embedding <=> $1 AS distance
+		SELECT id, chat_id, role, content, source_im, channel, msg_type, summary,
+			1 - (embedding <=> $1) AS similarity, created_at
 		FROM messages
 		WHERE chat_id = $2 AND embedding IS NOT NULL
 		ORDER BY embedding <=> $1
@@ -159,8 +159,7 @@ func (s *PostgresStore) SearchMessages(ctx context.Context, embedding []float32,
 	var results []StoredMessage
 	for rows.Next() {
 		var m StoredMessage
-		var dist float64
-		if err := rows.Scan(&m.ID, &m.ChatID, &m.Role, &m.Content, &m.SourceIM, &m.Channel, &m.MsgType, &m.CreatedAt, &dist); err != nil {
+		if err := rows.Scan(&m.ID, &m.ChatID, &m.Role, &m.Content, &m.SourceIM, &m.Channel, &m.MsgType, &m.Summary, &m.Similarity, &m.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan search result: %w", err)
 		}
 		results = append(results, m)
@@ -194,17 +193,18 @@ func (s *PostgresStore) UnembeddedMessages(ctx context.Context, limit int) ([]St
 
 func (s *PostgresStore) SetMessageEmbedding(ctx context.Context, messageID int64, embedding []float32) error {
 	vec := pgvector.NewVector(embedding)
-	_, err := s.db.ExecContext(ctx, `UPDATE messages SET embedding = $1 WHERE id = $2`, vec, messageID)
+	_, err := s.db.ExecContext(ctx, `UPDATE messages SET embedding = $1 WHERE id = $2 AND embedding IS NULL`, vec, messageID)
 	return err
 }
 
 func (s *PostgresStore) UnsummarizedMessages(ctx context.Context, limit int) ([]StoredMessage, error) {
 	// 2400 bytes ≈ 800 CJK runes. Only assistant replies above this threshold need summaries.
+	// ORDER BY id DESC: most recent first — they're most likely to appear in context soon.
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, content
 		FROM messages
 		WHERE summary IS NULL AND role = 'assistant' AND LENGTH(content) > 2400
-		ORDER BY id
+		ORDER BY id DESC
 		LIMIT $1
 	`, limit)
 	if err != nil {
@@ -224,7 +224,7 @@ func (s *PostgresStore) UnsummarizedMessages(ctx context.Context, limit int) ([]
 }
 
 func (s *PostgresStore) SetMessageSummary(ctx context.Context, messageID int64, summary string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE messages SET summary = $1 WHERE id = $2`, summary, messageID)
+	_, err := s.db.ExecContext(ctx, `UPDATE messages SET summary = $1 WHERE id = $2 AND summary IS NULL`, summary, messageID)
 	return err
 }
 
@@ -293,7 +293,7 @@ func (s *PostgresStore) DeleteMemory(ctx context.Context, id int64) error {
 
 func (s *PostgresStore) SetMemoryEmbedding(ctx context.Context, memoryID int64, embedding []float32) error {
 	vec := pgvector.NewVector(embedding)
-	_, err := s.db.ExecContext(ctx, `UPDATE memories SET embedding = $1 WHERE id = $2`, vec, memoryID)
+	_, err := s.db.ExecContext(ctx, `UPDATE memories SET embedding = $1 WHERE id = $2 AND embedding IS NULL`, vec, memoryID)
 	return err
 }
 
@@ -307,9 +307,37 @@ func (s *PostgresStore) SaveDocument(ctx context.Context, doc *Document) error {
 	`, doc.Filename, doc.FilePath, doc.Channel, doc.Status).Scan(&doc.ID, &doc.CreatedAt)
 }
 
+// validDocTransitions defines allowed status transitions for documents.
+// Prevents regression (e.g. ready → processing) from concurrent operations.
+var validDocTransitions = map[string][]string{
+	"pending":    {"processing"},
+	"processing": {"ready", "error", "pending"}, // pending = repair reset
+}
+
 func (s *PostgresStore) UpdateDocumentStatus(ctx context.Context, id int64, status, errorMsg string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE documents SET status = $1, error_msg = $2 WHERE id = $3`, status, errorMsg, id)
-	return err
+	fromStates := make([]string, 0)
+	for from, tos := range validDocTransitions {
+		for _, to := range tos {
+			if to == status {
+				fromStates = append(fromStates, from)
+			}
+		}
+	}
+	if len(fromStates) == 0 {
+		return fmt.Errorf("no valid transition to status %q", status)
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE documents SET status = $1, error_msg = $2
+		WHERE id = $3 AND status = ANY($4)
+	`, status, errorMsg, id, pq.Array(fromStates))
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("document %d: stale transition to %q (current status not in %v)", id, status, fromStates)
+	}
+	return nil
 }
 
 func (s *PostgresStore) PendingDocuments(ctx context.Context, limit int) ([]Document, error) {
@@ -427,7 +455,7 @@ func (s *PostgresStore) UnembeddedChunks(ctx context.Context, limit int) ([]Chun
 
 func (s *PostgresStore) SetChunkEmbedding(ctx context.Context, chunkID int64, embedding []float32) error {
 	vec := pgvector.NewVector(embedding)
-	_, err := s.db.ExecContext(ctx, `UPDATE chunks SET embedding = $1 WHERE id = $2`, vec, chunkID)
+	_, err := s.db.ExecContext(ctx, `UPDATE chunks SET embedding = $1 WHERE id = $2 AND embedding IS NULL`, vec, chunkID)
 	return err
 }
 
@@ -493,6 +521,15 @@ func (s *PostgresStore) FailedTranscriptions(ctx context.Context) ([]StoredMessa
 		msgs = append(msgs, m)
 	}
 	return msgs, nil
+}
+
+func (s *PostgresStore) CountUnsummarizedMessages(ctx context.Context) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM messages
+		WHERE summary IS NULL AND role = 'assistant' AND LENGTH(content) > 2400
+	`).Scan(&count)
+	return count, err
 }
 
 // --- TraceStore ---
@@ -568,7 +605,9 @@ func (s *PostgresStore) UpdateMessageContent(ctx context.Context, msgID int64, c
 }
 
 func (s *PostgresStore) SetReplyStatus(ctx context.Context, msgID int64, status string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE messages SET reply_status = $1 WHERE id = $2`, status, msgID)
+	// Never revert from terminal state 'done'. This prevents late-finishing
+	// ProcessMedia from setting a timed-out message back to 'ready'.
+	_, err := s.db.ExecContext(ctx, `UPDATE messages SET reply_status = $1 WHERE id = $2 AND reply_status != 'done'`, status, msgID)
 	return err
 }
 
@@ -616,6 +655,35 @@ func (s *PostgresStore) ClaimNextReply(ctx context.Context, chatID string) (*Sto
 	}
 	if err != nil {
 		return nil, fmt.Errorf("claim next reply: %w", err)
+	}
+	if replyStatus.Valid {
+		m.ReplyStatus = &replyStatus.String
+	}
+	m.ReplyChannelID = replyChannelID.String
+	m.TriggerMsgID = triggerMsgID.String
+	return &m, nil
+}
+
+func (s *PostgresStore) ClaimReplyByID(ctx context.Context, chatID string, msgID int64) (*StoredMessage, error) {
+	var m StoredMessage
+	var replyStatus sql.NullString
+	var replyChannelID, triggerMsgID sql.NullString
+	err := s.db.QueryRowContext(ctx, `
+		UPDATE messages SET reply_status = 'processing'
+		WHERE id = $1 AND chat_id = $2 AND reply_status = 'ready'
+		RETURNING id, chat_id, role, content, source_im, channel, msg_type,
+			file_paths, sender_id, created_at,
+			reply_status, reply_channel_id, trigger_msg_id
+	`, msgID, chatID).Scan(
+		&m.ID, &m.ChatID, &m.Role, &m.Content, &m.SourceIM, &m.Channel, &m.MsgType,
+		pq.Array(&m.FilePaths), &m.SenderID, &m.CreatedAt,
+		&replyStatus, &replyChannelID, &triggerMsgID,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil // already claimed by drain or not ready yet
+	}
+	if err != nil {
+		return nil, fmt.Errorf("claim reply by id: %w", err)
 	}
 	if replyStatus.Valid {
 		m.ReplyStatus = &replyStatus.String

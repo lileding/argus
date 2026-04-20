@@ -79,13 +79,22 @@ type Agent struct {
 	workspaceDir              string
 	orchestratorContextWindow int // orchestrator history window
 	maxIterations             int
+	orchestratorModel         string // for trace logging
+	synthesizerModel          string // for trace logging
+
+	// Scheduler state (per-chat FIFO).
+	chatChans sync.Map    // map[string]chan Task
+	wg        sync.WaitGroup
+	stopOnce  sync.Once
+	ctx       context.Context // set by SetContext or Run; defaults to Background
 }
 
-func New(orchestrator, synthesizer model.Client, st store.Store, toolReg *tool.Registry, skillIdx *skill.SkillIndex, embedder *embedding.Client, workspaceDir string, orchestratorContextWindow, maxIterations int) *Agent {
+func New(orchestrator, synthesizer model.Client, st store.Store, toolReg *tool.Registry, skillIdx *skill.SkillIndex, embedder *embedding.Client, workspaceDir string, orchestratorContextWindow, maxIterations int, orchestratorModelName, synthesizerModelName string) *Agent {
 	if maxIterations == 0 {
 		maxIterations = 10
 	}
 	return &Agent{
+		ctx:                       context.Background(),
 		orchestrator:              orchestrator,
 		synthesizer:               synthesizer,
 		store:                     st,
@@ -95,6 +104,8 @@ func New(orchestrator, synthesizer model.Client, st store.Store, toolReg *tool.R
 		workspaceDir:              workspaceDir,
 		orchestratorContextWindow: orchestratorContextWindow,
 		maxIterations:             maxIterations,
+		orchestratorModel:         orchestratorModelName,
+		synthesizerModel:          synthesizerModelName,
 	}
 }
 
@@ -112,8 +123,52 @@ type orchestratorStats struct {
 	TotalCompletionTokens int
 }
 
-// HandleStream processes a user message in two phases: orchestration (tool calling)
-// then synthesis (final reply generation). Returns a channel of events for UI updates.
+// execute is the core two-phase execution engine. Called by the scheduler
+// for queued tasks and by HandleStream for ad-hoc messages (cron).
+// The caller owns the events channel and must close it after execute returns.
+func (a *Agent) execute(ctx context.Context, chatID string, savedMsgID int64, payload Payload, ch chan<- Event) {
+	ctx = tool.WithChatID(ctx, chatID)
+
+	userMsg := buildUserMessage(payload.Content, payload.FilePaths, a.workspaceDir)
+	userText := payload.Content
+
+	// Phase 1: Orchestration.
+	orchHistory, err := a.loadHistory(ctx, chatID, savedMsgID, a.orchestratorContextWindow)
+	if err != nil {
+		ch <- Event{Type: EventError, Payload: ErrorPayload{Err: err}}
+		return
+	}
+	toolResults, finishSummary, orchStats := a.runOrchestrator(ctx, ch, userMsg, userText, orchHistory)
+
+	ch <- Event{Type: EventComposing, Payload: ComposingPayload{
+		Iterations:            orchStats.Iterations,
+		Summary:               finishSummary,
+		TotalPromptTokens:     orchStats.TotalPromptTokens,
+		TotalCompletionTokens: orchStats.TotalCompletionTokens,
+	}}
+
+	// Phase 2: Synthesis.
+	reply, synthPT, synthCT := a.runSynthesizer(ctx, ch, userMsg, userText, toolResults, finishSummary)
+
+	// Save assistant reply.
+	savedReply := &store.StoredMessage{
+		ChatID:  chatID,
+		Role:    string(model.RoleAssistant),
+		Content: reply,
+	}
+	if err := a.store.SaveMessage(ctx, savedReply); err != nil {
+		ch <- Event{Type: EventError, Payload: ErrorPayload{Err: fmt.Errorf("save assistant reply: %w", err)}}
+		return
+	}
+
+	ch <- Event{Type: EventReply, Payload: ReplyPayload{
+		Text: reply, ReplyMsgID: savedReply.ID,
+		PromptTokens: synthPT, CompletionTokens: synthCT,
+	}}
+}
+
+// HandleStream processes an ad-hoc user message (e.g. cron jobs) that is NOT
+// pre-saved in the DB. It saves the message, then delegates to execute.
 func (a *Agent) HandleStream(ctx context.Context, chatID string, userMsg model.Message) <-chan Event {
 	ch := make(chan Event, 16)
 
@@ -121,8 +176,6 @@ func (a *Agent) HandleStream(ctx context.Context, chatID string, userMsg model.M
 		defer close(ch)
 
 		ch <- Event{Type: EventThinking, Payload: ThinkingPayload{UserText: userMsg.TextContent()}}
-
-		ctx = tool.WithChatID(ctx, chatID)
 
 		// Save user message (crash-safe).
 		savedMsg := &store.StoredMessage{
@@ -143,95 +196,11 @@ func (a *Agent) HandleStream(ctx context.Context, chatID string, userMsg model.M
 			return
 		}
 
-		userText := userMsg.TextContent()
-
-		// Phase 1: Orchestration — smaller context window to save tokens.
-		orchHistory, err := a.loadHistory(ctx, chatID, savedMsg.ID, a.orchestratorContextWindow)
-		if err != nil {
-			ch <- Event{Type: EventError, Payload: ErrorPayload{Err: err}}
-			return
+		payload := Payload{Content: userMsg.TextContent()}
+		if meta := userMsg.Meta; meta != nil {
+			payload.FilePaths = meta.FilePaths
 		}
-		toolResults, finishSummary, orchStats := a.runOrchestrator(ctx, ch, userMsg, userText, orchHistory)
-
-		// Signal transition with orchestrator stats for trace recording.
-		ch <- Event{Type: EventComposing, Payload: ComposingPayload{
-			Iterations:            orchStats.Iterations,
-			Summary:               finishSummary,
-			TotalPromptTokens:     orchStats.TotalPromptTokens,
-			TotalCompletionTokens: orchStats.TotalCompletionTokens,
-		}}
-
-		// Phase 2: Synthesis — no history, only materials from Phase 1.
-		reply, synthPT, synthCT := a.runSynthesizer(ctx, ch, userMsg, userText, toolResults, finishSummary)
-
-		// Save assistant reply.
-		savedReply := &store.StoredMessage{
-			ChatID:  chatID,
-			Role:    string(model.RoleAssistant),
-			Content: reply,
-		}
-		if err := a.store.SaveMessage(ctx, savedReply); err != nil {
-			ch <- Event{Type: EventError, Payload: ErrorPayload{Err: fmt.Errorf("save assistant reply: %w", err)}}
-			return
-		}
-
-		ch <- Event{Type: EventReply, Payload: ReplyPayload{
-			Text: reply, ReplyMsgID: savedReply.ID,
-			PromptTokens: synthPT, CompletionTokens: synthCT,
-		}}
-	}()
-
-	return ch
-}
-
-// HandleStreamQueued is the dispatcher entry point for pre-saved messages.
-// Unlike HandleStream, it does NOT save the user message (already in the DB)
-// and reconstructs the model.Message from the stored text content.
-func (a *Agent) HandleStreamQueued(ctx context.Context, chatID string, savedMsgID int64, userText string, filePaths []string) <-chan Event {
-	ch := make(chan Event, 16)
-
-	go func() {
-		defer close(ch)
-
-		ctx = tool.WithChatID(ctx, chatID)
-
-		// Reconstruct message — multimodal if images are present.
-		userMsg := buildUserMessage(userText, filePaths, a.workspaceDir)
-
-		// Phase 1: Orchestration — smaller context window.
-		orchHistory, err := a.loadHistory(ctx, chatID, savedMsgID, a.orchestratorContextWindow)
-		if err != nil {
-			ch <- Event{Type: EventError, Payload: ErrorPayload{Err: err}}
-			return
-		}
-		toolResults, finishSummary, orchStats := a.runOrchestrator(ctx, ch, userMsg, userText, orchHistory)
-
-		// Signal transition.
-		ch <- Event{Type: EventComposing, Payload: ComposingPayload{
-			Iterations:            orchStats.Iterations,
-			Summary:               finishSummary,
-			TotalPromptTokens:     orchStats.TotalPromptTokens,
-			TotalCompletionTokens: orchStats.TotalCompletionTokens,
-		}}
-
-		// Phase 2: Synthesis — no history needed, only materials from Phase 1.
-		reply, synthPT, synthCT := a.runSynthesizer(ctx, ch, userMsg, userText, toolResults, finishSummary)
-
-		// Save assistant reply.
-		savedReply := &store.StoredMessage{
-			ChatID:  chatID,
-			Role:    string(model.RoleAssistant),
-			Content: reply,
-		}
-		if err := a.store.SaveMessage(ctx, savedReply); err != nil {
-			ch <- Event{Type: EventError, Payload: ErrorPayload{Err: fmt.Errorf("save assistant reply: %w", err)}}
-			return
-		}
-
-		ch <- Event{Type: EventReply, Payload: ReplyPayload{
-			Text: reply, ReplyMsgID: savedReply.ID,
-			PromptTokens: synthPT, CompletionTokens: synthCT,
-		}}
+		a.execute(ctx, chatID, savedMsg.ID, payload, ch)
 	}()
 
 	return ch
@@ -262,12 +231,13 @@ func (a *Agent) runOrchestrator(
 	// Small budgets for expensive/noisy tools like search; unrestricted tools
 	// (not listed) can be called freely.
 	toolBudgets := map[string]int{
-		"search":     3,
-		"fetch":      4,
-		"db":         6,
-		"cli":        5,
-		"write_file": 3,
-		"remember":   3,
+		"search":         3,
+		"fetch":          4,
+		"db":             6,
+		"cli":            5,
+		"write_file":     3,
+		"remember":       3,
+		"search_history": 2,
 	}
 	toolCounts := map[string]int{}
 

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"argus/internal/agent"
 	"argus/internal/config"
 	"argus/internal/model"
 	"argus/internal/store"
@@ -34,16 +35,18 @@ type DocRegisterer interface {
 
 // Handler handles Feishu webhook events.
 //
-// Inbound: parse → INSERT raw message (notReady) → push to Dispatcher's
-// per-chat channel → spawn async media processing goroutine.
+// Inbound: parse → INSERT raw message → construct Task → agent.SubmitTask
+// → spawn async media processing goroutine.
 //
-// The media goroutine downloads/transcribes, updates DB content to ready,
-// and closes the message's ReadyCh. The Dispatcher opens the card
-// immediately on pop, blocks on ReadyCh, then runs the agent.
+// The media goroutine downloads/transcribes, updates DB, and sends the
+// processed Payload through the task's ReadyCh. The Agent scheduler
+// opens the thinking card (via Frontend.SubmitMessage) immediately on
+// task pop, then blocks on ReadyCh until content is ready.
 type Handler struct {
 	client       *Client
 	store        store.QueueStore
-	dispatcher   *Dispatcher
+	ag           *agent.Agent
+	frontend     *FeishuFrontend
 	transcriber  Transcriber
 	corrector    Corrector
 	docStore     DocRegisterer
@@ -57,7 +60,8 @@ func NewHandler(
 	cfg config.FeishuConfig,
 	workspaceDir string,
 	st store.QueueStore,
-	dispatcher *Dispatcher,
+	ag *agent.Agent,
+	frontend *FeishuFrontend,
 	transcriber Transcriber,
 	corrector Corrector,
 	docStore DocRegisterer,
@@ -68,7 +72,8 @@ func NewHandler(
 	return &Handler{
 		client:       client,
 		store:        st,
-		dispatcher:   dispatcher,
+		ag:           ag,
+		frontend:     frontend,
 		transcriber:  transcriber,
 		corrector:    corrector,
 		docStore:     docStore,
@@ -147,25 +152,25 @@ func (h *Handler) processEvent(envelope EventEnvelope) {
 		"msg_type", msgEvent.Message.MessageType,
 	)
 
-	// 2. Push to Dispatcher's per-chat channel.
-	readyCh := make(chan struct{})
-	h.dispatcher.ChatChan(chatID) <- QueuedMessage{
-		MsgID:        msg.ID,
+	// 2. Construct Task and submit to Agent.
+	readyCh := make(chan agent.Payload, 1)
+	h.ag.SubmitTask(agent.Task{
 		ChatID:       chatID,
+		MsgID:        msg.ID,
 		TriggerMsgID: msgEvent.Message.MessageID,
 		Lang:         quickDetectLang(msgEvent.Message.Content),
+		Frontend:     h.frontend,
 		ReadyCh:      readyCh,
-	}
+	})
 
 	// 3. Spawn async media processing goroutine.
 	go h.ProcessMedia(msg, readyCh)
 }
 
-// processMedia downloads media, transcribes audio, updates DB content to
-// the processed form, marks the message as ready, and closes readyCh.
-// This is the function also used by Dispatcher.Recover for crash recovery.
-func (h *Handler) ProcessMedia(msg *store.StoredMessage, readyCh chan struct{}) {
-	defer close(readyCh)
+// ProcessMedia downloads media, transcribes audio, updates DB content to
+// the processed form, and sends the Payload through readyCh.
+// DB updates are retained for crash recovery / replay.
+func (h *Handler) ProcessMedia(msg *store.StoredMessage, readyCh chan agent.Payload) {
 	ctx := context.Background()
 
 	processedText, filePaths, err := h.buildProcessedContent(ctx, msg)
@@ -174,7 +179,7 @@ func (h *Handler) ProcessMedia(msg *store.StoredMessage, readyCh chan struct{}) 
 		processedText = fmt.Sprintf("[Message processing failed: %v]", err)
 	}
 
-	// Update content + file_paths + status in DB.
+	// Persist to DB for replay.
 	if err := h.store.UpdateMessageContent(ctx, msg.ID, processedText); err != nil {
 		slog.Error("processMedia: update content", "msg_id", msg.ID, "err", err)
 	}
@@ -186,6 +191,9 @@ func (h *Handler) ProcessMedia(msg *store.StoredMessage, readyCh chan struct{}) 
 	if err := h.store.SetReplyStatus(ctx, msg.ID, "ready"); err != nil {
 		slog.Error("processMedia: set ready", "msg_id", msg.ID, "err", err)
 	}
+
+	// Deliver payload to Agent — no DB round-trip needed.
+	readyCh <- agent.Payload{Content: processedText, FilePaths: filePaths}
 
 	slog.Info("processMedia: ready", "msg_id", msg.ID, "msg_type", msg.MsgType, "files", len(filePaths))
 }
@@ -403,6 +411,27 @@ func joinText(title, body string) string {
 		return title
 	}
 	return body
+}
+
+// detectLang checks if the text is primarily Chinese.
+func detectLang(text string) string {
+	for _, r := range text {
+		if r >= 0x4E00 && r <= 0x9FFF {
+			return "zh"
+		}
+	}
+	return "en"
+}
+
+// quickDetectLang does a fast language detection on raw Feishu message
+// content JSON. Falls back to "zh" if undetermined.
+func quickDetectLang(rawContentJSON string) string {
+	for _, r := range rawContentJSON {
+		if r >= 0x4E00 && r <= 0x9FFF {
+			return "zh"
+		}
+	}
+	return "zh"
 }
 
 func deriveChatID(chatType, userOpenID, feishuChatID string) string {

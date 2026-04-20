@@ -141,11 +141,12 @@ reply_status:    received → processing → done
 
 ### Single Active Card Per Chat
 
-This is a **Frontend implementation detail**, not an Agent scheduler
-concern. The Feishu Frontend uses a per-chat mpsc render loop; at most
-one card is "open" per chat at any instant. Agents may issue concurrent
-`SubmitMessage` calls — the Frontend serializes rendering within each
-chat because the IM UX requires it.
+The Agent scheduler guarantees per-chat serial execution (one task at a
+time per chat). The Feishu Frontend renders each Message in a stateless
+goroutine — no per-chat render queue is needed because the Agent never
+issues concurrent `SubmitMessage` calls for the same chat. At most one
+card is "open" per chat at any instant as a natural consequence of the
+scheduler's serialization.
 
 ### Replay Subsystem (Crash Recovery)
 
@@ -251,9 +252,11 @@ The reply card handle remains IM-agnostic:
 - **Slack** (future): message ts
 - **CLI**: empty string
 
-It lives in `messages.reply_channel_id`, written by the Frontend when
-it opens a card. Agents never touch it; the audit role survives replay
-even though the card itself does not.
+The column `messages.reply_channel_id` exists for audit purposes.
+Currently not actively persisted — the Frontend opens cards but does
+not write the card handle back to the DB. If replay card re-attachment
+becomes necessary, the Frontend would need a store callback to persist
+it after `ReplyRichWithID` succeeds.
 
 ### Two-Phase Agent (Orchestrator + Synthesizer)
 
@@ -401,13 +404,15 @@ question + materials from Phase 1).
 Agent pops a task, opens card via Frontend, waits on ReadyCh for Payload
         ↓
 [1] History Curation (orchestrator only)
-    - Load recent N messages from store
+    - Load recent N messages (sliding window)
     - Semantic recall: embed current message, pgvector search older messages
-    - Filter: user messages + assistant final replies only
-    - Remove: tool_call / tool_result noise
-    - Summarize: long assistant replies (>800 runes) replaced with
-      async-generated summary, or truncated as fallback
-    - Re-inject images from .files/ for multi-turn vision
+      ▸ similarity threshold (0.30), byte budget on effective size
+      ▸ sort recalled by time, not similarity
+    - Both paths → unified curateHistory:
+      ▸ Filter: user + assistant final replies only (no tool noise)
+      ▸ Long assistant replies (>800 runes): summary or truncation
+      ▸ Re-inject images from .files/ (sliding window only, not recalled)
+    - Document chunk recall: threshold 0.35, 4 KB budget
         ↓
 [2a] Orchestrator Prompt                [2b] Synthesizer Prompt
      - OrchestratorPrompt (tool-only         - SynthesizerPrompt (answer-only
@@ -861,11 +866,12 @@ CREATE TABLE messages (
     file_paths  TEXT[],
     sender_id   TEXT,
     embedding   vector(768),                      -- nullable; async-filled
+    summary     TEXT,                             -- nullable; async-generated for long assistant replies
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     -- Pipeline state (user messages only; NULL for assistant/tool msgs)
     content_status   TEXT,                        -- raw/downloaded/processed
     reply_status     TEXT,                        -- received/processing/done
-    reply_channel_id TEXT,                        -- IM-abstract card handle (Frontend-written)
+    reply_channel_id TEXT,                        -- IM-abstract card handle (audit placeholder, not actively persisted)
     trigger_msg_id   TEXT                         -- IM trigger message ID (reply thread root)
 );
 
@@ -905,6 +911,32 @@ IVFFlat cosine indexes on all three embedding columns. Agent-created
 business tables (e.g. `argus_food_log`) live alongside these and are
 created via the structured `db` tool's `create` verb. The `argus_` prefix
 is applied transparently by the tool layer.
+
+### Write Safety (Idempotent Async Updates)
+
+The database is the single source of truth. Background workers (embedding,
+summarization) and the ingester all write asynchronously, which creates
+potential for concurrent updates on the same row. All async UPDATE
+statements include a precondition WHERE clause to prevent overwrite and
+ensure idempotency:
+
+| Operation | Precondition | Reason |
+|-----------|-------------|--------|
+| `SetMessageEmbedding` | `WHERE embedding IS NULL` | Two worker cycles may pick up the same message; second write is a no-op |
+| `SetMessageSummary` | `WHERE summary IS NULL` | Same — prevents re-summarization if worker restarts mid-batch |
+| `SetMemoryEmbedding` | `WHERE embedding IS NULL` | Consistent with message embedding |
+| `SetChunkEmbedding` | `WHERE embedding IS NULL` | Consistent with message embedding |
+| `UpdateDocumentStatus` | `WHERE status = ANY(valid_from_states)` + `RowsAffected` check | Enforces state machine: `pending→processing→ready\|error`, `processing→pending` (repair). Returns explicit error on stale transition (0 rows affected) so the ingester can abort early instead of producing orphan chunks |
+
+`UpdateDocumentStatus` returns an error when `RowsAffected == 0` (stale
+transition). The ingester checks this at every status change:
+`pending→processing` failure aborts the entire document; `processing→error`
+and `processing→ready` failures are logged as warnings.
+
+Summary generation failures leave `summary IS NULL` — the message stays
+in the unsummarized pool and is retried next worker cycle. No error
+sentinel is written, so `curateHistory` always falls back to 800-rune
+truncation for messages that haven't been summarized yet.
 
 Database is optional — server mode falls back to memory store if PostgreSQL is unavailable, though semantic recall, pinned memories, and document RAG are disabled in that mode.
 

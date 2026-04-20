@@ -20,6 +20,7 @@ type StoredMessage struct {
 	FilePaths  []string   // paths to saved media files
 	SenderID   string     // user identity from source IM
 	Summary    *string   // async-generated summary for long assistant replies
+	Similarity float64   // populated by SearchMessages (1 - cosine distance)
 	CreatedAt  time.Time
 
 	// Queue fields — only meaningful for user messages in the pipeline.
@@ -81,7 +82,12 @@ type QueueStore interface {
 	AckReply(ctx context.Context, msgID int64, replyChannelID string) error
 	// ClaimNextReply atomically picks the oldest 'ready' message for chatID
 	// and marks it 'processing'. Returns nil if nothing queued.
+	// Used by drainReady (crash recovery) to process DB-only messages.
 	ClaimNextReply(ctx context.Context, chatID string) (*StoredMessage, error)
+	// ClaimReplyByID atomically claims a specific message by ID.
+	// Returns nil if the message is not in 'ready' status (already claimed).
+	// Used by the normal channel path to avoid claiming a different message.
+	ClaimReplyByID(ctx context.Context, chatID string, msgID int64) (*StoredMessage, error)
 	// FinishReply marks a message as 'done'.
 	FinishReply(ctx context.Context, msgID int64) error
 	// RecoverQueue runs at startup: resets processing→ready, filtering→received.

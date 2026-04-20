@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -12,81 +13,96 @@ import (
 	"argus/internal/store"
 )
 
+// Thresholds and budgets for passive recall.
+const (
+	msgSimThreshold   = 0.30 // cosine similarity minimum for message recall
+	chunkSimThreshold = 0.35 // cosine similarity minimum for document chunk recall
+	recallBytesBudget = 6000 // max total bytes from all recalled content
+	chunkBytesBudget  = 4000 // max total bytes from document chunks (subset of above)
+)
+
 // loadHistory retrieves and curates conversation history for context.
-// Used by both orchestrator and synthesizer phases.
+// All messages (recalled + recent) go through curateHistory for uniform
+// summary/truncation treatment. This prevents semantic recall from
+// bypassing the long-reply summarization mechanism.
 func (a *Agent) loadHistory(ctx context.Context, chatID string, excludeID int64, contextWindow int) ([]model.Message, error) {
 	recent, err := a.store.RecentMessages(ctx, chatID, contextWindow+1)
 	if err != nil {
 		return nil, fmt.Errorf("load recent messages: %w", err)
 	}
 
-	var recalledIDs map[int64]bool
-	var recalled []model.Message
+	// Build set of recent IDs for dedup.
+	recentIDs := make(map[int64]bool, len(recent))
+	for _, m := range recent {
+		recentIDs[m.ID] = true
+	}
+
+	var recalledMsgs []store.StoredMessage
+	var docChunkMsg *model.Message
 
 	// Semantic recall via embedding.
 	if a.embedder != nil {
 		if ss, ok := a.store.(store.SemanticStore); ok {
 			// Query text is the most recent user message (excluded from history).
 			var queryText string
-			if len(recent) > 0 {
-				// Find the just-saved message to use its content as query.
-				for _, m := range recent {
-					if m.ID == excludeID {
-						queryText = m.Content
-						break
-					}
+			for _, m := range recent {
+				if m.ID == excludeID {
+					queryText = m.Content
+					break
 				}
 			}
 			if queryText != "" {
 				queryVec, err := a.embedder.EmbedOne(ctx, queryText)
 				if err == nil {
-					// Search conversation history.
+					// Search conversation history with similarity threshold + byte budget.
+					// Budget is computed on effective size (summary or truncated), not
+					// raw content, so a 3000-byte reply with a 100-byte summary doesn't
+					// consume 3000 bytes of budget.
 					similar, err := ss.SearchMessages(ctx, queryVec, chatID, 10)
 					if err == nil {
-						recalledIDs = make(map[int64]bool)
+						totalBytes := 0
 						for _, m := range similar {
-							recalledIDs[m.ID] = true
-							recalled = append(recalled, model.Message{
-								Role:    model.Role(m.Role),
-								Content: m.Content,
-							})
+							if m.Similarity < msgSimThreshold {
+								continue
+							}
+							if recentIDs[m.ID] || m.ID == excludeID {
+								continue // already in sliding window
+							}
+							effectiveSize := effectiveContentSize(m)
+							if totalBytes+effectiveSize > recallBytesBudget {
+								continue // skip this candidate, try smaller ones
+							}
+							totalBytes += effectiveSize
+							recalledMsgs = append(recalledMsgs, m)
 						}
 					}
 
 					// Search document chunks (RAG) — passive recall.
-					// Only inject chunks above similarity threshold; cap total bytes
-					// to avoid polluting context with irrelevant excerpts.
 					if ds, ok := a.store.(store.DocumentStore); ok {
-						const (
-							chunkSimThreshold = 0.35 // cosine similarity minimum
-							chunkBytesBudget  = 4000 // max total bytes injected
-						)
 						chunks, err := ds.SearchChunks(ctx, queryVec, 3)
 						if err == nil {
 							var sb strings.Builder
-							totalBytes := 0
+							chunkBytes := 0
 							for _, c := range chunks {
 								if c.Similarity < chunkSimThreshold {
 									continue
 								}
 								content := c.Content
-								if totalBytes+len(content) > chunkBytesBudget {
-									content = content[:chunkBytesBudget-totalBytes]
+								if chunkBytes+len(content) > chunkBytesBudget {
+									content = content[:chunkBytesBudget-chunkBytes]
 								}
 								if sb.Len() == 0 {
 									sb.WriteString("[Relevant document excerpts]\n")
 								}
 								sb.WriteString(fmt.Sprintf("\n--- From: %s ---\n%s\n", c.DocFilename, content))
-								totalBytes += len(content)
-								if totalBytes >= chunkBytesBudget {
+								chunkBytes += len(content)
+								if chunkBytes >= chunkBytesBudget {
 									break
 								}
 							}
 							if sb.Len() > 0 {
-								recalled = append(recalled, model.Message{
-									Role:    model.RoleUser,
-									Content: sb.String(),
-								})
+								msg := model.Message{Role: model.RoleUser, Content: sb.String()}
+								docChunkMsg = &msg
 							}
 						}
 					}
@@ -95,28 +111,36 @@ func (a *Agent) loadHistory(ctx context.Context, chatID string, excludeID int64,
 		}
 	}
 
-	// Filter recent messages: remove excluded (just-saved) and dedup vs recalled.
-	// Exception: keep messages with image file_paths in recent (not recalled)
-	// so they go through curateHistory for proper image re-injection.
+	// Filter recent: remove excluded message, apply sliding window.
 	var filtered []store.StoredMessage
 	for _, m := range recent {
 		if m.ID == excludeID {
 			continue
-		}
-		if recalledIDs != nil && recalledIDs[m.ID] && !hasImagePaths(m.FilePaths) {
-			continue // dedup against recalled, but keep image messages in recent
 		}
 		filtered = append(filtered, m)
 	}
 	if len(filtered) > contextWindow {
 		filtered = filtered[len(filtered)-contextWindow:]
 	}
-	curated := a.curateHistory(filtered)
 
-	// Recalled first (older, semantically relevant), then recent (chronological).
-	out := make([]model.Message, 0, len(recalled)+len(curated))
-	out = append(out, recalled...)
-	out = append(out, curated...)
+	// Sort recalled by time (SearchMessages returns similarity order).
+	sort.Slice(recalledMsgs, func(i, j int) bool {
+		return recalledMsgs[i].CreatedAt.Before(recalledMsgs[j].CreatedAt)
+	})
+
+	// Both recalled and recent go through curateHistory for uniform
+	// summary/truncation. Recalled messages skip image reinjection
+	// (they're old context; only recent sliding window gets real images).
+	curatedRecalled := a.curateHistory(recalledMsgs)
+	curatedRecent := a.curateHistory(filtered)
+
+	// Assemble: doc chunks → recalled messages → recent messages.
+	out := make([]model.Message, 0, len(curatedRecalled)+len(curatedRecent)+1)
+	if docChunkMsg != nil {
+		out = append(out, *docChunkMsg)
+	}
+	out = append(out, curatedRecalled...)
+	out = append(out, curatedRecent...)
 	return out, nil
 }
 
@@ -237,6 +261,23 @@ func (a *Agent) curateHistory(messages []store.StoredMessage) []model.Message {
 		}
 	}
 	return curated
+}
+
+// effectiveContentSize estimates the byte size a message will occupy in
+// context after curateHistory applies summary/truncation. Used to compute
+// recall byte budgets on effective content rather than raw content.
+func effectiveContentSize(m store.StoredMessage) int {
+	const maxAssistantHistoryRunes = 800
+	if m.Role == "assistant" {
+		runes := []rune(m.Content)
+		if len(runes) > maxAssistantHistoryRunes {
+			if m.Summary != nil && *m.Summary != "" {
+				return len("[Summary of previous reply] ") + len(*m.Summary)
+			}
+			return maxAssistantHistoryRunes*3 + len(" …[truncated, use search_history for full text]")
+		}
+	}
+	return len(m.Content)
 }
 
 func hasImagePaths(paths []string) bool {

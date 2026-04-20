@@ -2,7 +2,6 @@ package embedding
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -215,9 +214,7 @@ func (w *Worker) summarizeMessages(ctx context.Context) {
 		}
 		resp, err := w.summarizer.Chat(ctx, messages, nil)
 		if err != nil {
-			slog.Warn("summarize message failed", "id", m.ID, "err", err)
-			// Set empty summary to avoid retrying failed messages forever.
-			w.semantic.SetMessageSummary(ctx, m.ID, fmt.Sprintf("[summary failed: %v]", err))
+			slog.Warn("summarize message failed, will retry next cycle", "id", m.ID, "err", err)
 			continue
 		}
 		if err := w.semantic.SetMessageSummary(ctx, m.ID, resp.Content); err != nil {

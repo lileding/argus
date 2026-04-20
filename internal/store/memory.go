@@ -93,6 +93,10 @@ func (s *MemoryStore) SetReplyStatus(_ context.Context, msgID int64, status stri
 	defer s.mu.Unlock()
 	for i := range s.messages {
 		if s.messages[i].ID == msgID {
+			// Never revert from terminal state 'done'.
+			if s.messages[i].ReplyStatus != nil && *s.messages[i].ReplyStatus == "done" {
+				return nil
+			}
 			s.messages[i].ReplyStatus = &status
 			return nil
 		}
@@ -122,6 +126,21 @@ func (s *MemoryStore) ClaimNextReply(_ context.Context, chatID string) (*StoredM
 			s.messages[i].ReplyStatus = &status
 			m := s.messages[i]
 			return &m, nil
+		}
+	}
+	return nil, nil
+}
+
+func (s *MemoryStore) ClaimReplyByID(_ context.Context, chatID string, msgID int64) (*StoredMessage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.messages {
+		m := &s.messages[i]
+		if m.ID == msgID && m.ChatID == chatID && m.ReplyStatus != nil && *m.ReplyStatus == "ready" {
+			status := "processing"
+			m.ReplyStatus = &status
+			ret := *m
+			return &ret, nil
 		}
 	}
 	return nil, nil

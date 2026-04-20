@@ -171,6 +171,9 @@ func runServer(cfg *config.Config) {
 				if n, err := rs.CountUnembeddedMessages(ctx); err == nil && n > 0 {
 					slog.Info("messages pending embedding", "count", n)
 				}
+				if n, err := rs.CountUnsummarizedMessages(ctx); err == nil && n > 0 {
+					slog.Info("assistant replies pending summary", "count", n)
+				}
 				if msgs, err := rs.FailedTranscriptions(ctx); err == nil && len(msgs) > 0 {
 					slog.Warn("found messages with failed transcriptions", "count", len(msgs))
 				}
@@ -223,11 +226,11 @@ func runServer(cfg *config.Config) {
 
 	sb := buildSandbox(cfg)
 	toolReg := buildToolRegistry(cfg, sb, loader, db, st, embedClient)
-	ag := agent.New(orchClient, synthClient, st, toolReg, loader.Index(), embedClient, cfg.Agent.WorkspaceDir, cfg.Agent.OrchestratorContextWindow, cfg.Agent.MaxIterations)
+	ag := agent.New(orchClient, synthClient, st, toolReg, loader.Index(), embedClient, cfg.Agent.WorkspaceDir, cfg.Agent.OrchestratorContextWindow, cfg.Agent.MaxIterations, cfg.Model.Orchestrator.ModelName, cfg.Model.Synthesizer.ModelName)
 
 	feishuClient := feishu.NewClient(cfg.Feishu)
 	processor := render.NewProcessor(feishuClient)
-	adapter := feishu.NewAdapter(feishuClient, processor)
+	frontend := feishu.NewFrontend(feishuClient, processor)
 
 	// Document store for RAG indexing (nil if not available).
 	var docReg feishu.DocRegisterer
@@ -248,17 +251,20 @@ func runServer(cfg *config.Config) {
 		qs = st.(*store.MemoryStore)
 	}
 
-	// Dispatcher: per-chat serial agent processing (channel-per-chat).
-	dispatcher := feishu.NewDispatcher(qs, ag, adapter, feishuClient, cfg.Model.Orchestrator.ModelName, cfg.Model.Synthesizer.ModelName)
-	defer dispatcher.Stop()
+	// Handler: inbound (store + submit task + spawn media goroutine).
+	handler := feishu.NewHandler(feishuClient, cfg.Feishu, cfg.Agent.WorkspaceDir, qs, ag, frontend, transClient, orchClient, docReg)
 
-	// Handler: inbound (store + push + spawn media goroutine).
-	handler := feishu.NewHandler(feishuClient, cfg.Feishu, cfg.Agent.WorkspaceDir, qs, dispatcher, transClient, orchClient, docReg)
+	// Set context before recovery so all goroutines inherit cancellation.
+	ag.SetContext(ctx)
 
 	// Crash recovery: re-queue interrupted messages.
-	dispatcher.Recover(ctx, func(msg *store.StoredMessage, readyCh chan struct{}) {
+	ag.Recover(ctx, frontend, func(msg *store.StoredMessage, readyCh chan agent.Payload) {
 		go handler.ProcessMedia(msg, readyCh)
 	})
+
+	// Start Agent scheduler (blocks until ctx is cancelled).
+	go ag.Run(ctx)
+	defer ag.Stop()
 
 	// Cron scheduler.
 	scheduler := setupCron(cfg, ag, feishuClient, processor, ctx)

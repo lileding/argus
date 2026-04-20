@@ -54,8 +54,7 @@ database:
 
 agent:
   max_iterations: 10
-  context_window: 20                  # synthesizer history window
-  orchestrator_context_window: 10     # orchestrator history (smaller to save tokens)
+  orchestrator_context_window: 10     # orchestrator sliding window size
   skill_rescan: 30s
 
 search:

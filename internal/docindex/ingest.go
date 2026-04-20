@@ -79,18 +79,27 @@ func (ing *Ingester) processAll() {
 func (ing *Ingester) processDocument(ctx context.Context, doc store.Document) {
 	slog.Info("processing document", "id", doc.ID, "filename", doc.Filename)
 
-	ing.docStore.UpdateDocumentStatus(ctx, doc.ID, "processing", "")
+	// Claim the document by transitioning pending→processing.
+	// If this fails (stale transition), another ingester or repair already claimed it.
+	if err := ing.docStore.UpdateDocumentStatus(ctx, doc.ID, "processing", ""); err != nil {
+		slog.Warn("claim document failed, skipping", "id", doc.ID, "err", err)
+		return
+	}
 
 	// Extract text based on file extension.
 	text, err := ing.extractText(ctx, doc)
 	if err != nil {
 		slog.Warn("extract text failed", "doc", doc.Filename, "err", err)
-		ing.docStore.UpdateDocumentStatus(ctx, doc.ID, "error", err.Error())
+		if err2 := ing.docStore.UpdateDocumentStatus(ctx, doc.ID, "error", err.Error()); err2 != nil {
+			slog.Warn("update document status failed", "id", doc.ID, "err", err2)
+		}
 		return
 	}
 
 	if strings.TrimSpace(text) == "" {
-		ing.docStore.UpdateDocumentStatus(ctx, doc.ID, "error", "no text content extracted")
+		if err := ing.docStore.UpdateDocumentStatus(ctx, doc.ID, "error", "no text content extracted"); err != nil {
+			slog.Warn("update document status failed", "id", doc.ID, "err", err)
+		}
 		return
 	}
 
@@ -109,11 +118,16 @@ func (ing *Ingester) processDocument(ctx context.Context, doc store.Document) {
 
 	if err := ing.docStore.SaveChunks(ctx, chunks); err != nil {
 		slog.Warn("save chunks failed", "doc", doc.Filename, "err", err)
-		ing.docStore.UpdateDocumentStatus(ctx, doc.ID, "error", err.Error())
+		if err2 := ing.docStore.UpdateDocumentStatus(ctx, doc.ID, "error", err.Error()); err2 != nil {
+			slog.Warn("update document status failed", "id", doc.ID, "err", err2)
+		}
 		return
 	}
 
-	ing.docStore.UpdateDocumentStatus(ctx, doc.ID, "ready", "")
+	if err := ing.docStore.UpdateDocumentStatus(ctx, doc.ID, "ready", ""); err != nil {
+		slog.Warn("update document status failed", "id", doc.ID, "err", err)
+		return
+	}
 	slog.Info("document ready", "id", doc.ID, "filename", doc.Filename, "chunks", len(chunks))
 }
 
