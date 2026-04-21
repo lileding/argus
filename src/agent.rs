@@ -4,6 +4,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::server::Server;
+use crate::upstream;
 
 // --- Types ---
 
@@ -60,15 +61,26 @@ pub struct Agent {
     tx: mpsc::Sender<Task>,
     rx: Mutex<mpsc::Receiver<Task>>,
     cancel: CancellationToken,
+    /// Orchestrator model client (Phase 1: tool calling).
+    #[allow(dead_code)] // Will be used when echo → two-phase agent.
+    orchestrator: Arc<dyn upstream::Client>,
+    /// Synthesizer model client (Phase 2: answer generation).
+    #[allow(dead_code)]
+    synthesizer: Arc<dyn upstream::Client>,
 }
 
 impl Agent {
-    pub fn new() -> Arc<Self> {
+    pub fn new(
+        orchestrator: Arc<dyn upstream::Client>,
+        synthesizer: Arc<dyn upstream::Client>,
+    ) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(64);
         Arc::new(Agent {
             tx,
             rx: Mutex::new(rx),
             cancel: CancellationToken::new(),
+            orchestrator,
+            synthesizer,
         })
     }
 

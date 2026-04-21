@@ -1,6 +1,11 @@
+// Agent doesn't call model methods yet (echo mode). Suppress dead_code
+// until the two-phase agent is wired.
+#[allow(dead_code)]
 pub mod types;
 
+#[allow(dead_code)]
 mod anthropic;
+#[allow(dead_code)]
 mod openai;
 // mod retry;      // TODO
 
@@ -11,6 +16,7 @@ use crate::config::{Config, RoleConfig, UpstreamConfig};
 use types::{ChunkStream, ClientError, ClientResult, Message, Response, ToolDef};
 
 /// Model client interface. Each provider implements this.
+#[allow(dead_code)]
 #[async_trait::async_trait]
 pub trait Client: Send + Sync {
     /// Non-streaming chat completion.

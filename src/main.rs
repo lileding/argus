@@ -11,7 +11,6 @@ mod agent;
 mod config;
 mod frontend;
 mod server;
-#[allow(dead_code)] // Not yet wired to agent; will be consumed when echo → real model.
 mod upstream;
 
 #[derive(Parser)]
@@ -42,7 +41,11 @@ async fn main() -> anyhow::Result<()> {
         "argus starting"
     );
 
-    let agent = Agent::new();
+    // Create model clients for agent roles.
+    let orchestrator = upstream::create_client(&config, &config.agent.orchestrator)?;
+    let synthesizer = upstream::create_client(&config, &config.agent.synthesizer)?;
+
+    let agent = Agent::new(orchestrator, synthesizer);
 
     // Create all frontends from config and spawn them.
     let frontends = frontend::create_all(&config, &agent);
