@@ -428,6 +428,11 @@ impl Feishu {
 
     /// Outbound render loop: receives Messages from the Agent, consumes
     /// their event streams, and replies via Feishu REST API.
+    ///
+    /// Flow per message:
+    /// 1. Immediately open a thinking card (user sees instant feedback)
+    /// 2. Consume events → update card on each Reply
+    /// 3. If events close without Reply → dismiss card
     async fn handle_outbound(self: &Arc<Self>) {
         info!("outbound render loop started");
         let mut rx = self.rx.lock().await;
@@ -439,25 +444,7 @@ impl Feishu {
                         debug!("outbound channel closed");
                         break;
                     };
-                    info!(msg_id = %msg.msg_id, chat_id = %msg.chat_id, "rendering message");
-
-                    while let Some(event) = msg.events.recv().await {
-                        match event {
-                            Event::Reply { text } => {
-                                debug!(msg_id = %msg.msg_id, reply_len = text.len(), "sending reply");
-                                let content = serde_json::json!({"text": text}).to_string();
-                                match api.reply_message(&msg.msg_id, "text", &content).await {
-                                    Ok(reply_id) => {
-                                        info!(msg_id = %msg.msg_id, reply_id, "reply sent");
-                                    }
-                                    Err(e) => {
-                                        warn!(msg_id = %msg.msg_id, error = %e, "reply failed");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    debug!(msg_id = %msg.msg_id, "message events exhausted, card closed");
+                    self.render_message(&api, &mut msg).await;
                 }
                 _ = self.cancel.cancelled() => {
                     info!("outbound render loop shutting down, draining remaining messages");
@@ -465,20 +452,70 @@ impl Feishu {
                 }
             }
         }
+        // Drain remaining messages so their replies still get sent.
         while let Ok(mut msg) = rx.try_recv() {
             info!(msg_id = %msg.msg_id, "draining message");
-            while let Some(event) = msg.events.recv().await {
-                match event {
-                    Event::Reply { text } => {
+            self.render_message(&api, &mut msg).await;
+        }
+        info!("outbound render loop stopped");
+    }
+
+    /// Render a single message: open thinking card → consume events → update card.
+    async fn render_message(&self, api: &feishu::api::Api, msg: &mut Message) {
+        let lang = detect_lang(&msg.chat_id);
+
+        // Step 1: Open thinking card immediately.
+        let card_id = match api
+            .reply_message(&msg.msg_id, "interactive", &thinking_card(lang))
+            .await
+        {
+            Ok(id) => {
+                debug!(msg_id = %msg.msg_id, card_id = %id, "thinking card opened");
+                Some(id)
+            }
+            Err(e) => {
+                warn!(msg_id = %msg.msg_id, error = %e, "failed to open thinking card");
+                None
+            }
+        };
+
+        // Step 2: Consume events and update card.
+        let mut got_reply = false;
+        while let Some(event) = msg.events.recv().await {
+            match event {
+                Event::Reply { text } => {
+                    got_reply = true;
+                    let card_json = markdown_card(&text);
+                    if let Some(cid) = &card_id {
+                        // Update the existing thinking card with the reply.
+                        match api.update_message(cid, &card_json).await {
+                            Ok(()) => {
+                                info!(msg_id = %msg.msg_id, "reply updated on card");
+                            }
+                            Err(e) => {
+                                warn!(msg_id = %msg.msg_id, error = %e, "card update failed, sending new reply");
+                                // Fallback: send as plain text reply.
+                                let content = serde_json::json!({"text": text}).to_string();
+                                let _ = api.reply_message(&msg.msg_id, "text", &content).await;
+                            }
+                        }
+                    } else {
+                        // No card opened → send as new reply.
                         let content = serde_json::json!({"text": text}).to_string();
                         if let Err(e) = api.reply_message(&msg.msg_id, "text", &content).await {
-                            warn!(msg_id = %msg.msg_id, error = %e, "drain reply failed");
+                            warn!(msg_id = %msg.msg_id, error = %e, "reply failed");
                         }
                     }
                 }
             }
         }
-        info!("outbound render loop stopped");
+
+        // Step 3: If events closed without any Reply, dismiss the thinking card.
+        if !got_reply && let Some(cid) = &card_id {
+            let _ = api.update_message(cid, &markdown_card("✓")).await;
+        }
+
+        debug!(msg_id = %msg.msg_id, "message rendering complete");
     }
 }
 
@@ -504,6 +541,40 @@ impl MessageSink for Feishu {
 }
 
 impl Frontend for Feishu {}
+
+// --- Feishu card builders ---
+
+/// Build a Feishu interactive card with markdown content.
+fn markdown_card(md: &str) -> String {
+    serde_json::json!({
+        "schema": "2.0",
+        "config": {"update_multi": true},
+        "body": {
+            "elements": [{"tag": "markdown", "content": md}]
+        }
+    })
+    .to_string()
+}
+
+/// Build a "thinking" status card.
+fn thinking_card(lang: &str) -> String {
+    let text = if lang == "zh" {
+        "💭 正在思考..."
+    } else {
+        "💭 Thinking..."
+    };
+    markdown_card(text)
+}
+
+/// Simple language detection: check for CJK characters.
+fn detect_lang(text: &str) -> &'static str {
+    for c in text.chars() {
+        if ('\u{4E00}'..='\u{9FFF}').contains(&c) {
+            return "zh";
+        }
+    }
+    "en"
+}
 
 // --- Content extraction helpers ---
 
