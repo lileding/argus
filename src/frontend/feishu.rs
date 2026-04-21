@@ -4,8 +4,9 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::agent::{Agent, Event, Message, Payload, Task};
+use crate::agent::{Agent, Event, Message, MessageSink, Payload, Task};
 use crate::config::{FrontendConfig, MEDIA_DIR};
+use crate::server::Server;
 
 use super::Frontend;
 
@@ -169,7 +170,7 @@ impl Feishu {
             chat_id: chat_id.clone(),
             msg_id: msg_id.clone(),
             ready: ready_rx,
-            frontend: self.tx.clone(),
+            frontend: Arc::clone(&self) as Arc<dyn MessageSink>,
         };
         if let Err(e) = self.agent.submit_task(task).await {
             warn!(msg_id, chat_id, error = %e, "submit_task failed");
@@ -481,15 +482,28 @@ impl Feishu {
     }
 }
 
-impl Frontend for Feishu {
-    fn run(self: Arc<Self>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        Box::pin(async move { Feishu::run_inner(&self).await })
+#[async_trait::async_trait]
+impl Server for Feishu {
+    async fn run(self: Arc<Self>) {
+        self.run_inner().await;
     }
 
-    fn stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-        Box::pin(self.stop_inner())
+    async fn stop(&self) {
+        self.stop_inner().await;
     }
 }
+
+#[async_trait::async_trait]
+impl MessageSink for Feishu {
+    async fn submit_message(&self, msg: Message) {
+        // Push to outbound render queue. The outbound loop consumes these.
+        if self.tx.send(msg).await.is_err() {
+            warn!("outbound channel closed, dropping message");
+        }
+    }
+}
+
+impl Frontend for Feishu {}
 
 // --- Content extraction helpers ---
 

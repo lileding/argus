@@ -3,6 +3,8 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::server::Server;
+
 // --- Types ---
 
 pub struct Payload {
@@ -10,13 +12,20 @@ pub struct Payload {
     pub file_paths: Vec<String>,
 }
 
+/// Trait for receiving messages from the Agent. Defined in the agent
+/// module so Agent never imports frontend. Frontend implements this.
+#[async_trait::async_trait]
+pub trait MessageSink: Send + Sync {
+    async fn submit_message(&self, msg: Message);
+}
+
 pub struct Task {
     pub chat_id: String,
     pub msg_id: String,
     /// Delivers the processed payload once media download/extraction is done.
     pub ready: oneshot::Receiver<Payload>,
-    /// Channel back to the frontend for outbound rendering.
-    pub frontend: mpsc::Sender<Message>,
+    /// Callback to the frontend for outbound rendering.
+    pub frontend: Arc<dyn MessageSink>,
 }
 
 pub struct Message {
@@ -46,6 +55,8 @@ impl<T> From<mpsc::error::SendError<T>> for AgentError {
 }
 
 pub struct Agent {
+    // Note: Agent holds tx, so rx.recv() never returns None due to "all senders dropped".
+    // The run loop exits via CancellationToken, not channel close.
     tx: mpsc::Sender<Task>,
     rx: Mutex<mpsc::Receiver<Task>>,
     cancel: CancellationToken,
@@ -61,8 +72,8 @@ impl Agent {
         })
     }
 
-    /// Main agent loop: pops tasks from the queue, processes them serially.
-    pub async fn run(&self) {
+    /// Internal run logic, called by Server::run.
+    async fn run_inner(&self) {
         info!("agent scheduler started");
         let mut rx = self.rx.lock().await;
         loop {
@@ -101,10 +112,7 @@ impl Agent {
             msg_id: task.msg_id.clone(),
             events: events_rx,
         };
-        if task.frontend.send(msg).await.is_err() {
-            warn!(chat_id, msg_id, "frontend channel closed, dropping task");
-            return;
-        }
+        task.frontend.submit_message(msg).await;
         debug!(chat_id, msg_id, "message submitted to frontend");
 
         // Step 2: Wait for payload (media download/extraction complete).
@@ -141,12 +149,19 @@ impl Agent {
         info!(chat_id, msg_id, "task complete");
     }
 
-    pub async fn stop(&self) {
-        self.cancel.cancel();
-    }
-
     pub async fn submit_task(&self, task: Task) -> Result<(), AgentError> {
         self.tx.send(task).await?;
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Server for Agent {
+    async fn run(self: Arc<Self>) {
+        self.run_inner().await;
+    }
+
+    async fn stop(&self) {
+        self.cancel.cancel();
     }
 }

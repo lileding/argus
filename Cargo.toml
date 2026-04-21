@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 tokio-util = { version = "0.7" }
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
+async-trait = "0.1"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

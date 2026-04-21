@@ -1,22 +1,16 @@
 mod feishu;
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::agent::Agent;
+use crate::agent::{Agent, MessageSink};
 use crate::config::Config;
+use crate::server::Server;
 
-/// A frontend can be run (blocking event loop) and stopped (graceful shutdown).
-/// Uses Pin<Box<...>> for dyn compatibility.
-pub trait Frontend: Send + Sync {
-    fn run(self: Arc<Self>) -> Pin<Box<dyn Future<Output = ()> + Send>>;
-    fn stop(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
-}
+/// A frontend is a Server that can receive Messages from the Agent.
+pub trait Frontend: Server + MessageSink {}
 
 /// Create all frontends defined in config. Returns (name, handle) pairs.
-/// Main doesn't need to know about specific frontend types.
 pub fn create_all(config: &Config, agent: &Arc<Agent>) -> Vec<(String, Arc<dyn Frontend>)> {
     let mut frontends = Vec::new();
 

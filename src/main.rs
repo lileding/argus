@@ -5,10 +5,12 @@ use tracing::info;
 
 use crate::agent::Agent;
 use crate::config::Config;
+use crate::server::Server;
 
 mod agent;
 mod config;
 mod frontend;
+mod server;
 
 #[derive(Parser)]
 #[command(name = "argus", about = "Personal AI assistant")]
@@ -49,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
         frontend_handles.push((name, tokio::spawn(async move { f.run().await })));
     }
 
+    // Spawn agent.
     let agent_handle = {
         let a = Arc::clone(&agent);
         tokio::spawn(async move { a.run().await })
