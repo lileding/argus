@@ -11,6 +11,8 @@ mod agent;
 mod config;
 mod frontend;
 mod server;
+#[allow(dead_code)] // Not yet wired to agent; will be consumed when echo → real model.
+mod upstream;
 
 #[derive(Parser)]
 #[command(name = "argus", about = "Personal AI assistant")]
