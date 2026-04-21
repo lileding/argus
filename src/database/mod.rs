@@ -1,3 +1,4 @@
+mod conversation;
 mod messages;
 mod notifications;
 
@@ -17,6 +18,7 @@ pub(crate) use notifications::Notifications;
 pub(crate) struct Database {
     pub messages: messages::Messages,
     pub notifications: notifications::Notifications,
+    pub conversation: conversation::Conversation,
 }
 
 impl Database {
@@ -35,7 +37,8 @@ impl Database {
 
         Ok(Arc::new(Self {
             messages: messages::Messages::new(pool.clone()),
-            notifications: notifications::Notifications::new(pool),
+            notifications: notifications::Notifications::new(pool.clone()),
+            conversation: conversation::Conversation::new(pool),
         }))
     }
 }
@@ -110,5 +113,9 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "006_reply_content.sql",
         include_str!("../../internal/store/migrations/006_reply_content.sql"),
+    ),
+    (
+        "007_conversation_view.sql",
+        include_str!("../../internal/store/migrations/007_conversation_view.sql"),
     ),
 ];

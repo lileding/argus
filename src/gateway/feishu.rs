@@ -215,6 +215,7 @@ impl Feishu {
         let task = Task {
             chat_id: chat_id.clone(),
             msg_id: msg_id.clone(),
+            channel: channel.clone(),
             db_msg_id,
             ready: ready_rx,
             frontend: Arc::clone(&self) as Arc<dyn MessageSink>,

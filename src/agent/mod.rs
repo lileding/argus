@@ -1,4 +1,5 @@
 mod embedding;
+mod harness;
 mod worker;
 
 use std::sync::Arc;
@@ -30,6 +31,8 @@ pub trait MessageSink: Send + Sync {
 pub(crate) struct Task {
     pub(crate) chat_id: String,
     pub(crate) msg_id: String,
+    /// Database channel (e.g. "feishu:p2p:ou_xxx").
+    pub(crate) channel: String,
     /// Database row ID (None if DB not available).
     pub(crate) db_msg_id: Option<i64>,
     pub(crate) ready: oneshot::Receiver<Payload>,
@@ -222,21 +225,30 @@ impl Agent {
             "payload received"
         );
 
-        // Phase 1: Orchestrator — no tools available yet, so it just produces
-        // a summary/analysis. With tools, this would be a loop.
-        let orch_summary = match self.run_orchestrator(&payload.content).await {
-            Ok(summary) => {
+        // Build context with conversation history (semantic recall + sliding window).
+        let orch_messages = harness::build_context(
+            &self.db,
+            self.embedder.as_deref(),
+            ORCHESTRATOR_PROMPT,
+            &task.channel,
+            &payload.content,
+            10, // context window
+        )
+        .await;
+
+        // Phase 1: Orchestrator — calls model with full context.
+        let orch_summary = match self.orchestrator.chat(&orch_messages, &[]).await {
+            Ok(resp) => {
                 debug!(
                     chat_id,
                     msg_id,
-                    summary_len = summary.len(),
+                    summary_len = resp.content.len(),
                     "orchestrator done"
                 );
-                summary
+                resp.content
             }
             Err(e) => {
                 warn!(chat_id, msg_id, error = %e, "orchestrator failed");
-                // Fallback: empty materials, synthesizer works from user text alone.
                 String::new()
             }
         };
@@ -273,23 +285,6 @@ impl Agent {
         }
 
         info!(chat_id, msg_id, "task complete");
-    }
-
-    /// Phase 1: Call the orchestrator model.
-    /// Without tools, it just analyzes the user's message and produces a summary.
-    async fn run_orchestrator(
-        &self,
-        user_text: &str,
-    ) -> Result<String, upstream::types::ClientError> {
-        let messages = vec![
-            model::Message::system(ORCHESTRATOR_PROMPT),
-            model::Message::user(user_text),
-        ];
-
-        // No tools → simple chat call. The orchestrator will produce text
-        // (which we use as "materials" for the synthesizer).
-        let response = self.orchestrator.chat(&messages, &[]).await?;
-        Ok(response.content)
     }
 
     /// Phase 2: Call the synthesizer model with streaming.
