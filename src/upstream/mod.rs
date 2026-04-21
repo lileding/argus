@@ -1,12 +1,11 @@
 pub mod types;
 
+mod anthropic;
 mod openai;
-// mod anthropic;  // TODO
-// mod gemini;     // TODO
 // mod retry;      // TODO
 
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::config::{Config, RoleConfig, UpstreamConfig};
 use types::{ChunkStream, ClientError, ClientResult, Message, Response, ToolDef};
@@ -62,13 +61,17 @@ fn create_provider_client(
 ) -> ClientResult<Arc<dyn Client>> {
     match upstream.provider_type.as_str() {
         "openai" => Ok(Arc::new(openai::OpenAiClient::new(upstream, role))),
-        "anthropic" => {
-            warn!("anthropic client not yet implemented");
-            Err(ClientError::Other("anthropic not implemented".into()))
-        }
+        "anthropic" => Ok(Arc::new(anthropic::AnthropicClient::new(upstream, role))),
         "gemini" => {
-            warn!("gemini client not yet implemented");
-            Err(ClientError::Other("gemini not implemented".into()))
+            // Gemini supports OpenAI-compatible endpoint.
+            // Use OpenAI client with Gemini's compatibility base URL.
+            info!("gemini: using OpenAI-compatible endpoint");
+            let mut gemini_upstream = upstream.clone();
+            if gemini_upstream.base_url.is_empty() {
+                gemini_upstream.base_url =
+                    "https://generativelanguage.googleapis.com/v1beta/openai".into();
+            }
+            Ok(Arc::new(openai::OpenAiClient::new(&gemini_upstream, role)))
         }
         other => Err(ClientError::Other(format!(
             "unknown provider type: {other}"
