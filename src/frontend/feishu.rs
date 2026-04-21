@@ -7,7 +7,9 @@ use tracing::{debug, info, warn};
 use crate::agent::{Agent, Event, Message, Payload, Task};
 use crate::config::{FrontendConfig, MEDIA_DIR};
 
-pub struct Feishu {
+use super::Frontend;
+
+pub(super) struct Feishu {
     agent: Arc<Agent>,
     cancel: CancellationToken,
     tx: mpsc::Sender<Message>,
@@ -44,7 +46,7 @@ impl Feishu {
 
     /// Main frontend loop: connects WS, dispatches inbound events,
     /// reconnects on disconnect. Outbound rendering runs in a spawned task.
-    pub async fn run(self: &Arc<Self>) {
+    async fn run_inner(self: &Arc<Self>) {
         info!("feishu frontend started");
 
         let outbound_handle = {
@@ -97,7 +99,7 @@ impl Feishu {
         info!("feishu frontend stopped");
     }
 
-    pub async fn stop(&self) {
+    async fn stop_inner(&self) {
         self.cancel.cancel();
     }
 
@@ -476,6 +478,16 @@ impl Feishu {
             }
         }
         info!("outbound render loop stopped");
+    }
+}
+
+impl Frontend for Feishu {
+    fn run(self: Arc<Self>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(async move { Feishu::run_inner(&self).await })
+    }
+
+    fn stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(self.stop_inner())
     }
 }
 

@@ -5,7 +5,6 @@ use tracing::info;
 
 use crate::agent::Agent;
 use crate::config::Config;
-use crate::frontend::Feishu;
 
 mod agent;
 mod config;
@@ -41,22 +40,14 @@ async fn main() -> anyhow::Result<()> {
 
     let agent = Agent::new();
 
-    // Start feishu frontend (if configured).
-    let feishu = if let Some(fe_cfg) = config.frontend.get("feishu") {
-        anyhow::ensure!(
-            !fe_cfg.app_id.is_empty() && !fe_cfg.app_secret.is_empty(),
-            "frontend 'feishu' requires non-empty app_id and app_secret"
-        );
-        let f = Feishu::new(Arc::clone(&agent), fe_cfg, &config.workspace_dir);
-        let handle = {
-            let f = Arc::clone(&f);
-            tokio::spawn(async move { f.run().await })
-        };
-        Some((f, handle))
-    } else {
-        info!("no feishu frontend configured");
-        None
-    };
+    // Create all frontends from config and spawn them.
+    let frontends = frontend::create_all(&config, &agent);
+    let mut frontend_handles = Vec::new();
+    for (name, f) in &frontends {
+        let f = Arc::clone(f);
+        let name = name.clone();
+        frontend_handles.push((name, tokio::spawn(async move { f.run().await })));
+    }
 
     let agent_handle = {
         let a = Arc::clone(&agent);
@@ -67,11 +58,16 @@ async fn main() -> anyhow::Result<()> {
     tokio::signal::ctrl_c().await.ok();
     info!("shutdown initiated");
 
+    // Shutdown: agent first (finishes in-flight), then frontends.
     agent.stop().await;
     let _ = agent_handle.await;
-    if let Some((f, handle)) = feishu {
+    for (name, f) in &frontends {
+        info!(frontend = name, "stopping frontend");
         f.stop().await;
+    }
+    for (name, handle) in frontend_handles {
         let _ = handle.await;
+        info!(frontend = name, "frontend stopped");
     }
 
     info!("argus stopped");
