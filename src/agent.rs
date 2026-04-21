@@ -5,6 +5,7 @@ use tracing::{debug, info, warn};
 
 use crate::server::Server;
 use crate::upstream;
+use crate::upstream::types as model;
 
 // --- Types ---
 
@@ -41,6 +42,27 @@ pub enum Event {
     Reply { text: String },
 }
 
+// --- Prompts ---
+
+/// Orchestrator prompt (Phase 1). When tools are available, this will instruct
+/// the model to only call tools. For now (no tools), it analyzes the request.
+const ORCHESTRATOR_PROMPT: &str = r#"You are the ORCHESTRATOR of an AI agent. Analyze the user's request and produce a structured summary:
+
+1. Identify the user's intent and key topics
+2. Note any specific facts, entities, or constraints mentioned
+3. Determine what information would be needed to answer well
+
+Output a brief, structured analysis. The SYNTHESIZER will use your analysis to compose the final answer."#;
+
+/// Synthesizer prompt (Phase 2). Composes the final user-facing answer.
+const SYNTHESIZER_PROMPT: &str = r#"You are the SYNTHESIZER. You receive the user's question and an analysis from the orchestrator. Compose a clear, helpful answer.
+
+RULES:
+- Match the user's language and tone. If they asked in Chinese, answer in Chinese.
+- Use markdown formatting: headings, lists, code blocks.
+- Be concise, well-structured, and directly address the user's question.
+- Draw on your knowledge to provide a thorough answer."#;
+
 // --- Agent ---
 
 #[derive(Debug, thiserror::Error)]
@@ -61,11 +83,7 @@ pub struct Agent {
     tx: mpsc::Sender<Task>,
     rx: Mutex<mpsc::Receiver<Task>>,
     cancel: CancellationToken,
-    /// Orchestrator model client (Phase 1: tool calling).
-    #[allow(dead_code)] // Will be used when echo → two-phase agent.
     orchestrator: Arc<dyn upstream::Client>,
-    /// Synthesizer model client (Phase 2: answer generation).
-    #[allow(dead_code)]
     synthesizer: Arc<dyn upstream::Client>,
 }
 
@@ -84,7 +102,6 @@ impl Agent {
         })
     }
 
-    /// Internal run logic, called by Server::run.
     async fn run_inner(&self) {
         info!("agent scheduler started");
         let mut rx = self.rx.lock().await;
@@ -106,18 +123,15 @@ impl Agent {
         info!("agent scheduler stopped");
     }
 
-    /// Process a single task through the full pipeline:
-    /// 1. Create events channel and notify frontend (opens card)
-    /// 2. Wait for payload from media processor
-    /// 3. Execute agent logic (echo for now)
-    /// 4. Drop events channel (closes card)
+    /// Two-phase processing pipeline:
+    /// 1. Orchestrator: analyze user message (no tools for now → just acknowledges)
+    /// 2. Synthesizer: compose final answer from materials, streaming to frontend
     async fn process_task(&self, task: Task) {
         let chat_id = &task.chat_id;
         let msg_id = &task.msg_id;
         info!(chat_id, msg_id, "processing task");
 
-        // Step 1: Create events channel and hand Message to frontend.
-        // Frontend opens the thinking card as soon as it receives this.
+        // Open events channel → frontend shows thinking card.
         let (events_tx, events_rx) = mpsc::channel(16);
         let msg = Message {
             chat_id: task.chat_id.clone(),
@@ -125,40 +139,120 @@ impl Agent {
             events: events_rx,
         };
         task.frontend.submit_message(msg).await;
-        debug!(chat_id, msg_id, "message submitted to frontend");
 
-        // Step 2: Wait for payload (media download/extraction complete).
+        // Wait for payload.
         let payload = match task.ready.await {
-            Ok(p) => {
+            Ok(p) => p,
+            Err(_) => {
+                warn!(chat_id, msg_id, "ready channel dropped");
+                return;
+            }
+        };
+        debug!(
+            chat_id,
+            msg_id,
+            content_len = payload.content.len(),
+            "payload received"
+        );
+
+        // Phase 1: Orchestrator — no tools available yet, so it just produces
+        // a summary/analysis. With tools, this would be a loop.
+        let orch_summary = match self.run_orchestrator(&payload.content).await {
+            Ok(summary) => {
                 debug!(
                     chat_id,
                     msg_id,
-                    content_len = p.content.len(),
-                    "payload received from download"
+                    summary_len = summary.len(),
+                    "orchestrator done"
                 );
-                p
+                summary
             }
-            Err(_) => {
-                warn!(
-                    chat_id,
-                    msg_id, "ready channel dropped, no payload delivered"
-                );
-                return;
-                // events_tx dropped here → frontend sees channel close → dismisses card
+            Err(e) => {
+                warn!(chat_id, msg_id, error = %e, "orchestrator failed");
+                // Fallback: empty materials, synthesizer works from user text alone.
+                String::new()
             }
         };
 
-        // Step 3: Agent logic — echo for now.
-        // Future: orchestrator tool loop → synthesizer streaming.
-        let _ = events_tx
-            .send(Event::Reply {
-                text: payload.content,
-            })
-            .await;
-        debug!(chat_id, msg_id, "reply event sent");
+        // Phase 2: Synthesizer — stream the final answer to frontend.
+        match self
+            .run_synthesizer(&payload.content, &orch_summary, &events_tx)
+            .await
+        {
+            Ok(()) => {
+                debug!(chat_id, msg_id, "synthesizer done");
+            }
+            Err(e) => {
+                warn!(chat_id, msg_id, error = %e, "synthesizer failed");
+                let _ = events_tx
+                    .send(Event::Reply {
+                        text: format!("Error: {e}"),
+                    })
+                    .await;
+            }
+        }
 
-        // Step 4: events_tx dropped → frontend sees channel close → finalizes card.
         info!(chat_id, msg_id, "task complete");
+    }
+
+    /// Phase 1: Call the orchestrator model.
+    /// Without tools, it just analyzes the user's message and produces a summary.
+    async fn run_orchestrator(
+        &self,
+        user_text: &str,
+    ) -> Result<String, upstream::types::ClientError> {
+        let messages = vec![
+            model::Message::system(ORCHESTRATOR_PROMPT),
+            model::Message::user(user_text),
+        ];
+
+        // No tools → simple chat call. The orchestrator will produce text
+        // (which we use as "materials" for the synthesizer).
+        let response = self.orchestrator.chat(&messages, &[]).await?;
+        Ok(response.content)
+    }
+
+    /// Phase 2: Call the synthesizer model with streaming.
+    /// Sends reply deltas to the frontend as they arrive.
+    async fn run_synthesizer(
+        &self,
+        user_text: &str,
+        materials: &str,
+        events_tx: &mpsc::Sender<Event>,
+    ) -> Result<(), upstream::types::ClientError> {
+        use futures::StreamExt;
+
+        // Single user message with both the question and materials to avoid
+        // consecutive same-role messages (which some providers reject).
+        let user_content = format!(
+            "{}\n\n---\n\n## Orchestrator Analysis\n\n{}",
+            user_text, materials
+        );
+        let messages = vec![
+            model::Message::system(SYNTHESIZER_PROMPT),
+            model::Message::user(user_content),
+        ];
+
+        let mut stream = self.synthesizer.chat_stream(&messages, &[]).await?;
+        let mut full_reply = String::new();
+
+        while let Some(chunk) = stream.next().await {
+            if let Some(err) = &chunk.error {
+                return Err(upstream::types::ClientError::Sse(err.clone()));
+            }
+            if !chunk.delta.is_empty() {
+                full_reply.push_str(&chunk.delta);
+            }
+            if chunk.done {
+                break;
+            }
+        }
+
+        // Send the complete reply as a single event.
+        // (Future: send incremental deltas for streaming card updates.)
+        let _ = events_tx.send(Event::Reply { text: full_reply }).await;
+
+        Ok(())
     }
 
     pub async fn submit_task(&self, task: Task) -> Result<(), AgentError> {
