@@ -1,11 +1,14 @@
 # Argus configuration.
-# Copy to ~/.argus/config.toml (or wherever --workspace points).
+# Default location: ~/.config/argus/argus.toml
+
+# Workspace directory for media files, skills, etc.
+# Supports ~, relative paths (resolved from cwd).
+# workspace_dir = "~/.local/share/argus"  # default
 
 [frontend.feishu]
-type = "feishu"
 app_id = ""
 app_secret = ""
-# base_url = "https://open.feishu.cn"  # default, use https://open.larksuite.com for Lark
+# base_url = "https://open.feishu.cn"  # default; use https://open.larksuite.com for Lark
 
 [agent]
 max_iterations = 10
@@ -29,7 +32,6 @@ max_tokens = 32768
 type = "openai"
 base_url = "https://api.openai.com/v1"
 api_key = ""
-timeout_secs = 120
 
 [upstream.anthropic]
 type = "anthropic"

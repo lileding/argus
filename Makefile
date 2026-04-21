@@ -4,7 +4,7 @@ build:
 	cargo build
 
 run:
-	RUST_LOG=info,argus=debug,feishu=debug cargo run -- --workspace ./workspace
+	RUST_LOG=info,argus=debug,feishu=debug cargo run -- --config ./workspace/config.toml
 
 test:
 	cargo test --workspace

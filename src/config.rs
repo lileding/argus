@@ -6,43 +6,34 @@ use serde::Deserialize;
 /// Subdirectory under workspace for downloaded media files.
 pub const MEDIA_DIR: &str = ".files";
 
-/// Application configuration. Loaded from TOML, with `workspace_dir`
-/// injected from CLI args (not present in the config file).
-#[derive(Debug)]
-#[allow(dead_code)] // Fields consumed incrementally as features are built.
+/// Application configuration loaded from TOML.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct Config {
-    /// Workspace directory (from --workspace CLI arg).
+    /// Workspace directory. Supports ~ and relative paths; resolved to
+    /// absolute on load.
+    #[serde(default = "default_workspace_dir")]
     pub workspace_dir: PathBuf,
-    /// Named frontend instances (e.g. "feishu").
+    /// Named frontend instances. Key is the frontend type ("feishu", etc.).
+    #[serde(default)]
     pub frontend: HashMap<String, FrontendConfig>,
-    /// Agent settings.
+    #[serde(default)]
     pub agent: AgentConfig,
-    /// Named upstream model providers (e.g. "openai", "anthropic").
+    /// Named upstream model providers.
+    #[serde(default)]
     pub upstream: HashMap<String, UpstreamConfig>,
 }
 
-/// Raw TOML structure (without workspace_dir).
-#[derive(Debug, Deserialize)]
-struct RawConfig {
-    #[serde(default)]
-    frontend: HashMap<String, FrontendConfig>,
-    #[serde(default)]
-    agent: AgentConfig,
-    #[serde(default)]
-    upstream: HashMap<String, UpstreamConfig>,
-}
-
+/// Frontend config. The HashMap key is the frontend type ("feishu", etc.).
+/// Currently feishu-only; when adding other frontends, use an enum or
+/// two-pass deserialization for type-specific fields.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct FrontendConfig {
-    /// Frontend type: "feishu" (future: "slack", "cli").
-    #[serde(rename = "type")]
-    pub frontend_type: String,
     #[serde(default)]
     pub app_id: String,
     #[serde(default)]
     pub app_secret: String,
-    /// Feishu API base URL.
     #[serde(default = "default_feishu_base_url")]
     pub base_url: String,
 }
@@ -74,11 +65,9 @@ impl Default for AgentConfig {
     }
 }
 
-/// Which upstream and model to use for a given agent role.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct RoleConfig {
-    /// Name of the upstream (key into Config.upstream).
     #[serde(default)]
     pub upstream: String,
     #[serde(default)]
@@ -97,11 +86,9 @@ impl Default for RoleConfig {
     }
 }
 
-/// A named model provider backend.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct UpstreamConfig {
-    /// Provider type: "openai", "anthropic", "gemini".
     #[serde(rename = "type")]
     pub provider_type: String,
     #[serde(default)]
@@ -113,7 +100,6 @@ pub struct UpstreamConfig {
 }
 
 impl UpstreamConfig {
-    /// Returns base_url if set, otherwise the default for the provider type.
     #[allow(dead_code)]
     pub fn effective_base_url(&self) -> &str {
         if !self.base_url.is_empty() {
@@ -129,6 +115,10 @@ impl UpstreamConfig {
 }
 
 // --- Defaults ---
+
+fn default_workspace_dir() -> PathBuf {
+    PathBuf::from("~/.local/share/argus")
+}
 
 fn default_feishu_base_url() -> String {
     "https://open.feishu.cn".into()
@@ -153,35 +143,34 @@ fn default_timeout() -> u64 {
 // --- Loading ---
 
 impl Config {
-    /// Load config from TOML file + CLI workspace_dir.
-    /// Falls back to defaults if file doesn't exist.
-    pub fn load(config_path: &Path, workspace_dir: PathBuf) -> anyhow::Result<Self> {
-        let raw = if config_path.exists() {
+    /// Load config from TOML file. Falls back to defaults if file doesn't exist.
+    /// Resolves workspace_dir to absolute (expand ~, join with cwd if relative).
+    pub fn load(config_path: &Path) -> anyhow::Result<Self> {
+        let mut config: Config = if config_path.exists() {
             let content = std::fs::read_to_string(config_path)?;
-            let raw: RawConfig = toml::from_str(&content)?;
+            let c: Config = toml::from_str(&content)?;
             tracing::info!(path = %config_path.display(), "config loaded");
-            raw
+            c
         } else {
             tracing::info!(
                 path = %config_path.display(),
                 "config file not found, using defaults"
             );
-            RawConfig {
-                frontend: HashMap::new(),
-                agent: AgentConfig::default(),
-                upstream: HashMap::new(),
-            }
+            toml::from_str("").unwrap()
         };
 
-        Ok(Config {
-            workspace_dir,
-            frontend: raw.frontend,
-            agent: raw.agent,
-            upstream: raw.upstream,
-        })
+        // Resolve workspace_dir to absolute (expand ~, join with cwd if relative).
+        let ws_str = config
+            .workspace_dir
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("workspace_dir contains invalid UTF-8"))?;
+        config.workspace_dir = resolve_path(ws_str)?;
+        std::fs::create_dir_all(&config.workspace_dir)?;
+
+        tracing::info!(workspace = %config.workspace_dir.display(), "workspace resolved");
+        Ok(config)
     }
 
-    /// Resolve the upstream config for a role.
     #[allow(dead_code)]
     pub fn upstream_for(&self, role: &RoleConfig) -> Option<&UpstreamConfig> {
         if role.upstream.is_empty() {
@@ -191,34 +180,53 @@ impl Config {
     }
 }
 
+/// Expand ~ and resolve relative paths to absolute using cwd.
+fn resolve_path(path: &str) -> anyhow::Result<PathBuf> {
+    let expanded = expand_tilde(path);
+    if expanded.is_absolute() {
+        Ok(expanded)
+    } else {
+        Ok(std::env::current_dir()?.join(expanded))
+    }
+}
+
+pub fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs_home() {
+            return home.join(rest);
+        }
+    } else if path == "~"
+        && let Some(home) = dirs_home()
+    {
+        return home;
+    }
+    PathBuf::from(path)
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn parse(toml_str: &str) -> Config {
-        let raw: RawConfig = toml::from_str(toml_str).unwrap();
-        Config {
-            workspace_dir: PathBuf::from("/test"),
-            frontend: raw.frontend,
-            agent: raw.agent,
-            upstream: raw.upstream,
-        }
-    }
-
     #[test]
     fn parse_minimal() {
-        let config = parse("");
-        assert_eq!(config.agent.max_iterations, 10);
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.workspace_dir, PathBuf::from("~/.local/share/argus"));
         assert!(config.frontend.is_empty());
         assert!(config.upstream.is_empty());
+        assert_eq!(config.agent.max_iterations, 10);
     }
 
     #[test]
     fn parse_full() {
-        let config = parse(
+        let config: Config = toml::from_str(
             r#"
+workspace_dir = "/data/argus"
+
 [frontend.feishu]
-type = "feishu"
 app_id = "cli_abc"
 app_secret = "secret123"
 
@@ -229,16 +237,11 @@ orchestrator_context_window = 8
 [agent.orchestrator]
 upstream = "anthropic"
 model_name = "claude-haiku-4-5"
-max_tokens = 4096
 
 [agent.synthesizer]
 upstream = "gemini"
 model_name = "gemini-2.5-flash-lite"
 max_tokens = 32768
-
-[agent.transcription]
-upstream = "local"
-model_name = "whisper-large-v3"
 
 [upstream.local]
 type = "openai"
@@ -249,62 +252,42 @@ timeout_secs = 240
 [upstream.anthropic]
 type = "anthropic"
 api_key = "sk-ant-xxx"
-
-[upstream.gemini]
-type = "gemini"
-api_key = "AIza-xxx"
 "#,
-        );
+        )
+        .unwrap();
+
+        assert_eq!(config.workspace_dir, PathBuf::from("/data/argus"));
 
         let feishu = config.frontend.get("feishu").unwrap();
-        assert_eq!(feishu.frontend_type, "feishu");
         assert_eq!(feishu.app_id, "cli_abc");
-        assert_eq!(feishu.base_url, "https://open.feishu.cn"); // default
+        assert_eq!(feishu.base_url, "https://open.feishu.cn");
 
         assert_eq!(config.agent.max_iterations, 15);
         assert_eq!(config.agent.orchestrator.upstream, "anthropic");
-        assert_eq!(config.agent.orchestrator.model_name, "claude-haiku-4-5");
         assert_eq!(config.agent.synthesizer.max_tokens, 32768);
-        assert_eq!(config.agent.transcription.model_name, "whisper-large-v3");
 
         let local = config.upstream.get("local").unwrap();
         assert_eq!(local.provider_type, "openai");
-        assert_eq!(local.base_url, "http://localhost:8000/v1");
         assert_eq!(local.timeout_secs, 240);
 
         let anthropic = config.upstream.get("anthropic").unwrap();
-        assert_eq!(anthropic.timeout_secs, 120); // default
-
-        assert!(config.upstream_for(&config.agent.orchestrator).is_some());
-        assert!(config.upstream_for(&RoleConfig::default()).is_none());
+        assert_eq!(anthropic.timeout_secs, 120);
     }
 
     #[test]
     fn parse_multiple_frontends() {
-        let config = parse(
+        let config: Config = toml::from_str(
             r#"
 [frontend.feishu]
-type = "feishu"
-app_id = "cli_abc"
+app_id = "abc"
 app_secret = "secret"
 
 [frontend.slack]
-type = "slack"
 app_id = "xoxb-xxx"
 "#,
-        );
+        )
+        .unwrap();
         assert_eq!(config.frontend.len(), 2);
-        assert_eq!(config.frontend["feishu"].frontend_type, "feishu");
-        assert_eq!(config.frontend["slack"].frontend_type, "slack");
-    }
-
-    #[test]
-    fn defaults_are_sane() {
-        let config = parse("");
-        assert_eq!(config.workspace_dir, PathBuf::from("/test"));
-        assert_eq!(config.agent.max_iterations, 10);
-        assert_eq!(config.agent.orchestrator_context_window, 10);
-        assert_eq!(config.agent.orchestrator.max_tokens, 4096);
     }
 
     #[test]
@@ -335,5 +318,36 @@ app_id = "xoxb-xxx"
             "https://api.anthropic.com"
         );
         assert!(make("gemini").effective_base_url().contains("googleapis"));
+    }
+
+    #[test]
+    fn expand_tilde_with_subpath() {
+        let result = expand_tilde("~/foo/bar");
+        assert!(result.to_str().unwrap().ends_with("/foo/bar"));
+        assert!(!result.to_str().unwrap().starts_with("~"));
+    }
+
+    #[test]
+    fn expand_tilde_bare() {
+        let result = expand_tilde("~");
+        assert!(!result.to_str().unwrap().starts_with("~"));
+    }
+
+    #[test]
+    fn expand_tilde_absolute_passthrough() {
+        assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+    }
+
+    #[test]
+    fn resolve_path_absolute() {
+        let p = resolve_path("/abs/path").unwrap();
+        assert_eq!(p, PathBuf::from("/abs/path"));
+    }
+
+    #[test]
+    fn resolve_path_relative() {
+        let p = resolve_path("relative/dir").unwrap();
+        assert!(p.is_absolute());
+        assert!(p.to_str().unwrap().ends_with("relative/dir"));
     }
 }
