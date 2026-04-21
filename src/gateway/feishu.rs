@@ -5,10 +5,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::agent::{Agent, Event, Message, MessageSink, Payload, Task};
-use crate::config::{FrontendConfig, MEDIA_DIR};
+use crate::config::{GatewayImConfig, MEDIA_DIR};
 use crate::server::Server;
 
-use super::Frontend;
+use super::Im;
 
 pub(super) struct Feishu {
     agent: Arc<Agent>,
@@ -20,7 +20,7 @@ pub(super) struct Feishu {
 }
 
 impl Feishu {
-    pub fn new(agent: Arc<Agent>, cfg: &FrontendConfig, workspace_dir: &Path) -> Arc<Self> {
+    pub fn new(agent: Arc<Agent>, cfg: &GatewayImConfig, workspace_dir: &Path) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(64);
 
         // Ensure media directory exists.
@@ -540,7 +540,7 @@ impl MessageSink for Feishu {
     }
 }
 
-impl Frontend for Feishu {}
+impl Im for Feishu {}
 
 // --- Feishu card builders ---
 

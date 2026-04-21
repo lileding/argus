@@ -5,7 +5,7 @@
 # Supports ~, relative paths (resolved from cwd).
 # workspace_dir = "~/.local/share/argus"  # default
 
-[frontend.feishu]
+[gateway.feishu]
 app_id = ""
 app_secret = ""
 # base_url = "https://open.feishu.cn"  # default; use https://open.larksuite.com for Lark

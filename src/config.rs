@@ -14,9 +14,9 @@ pub struct Config {
     /// absolute on load.
     #[serde(default = "default_workspace_dir")]
     pub workspace_dir: PathBuf,
-    /// Named frontend instances. Key is the frontend type ("feishu", etc.).
+    /// Named IM adapters. Key is the IM type ("feishu", "slack", etc.).
     #[serde(default)]
-    pub frontend: HashMap<String, FrontendConfig>,
+    pub gateway: HashMap<String, GatewayImConfig>,
     #[serde(default)]
     pub agent: AgentConfig,
     /// Named upstream model providers.
@@ -29,7 +29,7 @@ pub struct Config {
 /// two-pass deserialization for type-specific fields.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
-pub struct FrontendConfig {
+pub struct GatewayImConfig {
     #[serde(default)]
     pub app_id: String,
     #[serde(default)]
@@ -215,7 +215,7 @@ mod tests {
     fn parse_minimal() {
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.workspace_dir, PathBuf::from("~/.local/share/argus"));
-        assert!(config.frontend.is_empty());
+        assert!(config.gateway.is_empty());
         assert!(config.upstream.is_empty());
         assert_eq!(config.agent.max_iterations, 10);
     }
@@ -226,7 +226,7 @@ mod tests {
             r#"
 workspace_dir = "/data/argus"
 
-[frontend.feishu]
+[gateway.feishu]
 app_id = "cli_abc"
 app_secret = "secret123"
 
@@ -258,7 +258,7 @@ api_key = "sk-ant-xxx"
 
         assert_eq!(config.workspace_dir, PathBuf::from("/data/argus"));
 
-        let feishu = config.frontend.get("feishu").unwrap();
+        let feishu = config.gateway.get("feishu").unwrap();
         assert_eq!(feishu.app_id, "cli_abc");
         assert_eq!(feishu.base_url, "https://open.feishu.cn");
 
@@ -278,16 +278,16 @@ api_key = "sk-ant-xxx"
     fn parse_multiple_frontends() {
         let config: Config = toml::from_str(
             r#"
-[frontend.feishu]
+[gateway.feishu]
 app_id = "abc"
 app_secret = "secret"
 
-[frontend.slack]
+[gateway.slack]
 app_id = "xoxb-xxx"
 "#,
         )
         .unwrap();
-        assert_eq!(config.frontend.len(), 2);
+        assert_eq!(config.gateway.len(), 2);
     }
 
     #[test]

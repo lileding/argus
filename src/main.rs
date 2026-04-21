@@ -5,12 +5,13 @@ use tracing::info;
 
 use crate::agent::Agent;
 use crate::config::Config;
+use crate::gateway::Gateway;
 use crate::server::Server;
 use crate::upstream::Upstream;
 
 mod agent;
 mod config;
-mod frontend;
+mod gateway;
 mod server;
 mod upstream;
 
@@ -39,15 +40,9 @@ async fn main() -> anyhow::Result<()> {
 
     let upstream = Upstream::new(&config.upstream);
     let agent = Agent::new(&config.agent, &upstream)?;
-    let frontends = frontend::create_all(&config.frontend, &agent, &config.workspace_dir);
+    let gateway = Gateway::new(&config.gateway, &agent, &config.workspace_dir);
 
-    // Spawn all.
-    let mut frontend_handles = Vec::new();
-    for (name, f) in &frontends {
-        let f = Arc::clone(f);
-        let name = name.clone();
-        frontend_handles.push((name, tokio::spawn(async move { f.run().await })));
-    }
+    let gateway_handles = gateway.spawn_all();
     let agent_handle = {
         let a = Arc::clone(&agent);
         tokio::spawn(async move { a.run().await })
@@ -57,16 +52,11 @@ async fn main() -> anyhow::Result<()> {
     tokio::signal::ctrl_c().await.ok();
     info!("shutdown initiated");
 
-    // Shutdown: agent first, then frontends.
     agent.stop().await;
     let _ = agent_handle.await;
-    for (name, f) in &frontends {
-        info!(frontend = name, "stopping");
-        f.stop().await;
-    }
-    for (name, handle) in frontend_handles {
+    gateway.stop().await;
+    for handle in gateway_handles {
         let _ = handle.await;
-        info!(frontend = name, "stopped");
     }
 
     info!("argus stopped");
