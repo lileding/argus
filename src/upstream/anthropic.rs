@@ -451,14 +451,11 @@ fn sse_to_stream(mut es: EventSource) -> impl Stream<Item = StreamChunk> {
                                 }
                             }
                         }
-                        "content_block_stop" => {
-                            // Only increment tool_index for tool_use blocks.
-                            // Text blocks don't contribute to tool call indexing.
-                            if current_block_is_tool {
-                                tool_index += 1;
-                                current_block_is_tool = false;
-                            }
+                        "content_block_stop" if current_block_is_tool => {
+                            tool_index += 1;
+                            current_block_is_tool = false;
                         }
+                        "content_block_stop" => {}
                         "message_delta" => {
                             let usage = event.usage.map(|u| Usage {
                                 prompt_tokens: 0,

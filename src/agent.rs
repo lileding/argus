@@ -88,18 +88,29 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// Create an Agent from config. Internally creates model clients
+    /// for orchestrator and synthesizer roles.
     pub fn new(
-        orchestrator: Arc<dyn upstream::Client>,
-        synthesizer: Arc<dyn upstream::Client>,
-    ) -> Arc<Self> {
+        config: &crate::config::AgentConfig,
+        upstream: &upstream::Upstream,
+    ) -> Result<Arc<Self>, upstream::types::ClientError> {
+        let orchestrator = upstream.client_for(&config.orchestrator)?;
+        let synthesizer = upstream.client_for(&config.synthesizer)?;
+
+        info!(
+            orchestrator = config.orchestrator.model_name,
+            synthesizer = config.synthesizer.model_name,
+            "agent initialized"
+        );
+
         let (tx, rx) = mpsc::channel(64);
-        Arc::new(Agent {
+        Ok(Arc::new(Agent {
             tx,
             rx: Mutex::new(rx),
             cancel: CancellationToken::new(),
             orchestrator,
             synthesizer,
-        })
+        }))
     }
 
     async fn run_inner(&self) {

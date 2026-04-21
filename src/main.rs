@@ -6,6 +6,7 @@ use tracing::info;
 use crate::agent::Agent;
 use crate::config::Config;
 use crate::server::Server;
+use crate::upstream::Upstream;
 
 mod agent;
 mod config;
@@ -34,29 +35,19 @@ async fn main() -> anyhow::Result<()> {
     let config_path = config::expand_tilde(&cli.config);
     let config = Config::load(&config_path)?;
 
-    info!(
-        workspace = %config.workspace_dir.display(),
-        frontends = config.frontend.len(),
-        upstreams = config.upstream.len(),
-        "argus starting"
-    );
+    info!(workspace = %config.workspace_dir.display(), "argus starting");
 
-    // Create model clients for agent roles.
-    let orchestrator = upstream::create_client(&config, &config.agent.orchestrator)?;
-    let synthesizer = upstream::create_client(&config, &config.agent.synthesizer)?;
+    let upstream = Upstream::new(&config.upstream);
+    let agent = Agent::new(&config.agent, &upstream)?;
+    let frontends = frontend::create_all(&config.frontend, &agent, &config.workspace_dir);
 
-    let agent = Agent::new(orchestrator, synthesizer);
-
-    // Create all frontends from config and spawn them.
-    let frontends = frontend::create_all(&config, &agent);
+    // Spawn all.
     let mut frontend_handles = Vec::new();
     for (name, f) in &frontends {
         let f = Arc::clone(f);
         let name = name.clone();
         frontend_handles.push((name, tokio::spawn(async move { f.run().await })));
     }
-
-    // Spawn agent.
     let agent_handle = {
         let a = Arc::clone(&agent);
         tokio::spawn(async move { a.run().await })
@@ -66,16 +57,16 @@ async fn main() -> anyhow::Result<()> {
     tokio::signal::ctrl_c().await.ok();
     info!("shutdown initiated");
 
-    // Shutdown: agent first (finishes in-flight), then frontends.
+    // Shutdown: agent first, then frontends.
     agent.stop().await;
     let _ = agent_handle.await;
     for (name, f) in &frontends {
-        info!(frontend = name, "stopping frontend");
+        info!(frontend = name, "stopping");
         f.stop().await;
     }
     for (name, handle) in frontend_handles {
         let _ = handle.await;
-        info!(frontend = name, "frontend stopped");
+        info!(frontend = name, "stopped");
     }
 
     info!("argus stopped");

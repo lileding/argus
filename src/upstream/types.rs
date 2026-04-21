@@ -181,6 +181,25 @@ pub struct StreamChunk {
 /// Type alias for a boxed async stream of chunks.
 pub type ChunkStream = Pin<Box<dyn Stream<Item = StreamChunk> + Send>>;
 
+// --- Client trait ---
+
+/// Model client interface. Each provider implements this.
+#[async_trait::async_trait]
+pub trait Client: Send + Sync {
+    async fn chat(&self, messages: &[Message], tools: &[ToolDef]) -> ClientResult<Response>;
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+    ) -> ClientResult<ChunkStream>;
+    async fn chat_with_early_abort(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        max_text_tokens: usize,
+    ) -> ClientResult<Response>;
+}
+
 // --- Errors ---
 
 #[derive(Debug, thiserror::Error)]
