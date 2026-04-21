@@ -98,28 +98,27 @@ pub(crate) struct Agent {
 
 impl Agent {
     pub(crate) fn new(
-        config: &crate::config::Config,
+        config: &crate::config::AgentConfig,
         upstream_reg: &upstream::Upstream,
         db: &Arc<Database>,
     ) -> Result<Arc<Self>, upstream::types::ClientError> {
-        let orchestrator = upstream_reg.client_for(&config.agent.orchestrator)?;
-        let synthesizer = upstream_reg.client_for(&config.agent.synthesizer)?;
+        let orchestrator = upstream_reg.client_for(&config.orchestrator)?;
+        let synthesizer = upstream_reg.client_for(&config.synthesizer)?;
 
         // Embedding client (optional: only if upstream is configured).
         let embedder = if !config.embedding.upstream.is_empty() {
-            let up = config
-                .upstream
-                .get(&config.embedding.upstream)
+            let up_cfg = upstream_reg
+                .get_config(&config.embedding.upstream)
                 .ok_or_else(|| {
                     upstream::types::ClientError::Other(format!(
                         "embedding upstream '{}' not found",
                         config.embedding.upstream
                     ))
                 })?;
-            let base_url = up.effective_base_url();
+            let base_url = up_cfg.effective_base_url();
             Some(Arc::new(embedding::EmbeddingClient::new(
                 base_url,
-                &up.api_key,
+                &up_cfg.api_key,
                 &config.embedding.model_name,
             )))
         } else {
@@ -127,8 +126,8 @@ impl Agent {
         };
 
         info!(
-            orchestrator = config.agent.orchestrator.model_name,
-            synthesizer = config.agent.synthesizer.model_name,
+            orchestrator = config.orchestrator.model_name,
+            synthesizer = config.synthesizer.model_name,
             embedding = embedder.is_some(),
             "agent initialized"
         );

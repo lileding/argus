@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
 
     let db = Database::connect(&config.database).await?;
     let upstream = Upstream::new(&config.upstream);
-    let agent = Agent::new(&config, &upstream, &db)?;
+    let agent = Agent::new(&config.agent, &upstream, &db)?;
     let gateway = Gateway::new(&config.gateway, &agent, &db, &config.workspace_dir);
 
     // Spawn both servers.

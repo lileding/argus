@@ -30,8 +30,13 @@ impl Upstream {
         }
     }
 
+    /// Get the raw config for an upstream by name.
+    pub(crate) fn get_config(&self, name: &str) -> Option<&UpstreamConfig> {
+        self.configs.get(name)
+    }
+
     /// Create a model client for a specific agent role.
-    pub fn client_for(&self, role: &RoleConfig) -> ClientResult<Arc<dyn Client>> {
+    pub(crate) fn client_for(&self, role: &RoleConfig) -> ClientResult<Arc<dyn Client>> {
         if role.upstream.is_empty() {
             return Err(ClientError::Other(
                 "no upstream configured for this role".into(),

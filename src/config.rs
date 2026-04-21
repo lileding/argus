@@ -25,9 +25,6 @@ pub struct Config {
     /// Database connection.
     #[serde(default)]
     pub database: DatabaseConfig,
-    /// Embedding settings.
-    #[serde(default)]
-    pub embedding: EmbeddingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -98,11 +95,14 @@ pub struct AgentConfig {
     pub synthesizer: RoleConfig,
     #[serde(default)]
     pub transcription: RoleConfig,
+    #[serde(default)]
+    pub embedding: EmbeddingConfig,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
+            embedding: EmbeddingConfig::default(),
             max_iterations: default_max_iterations(),
             orchestrator_context_window: default_context_window(),
             orchestrator: RoleConfig::default(),
