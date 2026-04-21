@@ -19,6 +19,17 @@ pub(crate) struct StoredMessage {
     pub created_at: DateTime<Utc>,
 }
 
+/// Parameters for saving a new inbound message.
+pub(crate) struct InboundMessage<'a> {
+    pub chat_id: &'a str,
+    pub content: &'a str,
+    pub source_im: &'a str,
+    pub msg_type: &'a str,
+    pub sender_id: &'a str,
+    pub trigger_msg_id: &'a str,
+    pub source_ts: Option<DateTime<Utc>>,
+}
+
 /// Message persistence. Three-state machine: received → ready → replied.
 pub(crate) struct Messages {
     pool: PgPool,
@@ -31,29 +42,22 @@ impl Messages {
 
     /// Save a new inbound user message with status=received.
     /// Returns the database-assigned message ID.
-    pub(crate) async fn save_received(
-        &self,
-        chat_id: &str,
-        content: &str,
-        source_im: &str,
-        msg_type: &str,
-        sender_id: &str,
-        trigger_msg_id: &str,
-    ) -> anyhow::Result<i64> {
+    pub(crate) async fn save_received(&self, msg: &InboundMessage<'_>) -> anyhow::Result<i64> {
         let row = sqlx::query(
             "INSERT INTO messages \
                 (chat_id, role, content, source_im, channel, msg_type, sender_id, \
-                 reply_status, trigger_msg_id) \
-             VALUES ($1, 'user', $2, $3, $4, $5, $6, 'received', $7) \
+                 reply_status, trigger_msg_id, source_ts) \
+             VALUES ($1, 'user', $2, $3, $4, $5, $6, 'received', $7, $8) \
              RETURNING id",
         )
-        .bind(chat_id)
-        .bind(content)
-        .bind(source_im)
-        .bind(chat_id) // channel = chat_id for now
-        .bind(msg_type)
-        .bind(sender_id)
-        .bind(trigger_msg_id)
+        .bind(msg.chat_id)
+        .bind(msg.content)
+        .bind(msg.source_im)
+        .bind(msg.chat_id) // channel = chat_id for now
+        .bind(msg.msg_type)
+        .bind(msg.sender_id)
+        .bind(msg.trigger_msg_id)
+        .bind(msg.source_ts)
         .fetch_one(&self.pool)
         .await?;
 

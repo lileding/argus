@@ -7,7 +7,7 @@ use tracing::info;
 
 use crate::config::DatabaseConfig;
 
-pub(crate) use messages::Messages;
+pub(crate) use messages::{InboundMessage, Messages};
 
 /// Database handle. Sub-objects group operations by table/feature.
 /// PgPool is internally Arc'd — clone is zero-cost.

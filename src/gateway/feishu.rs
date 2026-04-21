@@ -6,7 +6,7 @@ use tracing::{debug, info, warn};
 
 use crate::agent::{Agent, Event, Message, MessageSink, Payload, Task};
 use crate::config::{GatewayImConfig, MEDIA_DIR};
-use crate::database::Database;
+use crate::database::{Database, InboundMessage};
 use crate::server::Server;
 
 use super::Im;
@@ -179,17 +179,25 @@ impl Feishu {
             .and_then(|s| s.get("open_id"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        // Parse Feishu create_time (milliseconds since epoch).
+        let source_ts = envelope
+            .header
+            .as_ref()
+            .and_then(|h| h.create_time.as_deref())
+            .and_then(|t| t.parse::<i64>().ok())
+            .and_then(chrono::DateTime::from_timestamp_millis);
         let db_msg_id = match self
             .db
             .messages
-            .save_received(
-                &chat_id,
-                &raw_content,
-                "feishu",
-                &msg_type,
+            .save_received(&InboundMessage {
+                chat_id: &chat_id,
+                content: &raw_content,
+                source_im: "feishu",
+                msg_type: &msg_type,
                 sender_id,
-                &msg_id,
-            )
+                trigger_msg_id: &msg_id,
+                source_ts,
+            })
             .await
         {
             Ok(id) => {
