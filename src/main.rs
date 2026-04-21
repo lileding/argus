@@ -5,6 +5,7 @@ use crate::agent::Agent;
 use crate::frontend::Feishu;
 
 mod agent;
+mod config;
 mod frontend;
 
 #[tokio::main]
@@ -21,8 +22,11 @@ async fn main() {
 
     info!("argus starting");
 
+    let workspace_dir = std::env::var("ARGUS_WORKSPACE").unwrap_or_else(|_| ".".into());
+    let workspace_dir = std::path::Path::new(&workspace_dir);
+
     let agent = Agent::new();
-    let feishu = Feishu::new(Arc::clone(&agent), &app_id, &app_secret);
+    let feishu = Feishu::new(Arc::clone(&agent), &app_id, &app_secret, workspace_dir);
 
     let agent_handle = {
         let a = Arc::clone(&agent);

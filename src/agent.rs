@@ -7,6 +7,7 @@ use tracing::{debug, info, warn};
 
 pub struct Payload {
     pub content: String,
+    pub file_paths: Vec<String>,
 }
 
 pub struct Task {
