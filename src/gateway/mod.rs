@@ -25,7 +25,7 @@ impl Gateway {
         configs: &HashMap<String, GatewayImConfig>,
         agent: &Arc<Agent>,
         workspace_dir: &Path,
-    ) -> Self {
+    ) -> Arc<Self> {
         let mut ims = Vec::new();
 
         for (name, cfg) in configs {
@@ -46,7 +46,7 @@ impl Gateway {
         }
 
         info!(count = ims.len(), "gateway created");
-        Self { ims }
+        Arc::new(Self { ims })
     }
 }
 

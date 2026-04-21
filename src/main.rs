@@ -40,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
 
     let upstream = Upstream::new(&config.upstream);
     let agent = Agent::new(&config.agent, &upstream)?;
-    let gateway = Arc::new(Gateway::new(&config.gateway, &agent, &config.workspace_dir));
+    let gateway = Gateway::new(&config.gateway, &agent, &config.workspace_dir);
 
     // Spawn both servers.
     let gateway_handle = {
