@@ -3,6 +3,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::database::Database;
 use crate::server::Server;
 use crate::upstream;
 use crate::upstream::types as model;
@@ -21,13 +22,13 @@ pub trait MessageSink: Send + Sync {
     async fn submit_message(&self, msg: Message);
 }
 
-pub struct Task {
-    pub chat_id: String,
-    pub msg_id: String,
-    /// Delivers the processed payload once media download/extraction is done.
-    pub ready: oneshot::Receiver<Payload>,
-    /// Callback to the frontend for outbound rendering.
-    pub frontend: Arc<dyn MessageSink>,
+pub(crate) struct Task {
+    pub(crate) chat_id: String,
+    pub(crate) msg_id: String,
+    /// Database row ID (None if DB not available).
+    pub(crate) db_msg_id: Option<i64>,
+    pub(crate) ready: oneshot::Receiver<Payload>,
+    pub(crate) frontend: Arc<dyn MessageSink>,
 }
 
 pub(crate) struct Message {
@@ -84,16 +85,16 @@ pub struct Agent {
     tx: mpsc::Sender<Task>,
     rx: Mutex<mpsc::Receiver<Task>>,
     cancel: CancellationToken,
+    db: Arc<Database>,
     orchestrator: Arc<dyn upstream::Client>,
     synthesizer: Arc<dyn upstream::Client>,
 }
 
 impl Agent {
-    /// Create an Agent from config. Internally creates model clients
-    /// for orchestrator and synthesizer roles.
     pub(crate) fn new(
         config: &crate::config::AgentConfig,
         upstream: &upstream::Upstream,
+        db: &Arc<Database>,
     ) -> Result<Arc<Self>, upstream::types::ClientError> {
         let orchestrator = upstream.client_for(&config.orchestrator)?;
         let synthesizer = upstream.client_for(&config.synthesizer)?;
@@ -109,6 +110,7 @@ impl Agent {
             tx,
             rx: Mutex::new(rx),
             cancel: CancellationToken::new(),
+            db: Arc::clone(db),
             orchestrator,
             synthesizer,
         }))
@@ -202,6 +204,13 @@ impl Agent {
                     })
                     .await;
             }
+        }
+
+        // Mark message as replied (terminal state).
+        if let Some(db_id) = task.db_msg_id
+            && let Err(e) = self.db.messages.save_replied(db_id).await
+        {
+            warn!(chat_id, msg_id, error = %e, "save_replied failed");
         }
 
         info!(chat_id, msg_id, "task complete");

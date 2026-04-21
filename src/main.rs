@@ -5,12 +5,14 @@ use tracing::info;
 
 use crate::agent::Agent;
 use crate::config::Config;
+use crate::database::Database;
 use crate::gateway::Gateway;
 use crate::server::Server;
 use crate::upstream::Upstream;
 
 mod agent;
 mod config;
+mod database;
 mod gateway;
 mod server;
 mod upstream;
@@ -38,9 +40,10 @@ async fn main() -> anyhow::Result<()> {
 
     info!(workspace = %config.workspace_dir.display(), "argus starting");
 
+    let db = Database::connect(&config.database).await?;
     let upstream = Upstream::new(&config.upstream);
-    let agent = Agent::new(&config.agent, &upstream)?;
-    let gateway = Gateway::new(&config.gateway, &agent, &config.workspace_dir);
+    let agent = Agent::new(&config.agent, &upstream, &db)?;
+    let gateway = Gateway::new(&config.gateway, &agent, &db, &config.workspace_dir);
 
     // Spawn both servers.
     let gateway_handle = {

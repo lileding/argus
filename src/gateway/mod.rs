@@ -7,6 +7,7 @@ use tracing::{info, warn};
 
 use crate::agent::{Agent, MessageSink};
 use crate::config::GatewayImConfig;
+use crate::database::Database;
 use crate::server::Server;
 
 /// An IM adapter that can run (event loop) and receive messages from Agent.
@@ -24,6 +25,7 @@ impl Gateway {
     pub(crate) fn new(
         configs: &HashMap<String, GatewayImConfig>,
         agent: &Arc<Agent>,
+        db: &Arc<Database>,
         workspace_dir: &Path,
     ) -> Arc<Self> {
         let mut ims = Vec::new();
@@ -35,7 +37,8 @@ impl Gateway {
                         warn!(im = name, "skipping: empty app_id or app_secret");
                         continue;
                     }
-                    let f = feishu::Feishu::new(Arc::clone(agent), cfg, workspace_dir);
+                    let f =
+                        feishu::Feishu::new(Arc::clone(agent), Arc::clone(db), cfg, workspace_dir);
                     info!(im = name, "IM adapter created");
                     ims.push((name.clone(), f as Arc<dyn Im>));
                 }

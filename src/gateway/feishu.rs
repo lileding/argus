@@ -6,12 +6,14 @@ use tracing::{debug, info, warn};
 
 use crate::agent::{Agent, Event, Message, MessageSink, Payload, Task};
 use crate::config::{GatewayImConfig, MEDIA_DIR};
+use crate::database::Database;
 use crate::server::Server;
 
 use super::Im;
 
 pub(super) struct Feishu {
     agent: Arc<Agent>,
+    db: Arc<Database>,
     cancel: CancellationToken,
     tx: mpsc::Sender<Message>,
     rx: Mutex<mpsc::Receiver<Message>>,
@@ -20,7 +22,12 @@ pub(super) struct Feishu {
 }
 
 impl Feishu {
-    pub fn new(agent: Arc<Agent>, cfg: &GatewayImConfig, workspace_dir: &Path) -> Arc<Self> {
+    pub fn new(
+        agent: Arc<Agent>,
+        db: Arc<Database>,
+        cfg: &GatewayImConfig,
+        workspace_dir: &Path,
+    ) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(64);
 
         // Ensure media directory exists.
@@ -37,6 +44,7 @@ impl Feishu {
 
         Arc::new(Feishu {
             agent,
+            db,
             cancel: CancellationToken::new(),
             tx,
             rx: Mutex::new(rx),
@@ -164,11 +172,42 @@ impl Feishu {
 
         info!(msg_id, chat_id, msg_type, "inbound message received");
 
+        // Persist: status=received.
+        let sender_id = event_data
+            .get("sender")
+            .and_then(|s| s.get("sender_id"))
+            .and_then(|s| s.get("open_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let db_msg_id = match self
+            .db
+            .messages
+            .save_received(
+                &chat_id,
+                &raw_content,
+                "feishu",
+                &msg_type,
+                sender_id,
+                &msg_id,
+            )
+            .await
+        {
+            Ok(id) => {
+                debug!(msg_id, db_msg_id = id, "message persisted");
+                Some(id)
+            }
+            Err(e) => {
+                warn!(msg_id, error = %e, "save_received failed, continuing without DB");
+                None
+            }
+        };
+
         let (ready_tx, ready_rx) = oneshot::channel();
 
         let task = Task {
             chat_id: chat_id.clone(),
             msg_id: msg_id.clone(),
+            db_msg_id,
             ready: ready_rx,
             frontend: Arc::clone(&self) as Arc<dyn MessageSink>,
         };
@@ -189,6 +228,16 @@ impl Feishu {
                 files = payload.file_paths.len(),
                 "payload ready"
             );
+            // Persist: status=ready with processed content.
+            if let Some(db_id) = db_msg_id
+                && let Err(e) = this
+                    .db
+                    .messages
+                    .save_ready(db_id, &payload.content, &payload.file_paths)
+                    .await
+            {
+                warn!(msg_id, error = %e, "save_ready failed");
+            }
             let _ = ready_tx.send(payload);
         });
     }

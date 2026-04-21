@@ -22,6 +22,16 @@ pub struct Config {
     /// Named upstream model providers.
     #[serde(default)]
     pub upstream: HashMap<String, UpstreamConfig>,
+    /// Database connection.
+    #[serde(default)]
+    pub database: DatabaseConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DatabaseConfig {
+    /// PostgreSQL connection string.
+    #[serde(default)]
+    pub dsn: String,
 }
 
 /// Frontend config. The HashMap key is the frontend type ("feishu", etc.).
