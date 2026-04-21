@@ -209,11 +209,14 @@ impl Agent {
             }
         };
 
-        // Persist reply and mark as terminal.
-        if let Some(db_id) = task.db_msg_id
-            && let Err(e) = self.db.messages.save_replied(db_id, &reply_text).await
+        // Persist reply as notification + link to message.
+        if let Err(e) = self
+            .db
+            .notifications
+            .save_notification(task.db_msg_id, &reply_text)
+            .await
         {
-            warn!(chat_id, msg_id, error = %e, "save_replied failed");
+            warn!(chat_id, msg_id, error = %e, "save_notification failed");
         }
 
         info!(chat_id, msg_id, "task complete");

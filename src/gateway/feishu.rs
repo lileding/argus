@@ -186,13 +186,13 @@ impl Feishu {
             .and_then(|h| h.create_time.as_deref())
             .and_then(|t| t.parse::<i64>().ok())
             .and_then(chrono::DateTime::from_timestamp_millis);
+        let channel = format!("feishu:{chat_id}");
         let db_msg_id = match self
             .db
             .messages
             .save_received(&InboundMessage {
-                chat_id: &chat_id,
+                channel: &channel,
                 content: &raw_content,
-                source_im: "feishu",
                 msg_type: &msg_type,
                 sender_id,
                 trigger_msg_id: &msg_id,

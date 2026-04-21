@@ -1,36 +1,17 @@
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
-/// Stored message row from the `messages` table.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub(crate) struct StoredMessage {
-    pub id: i64,
-    pub chat_id: String,
-    pub role: String,
-    pub content: String,
-    pub source_im: String,
-    pub channel: String,
-    pub msg_type: String,
-    pub file_paths: Vec<String>,
-    pub sender_id: Option<String>,
-    pub reply_status: Option<String>,
-    pub trigger_msg_id: Option<String>,
-    pub created_at: DateTime<Utc>,
-}
-
 /// Parameters for saving a new inbound message.
 pub(crate) struct InboundMessage<'a> {
-    pub chat_id: &'a str,
+    pub channel: &'a str,
     pub content: &'a str,
-    pub source_im: &'a str,
     pub msg_type: &'a str,
     pub sender_id: &'a str,
     pub trigger_msg_id: &'a str,
     pub source_ts: Option<DateTime<Utc>>,
 }
 
-/// Message persistence. Three-state machine: received → ready → replied.
+/// Message persistence. Two states: ready=false (received) → ready=true (processed).
 pub(crate) struct Messages {
     pool: PgPool,
 }
@@ -40,20 +21,17 @@ impl Messages {
         Self { pool }
     }
 
-    /// Save a new inbound user message with status=received.
+    /// Save a new inbound user message with ready=false.
     /// Returns the database-assigned message ID.
     pub(crate) async fn save_received(&self, msg: &InboundMessage<'_>) -> anyhow::Result<i64> {
         let row = sqlx::query(
             "INSERT INTO messages \
-                (chat_id, role, content, source_im, channel, msg_type, sender_id, \
-                 reply_status, trigger_msg_id, source_ts) \
-             VALUES ($1, 'user', $2, $3, $4, $5, $6, 'received', $7, $8) \
+                (channel, content, msg_type, sender_id, trigger_msg_id, source_ts, ready) \
+             VALUES ($1, $2, $3, $4, $5, $6, FALSE) \
              RETURNING id",
         )
-        .bind(msg.chat_id)
+        .bind(msg.channel)
         .bind(msg.content)
-        .bind(msg.source_im)
-        .bind(msg.chat_id) // channel = chat_id for now
         .bind(msg.msg_type)
         .bind(msg.sender_id)
         .bind(msg.trigger_msg_id)
@@ -65,7 +43,7 @@ impl Messages {
     }
 
     /// Update a message after media processing: set processed content,
-    /// file paths, and transition status received → ready.
+    /// file paths, and mark as ready.
     pub(crate) async fn save_ready(
         &self,
         msg_id: i64,
@@ -74,31 +52,11 @@ impl Messages {
     ) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE messages \
-             SET content = $1, file_paths = $2, reply_status = 'ready' \
-             WHERE id = $3 AND reply_status = 'received'",
+             SET content = $1, file_paths = $2, ready = TRUE \
+             WHERE id = $3 AND NOT ready",
         )
         .bind(content)
         .bind(file_paths)
-        .bind(msg_id)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Save the agent's reply and mark the message as replied (terminal state).
-    /// Only transitions from ready → replied.
-    pub(crate) async fn save_replied(
-        &self,
-        msg_id: i64,
-        reply_content: &str,
-    ) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE messages \
-             SET reply_content = $1, reply_status = 'replied' \
-             WHERE id = $2 AND reply_status = 'ready'",
-        )
-        .bind(reply_content)
         .bind(msg_id)
         .execute(&self.pool)
         .await?;

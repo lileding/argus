@@ -1,4 +1,5 @@
 mod messages;
+mod notifications;
 
 use std::sync::Arc;
 
@@ -7,14 +8,13 @@ use tracing::info;
 
 use crate::config::DatabaseConfig;
 
-pub(crate) use messages::{InboundMessage, Messages};
+pub(crate) use messages::InboundMessage;
 
 /// Database handle. Sub-objects group operations by table/feature.
 /// PgPool is internally Arc'd — clone is zero-cost.
 pub(crate) struct Database {
-    pub messages: Messages,
-    // pub traces: Traces,     // future
-    // pub memories: Memories, // future
+    pub messages: messages::Messages,
+    pub notifications: notifications::Notifications,
 }
 
 impl Database {
@@ -29,7 +29,8 @@ impl Database {
         info!("database connected");
 
         Ok(Arc::new(Self {
-            messages: Messages::new(pool.clone()),
+            messages: messages::Messages::new(pool.clone()),
+            notifications: notifications::Notifications::new(pool),
         }))
     }
 }
