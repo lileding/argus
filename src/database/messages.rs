@@ -82,14 +82,19 @@ impl Messages {
         Ok(())
     }
 
-    /// Mark a message as replied (terminal state).
-    /// Guards against reverting from terminal state.
-    pub(crate) async fn save_replied(&self, msg_id: i64) -> anyhow::Result<()> {
+    /// Save the agent's reply and mark the message as replied (terminal state).
+    /// Only transitions from ready → replied.
+    pub(crate) async fn save_replied(
+        &self,
+        msg_id: i64,
+        reply_content: &str,
+    ) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE messages \
-             SET reply_status = 'replied' \
-             WHERE id = $1 AND reply_status != 'replied'",
+             SET reply_content = $1, reply_status = 'replied' \
+             WHERE id = $2 AND reply_status = 'ready'",
         )
+        .bind(reply_content)
         .bind(msg_id)
         .execute(&self.pool)
         .await?;

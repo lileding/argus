@@ -189,26 +189,29 @@ impl Agent {
         };
 
         // Phase 2: Synthesizer — stream the final answer to frontend.
-        match self
+        let reply_text = match self
             .run_synthesizer(&payload.content, &orch_summary, &events_tx)
             .await
         {
-            Ok(()) => {
+            Ok(text) => {
                 debug!(chat_id, msg_id, "synthesizer done");
+                text
             }
             Err(e) => {
                 warn!(chat_id, msg_id, error = %e, "synthesizer failed");
+                let error_text = format!("Error: {e}");
                 let _ = events_tx
                     .send(Event::Reply {
-                        text: format!("Error: {e}"),
+                        text: error_text.clone(),
                     })
                     .await;
+                error_text
             }
-        }
+        };
 
-        // Mark message as replied (terminal state).
+        // Persist reply and mark as terminal.
         if let Some(db_id) = task.db_msg_id
-            && let Err(e) = self.db.messages.save_replied(db_id).await
+            && let Err(e) = self.db.messages.save_replied(db_id, &reply_text).await
         {
             warn!(chat_id, msg_id, error = %e, "save_replied failed");
         }
@@ -234,13 +237,13 @@ impl Agent {
     }
 
     /// Phase 2: Call the synthesizer model with streaming.
-    /// Sends reply deltas to the frontend as they arrive.
+    /// Returns the full reply text.
     async fn run_synthesizer(
         &self,
         user_text: &str,
         materials: &str,
         events_tx: &mpsc::Sender<Event>,
-    ) -> Result<(), upstream::types::ClientError> {
+    ) -> Result<String, upstream::types::ClientError> {
         use futures::StreamExt;
 
         // Single user message with both the question and materials to avoid
@@ -271,9 +274,13 @@ impl Agent {
 
         // Send the complete reply as a single event.
         // (Future: send incremental deltas for streaming card updates.)
-        let _ = events_tx.send(Event::Reply { text: full_reply }).await;
+        let _ = events_tx
+            .send(Event::Reply {
+                text: full_reply.clone(),
+            })
+            .await;
 
-        Ok(())
+        Ok(full_reply)
     }
 
     pub async fn submit_task(&self, task: Task) -> Result<(), AgentError> {
