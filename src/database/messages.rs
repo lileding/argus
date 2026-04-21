@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use pgvector::Vector;
 use sqlx::{PgPool, Row};
 
 /// Parameters for saving a new inbound message.
@@ -60,6 +61,35 @@ impl Messages {
         .bind(msg_id)
         .execute(&self.pool)
         .await?;
+
+        Ok(())
+    }
+
+    /// Fetch messages that haven't been embedded yet.
+    pub(crate) async fn unembedded(&self, limit: i64) -> anyhow::Result<Vec<(i64, String)>> {
+        let rows = sqlx::query(
+            "SELECT id, content FROM messages \
+             WHERE embedding IS NULL AND content != '' \
+             ORDER BY id DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| (r.get("id"), r.get("content")))
+            .collect())
+    }
+
+    /// Set the embedding vector for a message.
+    pub(crate) async fn set_embedding(&self, id: i64, embedding: &[f32]) -> anyhow::Result<()> {
+        let vec = Vector::from(embedding.to_vec());
+        sqlx::query("UPDATE messages SET embedding = $1 WHERE id = $2 AND embedding IS NULL")
+            .bind(vec)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
 
         Ok(())
     }

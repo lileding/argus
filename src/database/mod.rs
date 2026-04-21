@@ -9,7 +9,8 @@ use tracing::info;
 
 use crate::config::DatabaseConfig;
 
-pub(crate) use messages::InboundMessage;
+pub(crate) use messages::{InboundMessage, Messages};
+pub(crate) use notifications::Notifications;
 
 /// Database handle. Sub-objects group operations by table/feature.
 /// PgPool is internally Arc'd — clone is zero-cost.
@@ -70,7 +71,8 @@ async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
         info!(migration = name, "applying migration");
 
         let mut tx = pool.begin().await?;
-        sqlx::query(sql).execute(&mut *tx).await?;
+        // raw_sql supports multiple statements in one call (unlike query()).
+        sqlx::raw_sql(sql).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO schema_migrations (version) VALUES ($1)")
             .bind(name)
             .execute(&mut *tx)

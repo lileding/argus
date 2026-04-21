@@ -1,3 +1,4 @@
+use pgvector::Vector;
 use sqlx::{PgPool, Row};
 
 /// Notification persistence (agent → user replies).
@@ -32,7 +33,6 @@ impl Notifications {
 
         let notif_id: i64 = row.get("id");
 
-        // Link the message to its reply.
         if let Some(msg_id) = message_id {
             sqlx::query("UPDATE messages SET reply_id = $1 WHERE id = $2")
                 .bind(notif_id)
@@ -43,5 +43,62 @@ impl Notifications {
 
         tx.commit().await?;
         Ok(notif_id)
+    }
+
+    /// Fetch notifications that haven't been embedded yet.
+    pub(crate) async fn unembedded(&self, limit: i64) -> anyhow::Result<Vec<(i64, String)>> {
+        let rows = sqlx::query(
+            "SELECT id, content FROM notifications \
+             WHERE embedding IS NULL AND content != '' \
+             ORDER BY id DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| (r.get("id"), r.get("content")))
+            .collect())
+    }
+
+    /// Set the embedding vector for a notification.
+    pub(crate) async fn set_embedding(&self, id: i64, embedding: &[f32]) -> anyhow::Result<()> {
+        let vec = Vector::from(embedding.to_vec());
+        sqlx::query("UPDATE notifications SET embedding = $1 WHERE id = $2 AND embedding IS NULL")
+            .bind(vec)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Fetch long notifications without summaries.
+    pub(crate) async fn unsummarized(&self, limit: i64) -> anyhow::Result<Vec<(i64, String)>> {
+        let rows = sqlx::query(
+            "SELECT id, content FROM notifications \
+             WHERE summary IS NULL AND LENGTH(content) > 2400 \
+             ORDER BY id DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| (r.get("id"), r.get("content")))
+            .collect())
+    }
+
+    /// Set the summary for a notification.
+    pub(crate) async fn set_summary(&self, id: i64, summary: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE notifications SET summary = $1 WHERE id = $2 AND summary IS NULL")
+            .bind(summary)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
     }
 }

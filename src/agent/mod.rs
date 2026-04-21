@@ -1,4 +1,9 @@
+mod embedding;
+mod worker;
+
 use std::sync::Arc;
+use std::time::Duration;
+
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -79,29 +84,52 @@ impl<T> From<mpsc::error::SendError<T>> for AgentError {
     }
 }
 
-pub struct Agent {
-    // Note: Agent holds tx, so rx.recv() never returns None due to "all senders dropped".
-    // The run loop exits via CancellationToken, not channel close.
+pub(crate) struct Agent {
     tx: mpsc::Sender<Task>,
     rx: Mutex<mpsc::Receiver<Task>>,
     cancel: CancellationToken,
     db: Arc<Database>,
     orchestrator: Arc<dyn upstream::Client>,
     synthesizer: Arc<dyn upstream::Client>,
+    embedder: Option<Arc<embedding::EmbeddingClient>>,
+    embedding_interval: Duration,
+    embedding_batch_size: usize,
 }
 
 impl Agent {
     pub(crate) fn new(
-        config: &crate::config::AgentConfig,
-        upstream: &upstream::Upstream,
+        config: &crate::config::Config,
+        upstream_reg: &upstream::Upstream,
         db: &Arc<Database>,
     ) -> Result<Arc<Self>, upstream::types::ClientError> {
-        let orchestrator = upstream.client_for(&config.orchestrator)?;
-        let synthesizer = upstream.client_for(&config.synthesizer)?;
+        let orchestrator = upstream_reg.client_for(&config.agent.orchestrator)?;
+        let synthesizer = upstream_reg.client_for(&config.agent.synthesizer)?;
+
+        // Embedding client (optional: only if upstream is configured).
+        let embedder = if !config.embedding.upstream.is_empty() {
+            let up = config
+                .upstream
+                .get(&config.embedding.upstream)
+                .ok_or_else(|| {
+                    upstream::types::ClientError::Other(format!(
+                        "embedding upstream '{}' not found",
+                        config.embedding.upstream
+                    ))
+                })?;
+            let base_url = up.effective_base_url();
+            Some(Arc::new(embedding::EmbeddingClient::new(
+                base_url,
+                &up.api_key,
+                &config.embedding.model_name,
+            )))
+        } else {
+            None
+        };
 
         info!(
-            orchestrator = config.orchestrator.model_name,
-            synthesizer = config.synthesizer.model_name,
+            orchestrator = config.agent.orchestrator.model_name,
+            synthesizer = config.agent.synthesizer.model_name,
+            embedding = embedder.is_some(),
             "agent initialized"
         );
 
@@ -113,11 +141,33 @@ impl Agent {
             db: Arc::clone(db),
             orchestrator,
             synthesizer,
+            embedder,
+            embedding_interval: Duration::from_secs(config.embedding.interval_secs),
+            embedding_batch_size: config.embedding.batch_size,
         }))
     }
 
-    async fn run_inner(&self) {
+    async fn run_inner(self: &Arc<Self>) {
         info!("agent scheduler started");
+
+        // Spawn background workers.
+        let mut worker_handles = Vec::new();
+        if let Some(embedder) = &self.embedder {
+            worker_handles.push(worker::spawn_embedder(
+                Arc::clone(&self.db),
+                Arc::clone(embedder),
+                self.cancel.clone(),
+                self.embedding_batch_size,
+                self.embedding_interval,
+            ));
+            worker_handles.push(worker::spawn_summarizer(
+                Arc::clone(&self.db),
+                Arc::clone(&self.synthesizer),
+                self.cancel.clone(),
+                self.embedding_interval * 5, // summarize less frequently
+            ));
+        }
+
         let mut rx = self.rx.lock().await;
         loop {
             tokio::select! {
@@ -133,6 +183,10 @@ impl Agent {
                     break;
                 }
             }
+        }
+        // Wait for background workers to finish.
+        for handle in worker_handles {
+            let _ = handle.await;
         }
         info!("agent scheduler stopped");
     }

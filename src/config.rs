@@ -25,13 +25,50 @@ pub struct Config {
     /// Database connection.
     #[serde(default)]
     pub database: DatabaseConfig,
+    /// Embedding settings.
+    #[serde(default)]
+    pub embedding: EmbeddingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct DatabaseConfig {
-    /// PostgreSQL connection string.
     #[serde(default)]
     pub dsn: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct EmbeddingConfig {
+    /// Which upstream provides the embedding endpoint.
+    #[serde(default)]
+    pub upstream: String,
+    #[serde(default = "default_embedding_model")]
+    pub model_name: String,
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+    #[serde(default = "default_interval_secs")]
+    pub interval_secs: u64,
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            upstream: String::new(),
+            model_name: default_embedding_model(),
+            batch_size: default_batch_size(),
+            interval_secs: default_interval_secs(),
+        }
+    }
+}
+
+fn default_embedding_model() -> String {
+    "modernbert-embed-base".into()
+}
+fn default_batch_size() -> usize {
+    32
+}
+fn default_interval_secs() -> u64 {
+    2
 }
 
 /// Frontend config. The HashMap key is the frontend type ("feishu", etc.).
