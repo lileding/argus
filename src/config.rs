@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 /// Subdirectory under workspace for downloaded media files.
-pub const MEDIA_DIR: &str = ".files";
+pub(crate) const MEDIA_DIR: &str = ".files";
 
 /// Application configuration loaded from TOML.
 #[derive(Debug, Deserialize)]
@@ -190,7 +190,7 @@ fn resolve_path(path: &str) -> anyhow::Result<PathBuf> {
     }
 }
 
-pub fn expand_tilde(path: &str) -> PathBuf {
+pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = dirs_home() {
             return home.join(rest);

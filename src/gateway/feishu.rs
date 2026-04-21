@@ -462,7 +462,9 @@ impl Feishu {
 
     /// Render a single message: open thinking card → consume events → update card.
     async fn render_message(&self, api: &feishu::api::Api, msg: &mut Message) {
-        let lang = detect_lang(&msg.chat_id);
+        // Default to Chinese (primary user). Full language detection would
+        // require carrying the user's text through Message, deferred for now.
+        let lang = "zh";
 
         // Step 1: Open thinking card immediately.
         let card_id = match api
@@ -567,6 +569,7 @@ fn thinking_card(lang: &str) -> String {
 }
 
 /// Simple language detection: check for CJK characters.
+#[allow(dead_code)]
 fn detect_lang(text: &str) -> &'static str {
     for c in text.chars() {
         if ('\u{4E00}'..='\u{9FFF}').contains(&c) {

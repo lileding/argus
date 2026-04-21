@@ -10,7 +10,7 @@ use crate::upstream::types as model;
 // --- Types ---
 
 pub struct Payload {
-    pub content: String,
+    pub(crate) content: String,
     pub file_paths: Vec<String>,
 }
 
@@ -30,8 +30,9 @@ pub struct Task {
     pub frontend: Arc<dyn MessageSink>,
 }
 
-pub struct Message {
-    pub chat_id: String,
+pub(crate) struct Message {
+    #[allow(dead_code)] // Will be used for per-chat channel routing.
+    pub(crate) chat_id: String,
     pub msg_id: String,
     /// Agent emits events; frontend consumes them to drive UI.
     /// Dropping the sender signals "message complete".
@@ -90,7 +91,7 @@ pub struct Agent {
 impl Agent {
     /// Create an Agent from config. Internally creates model clients
     /// for orchestrator and synthesizer roles.
-    pub fn new(
+    pub(crate) fn new(
         config: &crate::config::AgentConfig,
         upstream: &upstream::Upstream,
     ) -> Result<Arc<Self>, upstream::types::ClientError> {

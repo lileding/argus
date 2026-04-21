@@ -1,5 +1,5 @@
 #[allow(dead_code)]
-pub mod types;
+pub(crate) mod types;
 
 #[allow(dead_code)]
 mod anthropic;
@@ -14,16 +14,16 @@ use crate::config::{RoleConfig, UpstreamConfig};
 use types::{ClientError, ClientResult};
 
 // Re-export for agent use.
-pub use types::Client;
+pub(crate) use types::Client;
 
 /// Registry of upstream model providers. Created from config, used by Agent
 /// to obtain model clients for each role.
-pub struct Upstream {
+pub(crate) struct Upstream {
     configs: HashMap<String, UpstreamConfig>,
 }
 
 impl Upstream {
-    pub fn new(configs: &HashMap<String, UpstreamConfig>) -> Self {
+    pub(crate) fn new(configs: &HashMap<String, UpstreamConfig>) -> Self {
         info!(count = configs.len(), "upstream registry created");
         Self {
             configs: configs.clone(),
