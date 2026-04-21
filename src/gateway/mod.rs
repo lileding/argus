@@ -10,18 +10,18 @@ use crate::config::GatewayImConfig;
 use crate::server::Server;
 
 /// An IM adapter that can run (event loop) and receive messages from Agent.
-pub trait Im: Server + MessageSink {}
+trait Im: Server + MessageSink {}
 
 /// Gateway manages all IM adapters. One gateway to rule them all.
 ///
-/// Hierarchy: Gateway → IM (feishu/slack/...) → Channel (per-chat, future)
-pub struct Gateway {
+/// Implements Server: run() spawns all IMs, stop() stops them all.
+/// Main never sees the individual IMs.
+pub(crate) struct Gateway {
     ims: Vec<(String, Arc<dyn Im>)>,
 }
 
 impl Gateway {
-    /// Create the gateway with all configured IM adapters.
-    pub fn new(
+    pub(crate) fn new(
         configs: &HashMap<String, GatewayImConfig>,
         agent: &Arc<Agent>,
         workspace_dir: &Path,
@@ -48,10 +48,14 @@ impl Gateway {
         info!(count = ims.len(), "gateway created");
         Self { ims }
     }
+}
 
-    /// Spawn all IM adapters. Returns join handles.
-    pub fn spawn_all(&self) -> Vec<tokio::task::JoinHandle<()>> {
-        self.ims
+#[async_trait::async_trait]
+impl Server for Gateway {
+    /// Spawn all IM adapters and block until they all finish.
+    async fn run(self: Arc<Self>) {
+        let handles: Vec<_> = self
+            .ims
             .iter()
             .map(|(name, im)| {
                 let im = Arc::clone(im);
@@ -61,11 +65,15 @@ impl Gateway {
                     im.run().await;
                 })
             })
-            .collect()
+            .collect();
+
+        for handle in handles {
+            let _ = handle.await;
+        }
     }
 
     /// Stop all IM adapters.
-    pub async fn stop(&self) {
+    async fn stop(&self) {
         for (name, im) in &self.ims {
             info!(im = name, "stopping IM adapter");
             im.stop().await;

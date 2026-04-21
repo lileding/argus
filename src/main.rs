@@ -40,9 +40,13 @@ async fn main() -> anyhow::Result<()> {
 
     let upstream = Upstream::new(&config.upstream);
     let agent = Agent::new(&config.agent, &upstream)?;
-    let gateway = Gateway::new(&config.gateway, &agent, &config.workspace_dir);
+    let gateway = Arc::new(Gateway::new(&config.gateway, &agent, &config.workspace_dir));
 
-    let gateway_handles = gateway.spawn_all();
+    // Spawn both servers.
+    let gateway_handle = {
+        let g = Arc::clone(&gateway);
+        tokio::spawn(async move { g.run().await })
+    };
     let agent_handle = {
         let a = Arc::clone(&agent);
         tokio::spawn(async move { a.run().await })
@@ -52,12 +56,11 @@ async fn main() -> anyhow::Result<()> {
     tokio::signal::ctrl_c().await.ok();
     info!("shutdown initiated");
 
+    // Shutdown: agent first, then gateway.
     agent.stop().await;
     let _ = agent_handle.await;
     gateway.stop().await;
-    for handle in gateway_handles {
-        let _ = handle.await;
-    }
+    let _ = gateway_handle.await;
 
     info!("argus stopped");
     Ok(())
