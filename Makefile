@@ -4,12 +4,13 @@ build:
 	cargo build
 
 run:
-	RUST_LOG=info,argus=debug,feishu=debug FEISHU_APP_ID=cli_a957a04745f8dbcf FEISHU_APP_SECRET=rRuVxRDkXGEyGZ6UlLlPghVAaS7pZPrH cargo run
+	RUST_LOG=info,argus=debug,feishu=debug cargo run -- --workspace ./workspace
 
 test:
 	cargo test --workspace
 
 check:
+	cargo fmt --all -- --check
 	cargo clippy --workspace -- -D warnings
 	cargo test --workspace
 

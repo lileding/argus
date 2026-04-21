@@ -1,0 +1,46 @@
+# Argus configuration.
+# Copy to ~/.argus/config.toml (or wherever --workspace points).
+
+[frontend.feishu]
+type = "feishu"
+app_id = ""
+app_secret = ""
+# base_url = "https://open.feishu.cn"  # default, use https://open.larksuite.com for Lark
+
+[agent]
+max_iterations = 10
+orchestrator_context_window = 10
+
+[agent.orchestrator]
+upstream = "anthropic"
+model_name = "claude-haiku-4-5"
+max_tokens = 4096
+
+[agent.synthesizer]
+upstream = "gemini"
+model_name = "gemini-2.5-flash-lite"
+max_tokens = 32768
+
+# [agent.transcription]
+# upstream = "local"
+# model_name = "whisper-large-v3"
+
+[upstream.openai]
+type = "openai"
+base_url = "https://api.openai.com/v1"
+api_key = ""
+timeout_secs = 120
+
+[upstream.anthropic]
+type = "anthropic"
+api_key = ""
+
+[upstream.gemini]
+type = "gemini"
+api_key = ""
+
+# [upstream.local]
+# type = "openai"
+# base_url = "http://localhost:8000/v1"
+# api_key = "omlx"
+# timeout_secs = 240

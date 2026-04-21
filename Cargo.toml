@@ -18,6 +18,8 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tokio-util = { version = "0.7" }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

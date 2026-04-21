@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::agent::{Agent, Event, Message, Payload, Task};
-use crate::config::MEDIA_DIR;
+use crate::config::{FrontendConfig, MEDIA_DIR};
 
 pub struct Feishu {
     agent: Arc<Agent>,
@@ -17,12 +17,7 @@ pub struct Feishu {
 }
 
 impl Feishu {
-    pub fn new(
-        agent: Arc<Agent>,
-        app_id: &str,
-        app_secret: &str,
-        workspace_dir: &Path,
-    ) -> Arc<Self> {
+    pub fn new(agent: Arc<Agent>, cfg: &FrontendConfig, workspace_dir: &Path) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(64);
 
         // Ensure media directory exists.
@@ -31,12 +26,18 @@ impl Feishu {
             warn!(path = %media_dir.display(), error = %e, "failed to create media dir");
         }
 
+        let feishu_client = if cfg.base_url == "https://open.feishu.cn" {
+            feishu::Client::new(&cfg.app_id, &cfg.app_secret)
+        } else {
+            feishu::Client::with_base_url(&cfg.app_id, &cfg.app_secret, &cfg.base_url)
+        };
+
         Arc::new(Feishu {
             agent,
             cancel: CancellationToken::new(),
             tx,
             rx: Mutex::new(rx),
-            feishu_client: feishu::Client::new(app_id, app_secret),
+            feishu_client,
             workspace_dir: workspace_dir.to_path_buf(),
         })
     }
