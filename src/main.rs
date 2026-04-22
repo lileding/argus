@@ -62,7 +62,13 @@ async fn main() -> Result<(), AppError> {
     let db = Database::connect(&config.database).await?;
     let upstream = Upstream::new(&config.upstream);
     let embedder = Embedder::new(&config.embedder, &upstream, &db)?;
-    let agent = Agent::new(&config.agent, &upstream, &db, &embedder)?;
+    let agent = Agent::new(
+        &config.agent,
+        &upstream,
+        &db,
+        &embedder,
+        &config.workspace_dir,
+    )?;
     let gateway = Gateway::new(
         &config.gateway,
         agent.port(),

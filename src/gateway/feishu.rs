@@ -575,8 +575,29 @@ impl<'a> Feishu<'a> {
         };
 
         let mut got_reply = false;
+        // (tool_name, display_text) — ordered by first appearance, deduped by name.
+        let mut status_lines: Vec<(String, String)> = Vec::new();
+
         while let Some(event) = msg.events.recv().await {
             match event {
+                Event::ToolStatus { tool, text } => {
+                    // Upsert: same tool name updates its line, new tool appends.
+                    if let Some(entry) = status_lines.iter_mut().find(|(k, _)| k == &tool) {
+                        entry.1 = text;
+                    } else {
+                        status_lines.push((tool, text));
+                    }
+                    if let Some(cid) = &card_id {
+                        let card = build_status_card(&status_lines, false);
+                        let _ = api.update_message(cid, &card).await;
+                    }
+                }
+                Event::Composing => {
+                    if let Some(cid) = &card_id {
+                        let card = build_status_card(&status_lines, true);
+                        let _ = api.update_message(cid, &card).await;
+                    }
+                }
                 Event::Reply { text } => {
                     got_reply = true;
                     let processed = crate::render::process_markdown(&text, api).await;
@@ -620,6 +641,16 @@ impl super::Im for Feishu<'_> {
 }
 
 // --- Feishu card builders ---
+
+/// Build a card showing stacked tool status lines.
+/// Replaces the initial "thinking" card on first call.
+fn build_status_card(lines: &[(String, String)], composing: bool) -> String {
+    let mut all: Vec<&str> = lines.iter().map(|(_, text)| text.as_str()).collect();
+    if composing {
+        all.push("✏️ Composing answer...");
+    }
+    crate::render::markdown_to_card(&all.join("\n"))
+}
 
 fn thinking_card(lang: &str) -> String {
     let text = if lang == "zh" {

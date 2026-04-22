@@ -3,6 +3,7 @@ mod documents;
 mod memories;
 mod messages;
 mod notifications;
+pub(crate) mod traces;
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
@@ -33,9 +34,16 @@ pub(crate) struct Database {
     pub(crate) conversation: conversation::Conversation,
     pub(crate) documents: documents::Documents,
     pub(crate) memories: memories::Memories,
+    pub(crate) traces: traces::Traces,
 }
 
 impl Database {
+    /// Access the underlying connection pool for raw SQL queries.
+    pub(crate) fn pool(&self) -> &PgPool {
+        // All sub-objects share the same underlying pool (PgPool is Arc-based).
+        self.traces.pool()
+    }
+
     pub(crate) async fn connect(config: &DatabaseConfig) -> DbResult<Self> {
         if config.dsn.is_empty() {
             return Err(DatabaseError::InvalidState(
@@ -58,7 +66,8 @@ impl Database {
             notifications: notifications::Notifications::new(pool.clone()),
             conversation: conversation::Conversation::new(pool.clone()),
             documents: documents::Documents::new(pool.clone()),
-            memories: memories::Memories::new(pool),
+            memories: memories::Memories::new(pool.clone()),
+            traces: traces::Traces::new(pool),
         })
     }
 }

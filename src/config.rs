@@ -6,6 +6,12 @@ use serde::Deserialize;
 /// Subdirectory under workspace for downloaded media files.
 pub(crate) const MEDIA_DIR: &str = ".files";
 
+/// Subdirectory under workspace for user-created files (write_file tool).
+pub(crate) const USER_DIR: &str = ".users";
+
+/// Subdirectory under workspace for skill definitions.
+pub(crate) const SKILLS_DIR: &str = "skills";
+
 /// Application configuration loaded from TOML.
 #[derive(Debug, Deserialize)]
 pub(crate) struct Config {
@@ -99,8 +105,10 @@ pub(crate) struct GatewayImConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct AgentConfig {
     #[serde(default = "default_max_iterations")]
-    #[allow(dead_code)] // Used when tool loop is implemented.
     pub(crate) max_iterations: usize,
+    /// Tavily API key for web search. Empty = DuckDuckGo fallback only.
+    #[serde(default)]
+    pub(crate) tavily_api_key: String,
     #[serde(default = "default_context_window")]
     pub(crate) orchestrator_context_window: usize,
     #[serde(default)]
@@ -113,6 +121,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_iterations: default_max_iterations(),
+            tavily_api_key: String::new(),
             orchestrator_context_window: default_context_window(),
             orchestrator: RoleConfig::default(),
             synthesizer: RoleConfig::default(),

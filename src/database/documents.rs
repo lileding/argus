@@ -143,4 +143,79 @@ impl Documents {
             .await?;
         Ok(())
     }
+
+    /// Semantic search over document chunks. Returns (filename, chunk_content, similarity).
+    pub(crate) async fn search_chunks(
+        &self,
+        embedding: &[f32],
+        limit: i64,
+        filename_filter: Option<&str>,
+    ) -> super::DbResult<Vec<(String, i32, String, f64)>> {
+        let vec = pgvector::Vector::from(embedding.to_vec());
+        let rows = if let Some(fname) = filename_filter {
+            sqlx::query(
+                "SELECT d.filename, c.chunk_index, c.content, \
+                        1 - (c.embedding <=> $1) AS similarity \
+                 FROM chunks c JOIN documents d ON d.id = c.document_id \
+                 WHERE c.embedding IS NOT NULL AND d.filename ILIKE '%' || $2 || '%' \
+                 ORDER BY c.embedding <=> $1 LIMIT $3",
+            )
+            .bind(&vec)
+            .bind(fname)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT d.filename, c.chunk_index, c.content, \
+                        1 - (c.embedding <=> $1) AS similarity \
+                 FROM chunks c JOIN documents d ON d.id = c.document_id \
+                 WHERE c.embedding IS NOT NULL \
+                 ORDER BY c.embedding <=> $1 LIMIT $2",
+            )
+            .bind(&vec)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("filename"),
+                    r.get::<i32, _>("chunk_index"),
+                    r.get::<String, _>("content"),
+                    r.get::<f64, _>("similarity"),
+                )
+            })
+            .collect())
+    }
+
+    /// List all documents with their status.
+    pub(crate) async fn list_all(
+        &self,
+    ) -> super::DbResult<Vec<(i64, String, String, i64, chrono::DateTime<chrono::Utc>)>> {
+        let rows = sqlx::query(
+            "SELECT d.id, d.filename, d.status, d.created_at, \
+                    COUNT(c.id) AS chunk_count \
+             FROM documents d LEFT JOIN chunks c ON c.document_id = d.id \
+             GROUP BY d.id ORDER BY d.created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<i64, _>("id"),
+                    r.get::<String, _>("filename"),
+                    r.get::<String, _>("status"),
+                    r.get::<i64, _>("chunk_count"),
+                    r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                )
+            })
+            .collect())
+    }
 }

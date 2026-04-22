@@ -52,6 +52,29 @@ impl Memories {
             .collect())
     }
 
+    /// Save a new pinned memory. Returns the memory ID.
+    pub(crate) async fn save(&self, category: &str, content: &str) -> super::DbResult<i64> {
+        let row = sqlx::query(
+            "INSERT INTO memories (category, content, active) \
+             VALUES ($1, $2, TRUE) RETURNING id",
+        )
+        .bind(category)
+        .bind(content)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get("id"))
+    }
+
+    /// Deactivate a memory by ID. Returns true if a memory was actually deactivated.
+    pub(crate) async fn deactivate(&self, id: i64) -> super::DbResult<bool> {
+        let result =
+            sqlx::query("UPDATE memories SET active = FALSE WHERE id = $1 AND active = TRUE")
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Set embedding for a memory.
     pub(crate) async fn set_embedding(&self, id: i64, embedding: &[f32]) -> super::DbResult<()> {
         let vec = Vector::from(embedding.to_vec());
