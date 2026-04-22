@@ -16,7 +16,6 @@ use crate::database::{Database, InboundMessage};
 /// Pending media work returned by the fast inbound path.
 struct MediaWork {
     msg_id: String,
-    chat_id: String,
     msg_type: String,
     raw_content: String,
     db_msg_id: Option<i64>,
@@ -189,7 +188,6 @@ impl<'a> Feishu<'a> {
         // Submit task to agent (same as normal flow).
         let (ready_tx, ready_rx) = oneshot::channel();
         let task = Task {
-            chat_id: msg.channel.clone(),
             msg_id: msg.trigger_msg_id.clone(),
             channel: msg.channel,
             db_msg_id: Some(msg.db_msg_id),
@@ -211,7 +209,6 @@ impl<'a> Feishu<'a> {
             .await;
         debug!(
             msg_id = work.msg_id,
-            chat_id = work.chat_id,
             content_len = payload.content.len(),
             files = payload.file_paths.len(),
             "payload ready"
@@ -357,7 +354,6 @@ impl<'a> Feishu<'a> {
         let (ready_tx, ready_rx) = oneshot::channel();
 
         let task = Task {
-            chat_id: chat_id.clone(),
             msg_id: msg_id.clone(),
             channel: channel.clone(),
             db_msg_id,
@@ -373,7 +369,6 @@ impl<'a> Feishu<'a> {
         // Return media work for the select loop to drive concurrently.
         Some(MediaWork {
             msg_id,
-            chat_id,
             msg_type,
             raw_content,
             db_msg_id,

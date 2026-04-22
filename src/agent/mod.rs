@@ -34,7 +34,6 @@ pub(crate) trait EmbedService: Send + Sync {
 }
 
 pub(crate) struct Task {
-    pub(crate) chat_id: String,
     pub(crate) msg_id: String,
     /// Database channel (e.g. "feishu:p2p:ou_xxx").
     pub(crate) channel: String,
@@ -45,8 +44,6 @@ pub(crate) struct Task {
 }
 
 pub(crate) struct Message {
-    #[allow(dead_code)] // Will be used for per-chat channel routing.
-    pub(crate) chat_id: String,
     pub(crate) msg_id: String,
     /// Agent emits events; frontend consumes them to drive UI.
     /// Dropping the sender signals "message complete".
@@ -186,19 +183,17 @@ impl<'a, E: EmbedService> Agent<'a, E> {
 
     async fn process_task(&self, task: Task) {
         let Task {
-            chat_id,
             msg_id,
             channel,
             db_msg_id,
             ready,
             port,
         } = task;
-        info!(chat_id, msg_id, "processing task");
+        info!(channel, msg_id, "processing task");
 
         // Open events channel → frontend shows thinking card.
         let (events_tx, events_rx) = mpsc::channel(16);
         let msg = Message {
-            chat_id: chat_id.clone(),
             msg_id: msg_id.clone(),
             events: events_rx,
         };
@@ -206,22 +201,22 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             warn!("outbound channel closed, dropping message");
             return;
         }
-        debug!(chat_id, msg_id, "message posted to outbound port");
+        debug!(channel, msg_id, "message posted to outbound port");
 
         // Wait for payload with timeout (media processing may hang).
         let payload = match tokio::time::timeout(std::time::Duration::from_secs(120), ready).await {
             Ok(Ok(p)) => p,
             Ok(Err(_)) => {
-                warn!(chat_id, msg_id, "ready channel dropped");
+                warn!(channel, msg_id, "ready channel dropped");
                 return;
             }
             Err(_) => {
-                warn!(chat_id, msg_id, "media processing timed out (120s)");
+                warn!(channel, msg_id, "media processing timed out (120s)");
                 return;
             }
         };
         debug!(
-            chat_id,
+            channel,
             msg_id,
             content_len = payload.content.len(),
             "payload received"
@@ -249,7 +244,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
 
         // Phase 1: Orchestrator tool loop.
         let (summary, tool_results, iterations, trace) = self
-            .run_orchestrator(&mut messages, &chat_id, &channel, db_msg_id, &events_tx)
+            .run_orchestrator(&mut messages, &channel, db_msg_id, &events_tx)
             .await;
 
         // Transition to Phase 2.
@@ -261,7 +256,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             .await
         {
             Ok((text, usage)) => {
-                debug!(chat_id, msg_id, "synthesizer done");
+                debug!(channel, msg_id, "synthesizer done");
                 // Finalize trace with synthesizer stats.
                 if let Some(trace) = trace {
                     let reply_id = self
@@ -280,13 +275,13 @@ impl<'a, E: EmbedService> Agent<'a, E> {
                         )
                         .await
                     {
-                        warn!(chat_id, msg_id, error = %e, "trace finalize failed");
+                        warn!(channel, msg_id, error = %e, "trace finalize failed");
                     }
                 }
                 text
             }
             Err(e) => {
-                warn!(chat_id, msg_id, error = %e, "synthesizer failed");
+                warn!(channel, msg_id, error = %e, "synthesizer failed");
                 let error_text = format!("Error: {e}");
                 let _ = events_tx
                     .send(Event::Reply {
@@ -306,7 +301,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
                 .await;
         }
 
-        info!(chat_id, msg_id, "task complete");
+        info!(channel, msg_id, "task complete");
     }
 
     /// Phase 1: Orchestrator tool loop. Calls model with tools, executes tool
@@ -314,7 +309,6 @@ impl<'a, E: EmbedService> Agent<'a, E> {
     async fn run_orchestrator(
         &self,
         messages: &mut Vec<model::Message>,
-        chat_id: &str,
         channel: &str,
         db_msg_id: Option<i64>,
         events_tx: &mpsc::Sender<Event>,
@@ -354,7 +348,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
                 match self
                     .db
                     .traces
-                    .begin(mid, chat_id, &self.orch_model_name, &self.synth_model_name)
+                    .begin(mid, channel, &self.orch_model_name, &self.synth_model_name)
                     .await
                 {
                     Ok(t) => Some(t),

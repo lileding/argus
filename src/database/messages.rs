@@ -101,8 +101,10 @@ impl Messages {
             "SELECT id, channel, trigger_msg_id, msg_type, content, ready \
              FROM messages \
              WHERE reply_id IS NULL \
+               AND trigger_msg_id IS NOT NULL \
                AND created_at > NOW() - INTERVAL '24 hours' \
-             ORDER BY created_at",
+             ORDER BY created_at \
+             LIMIT 10",
         )
         .fetch_all(&self.pool)
         .await?;
