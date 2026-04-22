@@ -20,6 +20,7 @@ One assistant, one memory, one timeline. The user never needs to "start a new se
 ### Group Silent Listening
 - Passive observation mode
 - Records mentioned items, proactively reminds when relevant
+- Not yet implemented (future work)
 
 ---
 
@@ -31,232 +32,183 @@ Argus is structured as three layers with strict import boundaries:
 
 ```
 ┌────────────────────────────────┐
-│  Frontend                      │  IM adapter, data prep, rendering
-│  (Feishu; future CLI/Slack)    │
+│  Gateway                       │  IM adapters, media processing,
+│  (Feishu; future Slack)        │  card rendering
 └────────────────────────────────┘
-              │  SubmitTask
+              │  Task → mpsc
               ▼
 ┌────────────────────────────────┐
 │  Agent                         │  task scheduler, two-phase execution,
-│  (scheduler + HandleStream)    │  trace persistence
+│  (orchestrator + synthesizer)  │  trace persistence
 └────────────────────────────────┘
               │  uses
               ▼
 ┌────────────────────────────────┐
-│  Backend                       │  LLM clients, tools, sandbox,
-│  (model / tool / sandbox /     │  embedding, render, skills
-│   embedding / render / skill)  │
+│  Upstream                      │  LLM clients (OpenAI, Anthropic,
+│  (model / tool / embed /       │  Gemini-via-OpenAI), embedding,
+│   render / skill)              │  document RAG, skills
 └────────────────────────────────┘
 ```
 
-Import direction is **Frontend → Agent → Backend**, never reversed.
-The Agent does not `import` any Frontend implementation; each Task
-carries its own Frontend reference, so UI callbacks route themselves.
+Import direction is **Gateway → Agent → Upstream**, never reversed.
+The Agent does not `use` any Gateway type; each `Task` carries its own
+`mpsc::Sender<Message>` port, so reply events route themselves back
+to the originating IM adapter.
 
-The two inter-layer interfaces:
+### Four Peer Services
 
-```go
-type Agent interface {
-    SubmitTask(Task)                   // mpsc entry; sync tasks only
-    Run(ctx context.Context) error     // graceful start/stop
+`main.rs` creates four top-level services and runs them concurrently
+via `tokio::join!`. All services share references (`&self`) — no
+`Arc`, no `spawn`:
+
+```rust
+let upstream = Upstream::new(&config.upstream);
+let embedder = Embedder::new(&config.embedder, &upstream, &db)?;
+let agent = Agent::new(&config.agent, &upstream, &db, &embedder, &config.workspace_dir)?;
+let gateway = Gateway::new(&config.gateway, agent.port(), &upstream, &db, &config.workspace_dir);
+let recovery = Recovery::new(&db, &gateway);
+
+tokio::join!(
+    gateway.run(&cancel),
+    agent.run(&cancel),
+    embedder.run(&cancel),
+    recovery.run(&cancel),
+    shutdown_signal(&cancel),
+);
+```
+
+| Service | Responsibility |
+|---------|---------------|
+| **Gateway** | Manages all IM adapters. Each adapter runs its own `select!` loop: WS inbound, outbound rendering, media processing, recovery replay — all in a single `FuturesUnordered` pool |
+| **Agent** | Pops tasks from mpsc, runs two-phase execution (orchestrator → synthesizer), records traces |
+| **Embedder** | Background worker: embeds unembedded rows (messages, notifications, memories, chunks), summarizes long assistant replies, ingests queued documents |
+| **Recovery** | Scans for unreplied messages at startup and every 5 minutes, replays them through the Gateway |
+
+### Task, Message, Event
+
+```rust
+pub(crate) struct Task {
+    pub(crate) msg_id: String,
+    pub(crate) channel: String,           // e.g. "feishu:p2p:ou_xxx"
+    pub(crate) db_msg_id: Option<i64>,
+    pub(crate) ready: oneshot::Receiver<Payload>,
+    pub(crate) port: mpsc::Sender<Message>,
 }
 
-type Frontend interface {
-    SubmitMessage(*Message)            // mpsc entry; rendering queue
-    Run(ctx context.Context) error     // graceful start/stop
+pub(crate) struct Payload {
+    pub(crate) content: String,
+    pub(crate) file_paths: Vec<String>,
+}
+
+pub(crate) struct Message {
+    pub(crate) msg_id: String,
+    pub(crate) events: mpsc::Receiver<Event>,
+}
+
+pub(crate) enum Event {
+    ToolStatus { tool: String, text: String },
+    Composing,
+    Reply { text: String },
 }
 ```
 
-Async tasks (future: cron-driven, trace self-introspection, subagent
-orchestration) are produced **inside** the Agent and never traverse
-`SubmitTask`. The external surface stays minimal.
-
-### Task, Message, Payload
-
-```go
-type Task struct {
-    ChatID   string
-    Frontend Frontend              // reply channel for this task's UI
-    ReadyCh  <-chan Payload        // readiness signal + payload in one
-    // ...metadata (db message id, kind, lang, ...)
-}
-
-type Payload struct {
-    Content   string
-    FilePaths []string
-}
-
-type Message struct {
-    Events <-chan Event            // Agent produces, Frontend consumes
-    // ...minimal metadata (chat id, db msg id)
-}
-```
-
-`ReadyCh` is a buffered (cap 1) channel that carries the processed
-payload directly — no DB round-trip between Frontend and Agent after
-media is ready. `msg.Events` closing is the sole "this message is done"
-signal; no explicit `Close()` method.
+`ready` is a `oneshot` that carries the processed payload directly —
+no DB round-trip between Gateway and Agent after media is ready.
+Dropping the `events` sender is the sole "this message is done"
+signal; no explicit `close()` method.
 
 ### Per-Task Lifecycle
 
 ```
-Frontend inbound loop                 Agent run loop
-─────────────────────                 ──────────────
-webhook arrives                       task ← queue
-  INSERT raw message                  msg := new Message
-  Task{ReadyCh} constructed           task.Frontend.SubmitMessage(msg)
-  agent.SubmitTask(task)              payload := <-task.ReadyCh
-  go media.download+process           execute(payload, msg.Events)
-                                      close(msg.Events)
-media goroutine
-──────────────                        Frontend render loop
-download bytes → DB(downloaded)       ────────────────────
-process → DB(processed)               msg ← outbound queue
-payload → task.ReadyCh                open card
-                                      for ev := range msg.Events:
-                                          patch card
-                                      close card
+Gateway inbound (select! loop)        Agent run loop
+──────────────────────────────        ──────────────
+WS event arrives                      task ← mpsc::recv
+  dedup by message_id                 msg := Message { events }
+  INSERT raw message (ready=false)    task.port.send(msg)
+  Task{ready_rx} constructed          payload := task.ready.await
+  task_tx.send(task)                  execute(payload, events_tx)
+  → returns MediaWork                 drop(events_tx)
+
+FuturesUnordered                      Gateway render (same select!)
+────────────────                      ──────────────────────────────
+download bytes → DB(ready=true)       msg ← outbound mpsc
+process → ready_tx.send(payload)      reply_message → thinking card
+                                      for event in msg.events:
+                                          update_message(card)
+                                      finalize card
 ```
 
-Agent calls `SubmitMessage` **before** waiting on `ReadyCh` — this
+Agent calls `port.send(msg)` **before** waiting on `ready` — this
 preserves the "thinking card appears instantly, even while audio is
 transcribing" UX.
 
 ### Content State Machine
 
-Two independent state columns on `messages`:
+Two state signals on `messages`:
 
 ```
-content_status:  raw → downloaded → processed
-reply_status:    received → processing → done
+ready:       false → true             (content processing complete)
+reply_id:    NULL → Some(id)          (reply saved to notifications)
 ```
 
-- **raw**: webhook JSON stored; no bytes downloaded yet
-- **downloaded**: media bytes saved to `.files/`; transcription/extraction
-  pending. *Not interruptible* during graceful shutdown: Feishu file
-  resources expire and re-download may fail.
-- **processed**: transcription / OCR / post extraction done.
-  *Reproducible from local bytes* — safe to re-run after crash or
-  clean shutdown.
+- **ready=false**: raw content stored; media download or transcription
+  pending. Feishu file resources may expire, so download is
+  non-interruptible during shutdown.
+- **ready=true**: content fully processed. Reproducible from local
+  bytes — safe to re-run after crash.
 
 ### Single Active Card Per Chat
 
-The Agent scheduler guarantees per-chat serial execution (one task at a
-time per chat). The Feishu Frontend renders each Message in a stateless
-goroutine — no per-chat render queue is needed because the Agent never
-issues concurrent `SubmitMessage` calls for the same chat. At most one
-card is "open" per chat at any instant as a natural consequence of the
-scheduler's serialization.
+The Agent scheduler processes tasks sequentially (single queue). The
+Feishu adapter renders each Message in a concurrent future within its
+`FuturesUnordered` pool. Since the Agent never issues concurrent tasks,
+at most one card is "open" per chat at any instant.
 
-### Replay Subsystem (Crash Recovery)
+### Recovery (Crash Replay)
 
-Recovery is a standalone subsystem, not a Frontend feature. A
-**Registry** indexed by `source_im` lets the replay subsystem route
-each unfinished message back to the correct Frontend:
+Recovery is a standalone peer service, not a Gateway feature. On
+startup and every 5 minutes, it scans `messages WHERE reply_id IS NULL`
+from the last 24 hours.
 
 ```
 On startup:
-  1. Each Frontend registers itself in Registry (by source_im tag)
-  2. Replay subsystem scans messages WHERE reply_status != done
-  3. For each row: lookup Registry[source_im] → construct Task → SubmitTask
-  4. Agent processes replayed tasks identically to fresh ones
+  1. Recovery.scan() queries messages with no reply
+  2. For each row: route by channel prefix (e.g. "feishu:..." → feishu IM)
+  3. Gateway.replay(msg) sends through the IM's recover channel
+  4. IM adapter receives, reprocesses if needed, constructs Task → agent
 ```
 
-Replay handles the state combinations:
-- `content_status=raw`: re-spawn download (may fail if Feishu resource expired — logged, moved to error)
-- `content_status=downloaded`, not `processed`: re-run processing from local bytes
-- `content_status=processed`, `reply_status != done`: direct SubmitTask
+Recovery handles the state combinations:
+- `ready=false`: re-run media processing from raw content (may fail if
+  Feishu resource expired — logged, skipped)
+- `ready=true`: content already processed, submit task directly
 
-**Cards are not re-attached.** Feishu mostly rejects `update` calls on
-older message IDs after a process restart. Replay opens a fresh card
-per replayed task rather than relying on `reply_channel_id` continuity
-(the old value is retained for audit only).
+**Cards are not re-attached.** Feishu rejects `update` calls on older
+message IDs after a process restart. Replay opens a fresh card per
+replayed task.
 
-**Replay responsibility split**:
-- Agent guarantees *every task is idempotent and fully replayable* from
-  the DB state (key status transitions land on disk before the work starts)
-- Replay subsystem decides *when* and *what* to resubmit
-- Frontend provides the reply surface for replayed tasks via Registry
+### Shutdown
 
-### "Don't Lose IM Bytes" Shutdown
-
-One `ctx` cancel notifies everyone. Each loop decides how to exit
-based on its own semantics; ordering falls out naturally from the
-producer/consumer graph, no external staging controller.
-
-**Inbound loop** (Frontend) on `ctx.Done`:
-- close HTTP listener (no new webhooks accepted)
-- drain inbound channel: remaining events get `INSERT` + `SubmitTask`
-- exit
-
-**Media goroutines** (Frontend) — *do not observe ctx*:
-- each continues until its download phase lands bytes on disk
-- processing phase (transcription / extraction) is replayable, so it
-  may continue to completion or be abandoned at process exit; either
-  way `Frontend.Run` waits on a `WaitGroup` tracking these goroutines
-  before returning
-
-**Agent run loop** on `ctx.Done`:
-- stop taking new tasks from its queue
-- **finish the task currently in hand** (user-experience priority: the
-  Agent is slow relative to the Frontend, so the in-flight task is
-  almost always what the user is watching). `msg.Events` gets closed
-  normally at the end
-- queued-but-not-started tasks are dropped; they are persisted and
-  replayable on next startup
-- exit
-
-**Outbound (render) loop** (Frontend) on `ctx.Done`:
-- drain the outbound queue: for each queued `msg`, consume
-  `msg.Events` until closed, then close the card
-- this naturally synchronizes with the Agent: the loop blocks on
-  `msg.Events` exactly until the Agent's in-hand task closes it
-- exit when the queue is empty
-
-`Frontend.Run` returns after inbound + outbound + mediaWG all complete.
-`Agent.Run` returns after its in-hand task completes.
+One `CancellationToken` notifies all services. Each service decides
+how to exit based on its own semantics:
 
 ```
-ctx cancel
-    │  (everyone sees it)
-    ├── inbound loop:    drain inbound → exit
-    ├── agent loop:      finish in-hand task (closes msg.Events) → exit
-    ├── outbound loop:   drain outbound queue (events closed by the
-    │                    exiting agent) → exit
-    └── media goroutines: finish download + process → readyCh <- payload
-
-Frontend.Run waits on (inbound + outbound + mediaWG), returns
-Agent.Run   waits on (in-hand task), returns
+cancel.cancel()
+    │
+    ├── Gateway (each IM adapter):
+    │     drain outbound queue, drain in-flight FuturesUnordered, return
+    ├── Agent:
+    │     break select! loop (current task completes naturally), return
+    ├── Embedder:
+    │     break interval loop, return
+    └── Recovery:
+          break scan loop, return
 ```
 
-**Principle**: only IM-provided bytes are protected by the shutdown
-path; derived data relies on replay. A single ctx lets each loop
-express its own "what must I finish before exiting" rule locally,
-without a controller orchestrating stages.
-
-### Per-Chat FIFO Within Agent
-
-The per-chat MPSC channel structure that used to live in
-`feishu/dispatcher.go` moves **into the Agent scheduler**. Semantics
-are unchanged at this milestone:
-
-- One consumer goroutine per chat (created lazily via `sync.Map.LoadOrStore`)
-- Cross-chat parallelism preserved
-- Sync tasks ordered per chat; async tasks (future work) will run on a
-  global pool alongside this path, not replace it
-
-### reply_channel_id Abstraction
-
-The reply card handle remains IM-agnostic:
-- **Feishu**: message_id from `ReplyRichWithID` (used for PATCH updates)
-- **Slack** (future): message ts
-- **CLI**: empty string
-
-The column `messages.reply_channel_id` exists for audit purposes.
-Currently not actively persisted — the Frontend opens cards but does
-not write the card handle back to the DB. If replay card re-attachment
-becomes necessary, the Frontend would need a store callback to persist
-it after `ReplyRichWithID` succeeds.
+Gateway `select!` on cancel: drains remaining outbound messages with a
+500ms timeout, then drains all in-flight futures (media + render).
+Agent completes whatever task is currently mid-execution — no new tasks
+are pulled from the queue.
 
 ### Two-Phase Agent (Orchestrator + Synthesizer)
 
@@ -266,27 +218,18 @@ models skip tool calls entirely and answer from training memory. Splitting
 into two narrow roles dramatically improves reliability:
 
 - **Orchestrator** only calls tools. Its system prompt forbids text answers
-  ("your text output is DISCARDED"). It loops until it calls `finish_task`
-  with a summary, gets force-stopped by the harness (see below), or hits
-  `max_iterations`.
+  ("Text output is ignored — only tool calls matter"). It loops until it
+  calls `finish_task` with a summary, gets force-stopped by the harness
+  (budget exhaustion or max iterations), or produces text after retry.
 - **Synthesizer** only writes the answer. It receives the user question
   and a `Materials` block containing every tool result and the orchestrator's
   summary. No conversation history, no tools — it composes purely from what
   Phase 1 gathered. This keeps the synthesizer cheap and immune to context
   pollution.
 
-Both phases may use different role-specific model clients (e.g. Claude for
-orchestration, Gemini for synthesis).
-
-### Tool vs Sandbox Orthogonality
-
-These are unrelated axes:
-- **Tool layer**: the LLM outputs tool calls — defines WHAT to do
-- **Sandbox layer**: the sandbox executes — defines WHERE to run
-
-Sandboxes are configurable:
-- `local` — direct host execution via `bash -c` (development)
-- `docker` — isolated container execution (production, image: `argus-sandbox`)
+Both phases use different model clients (e.g. Claude for orchestration,
+Gemini for synthesis). The `run_synthesizer` method streams its output via
+SSE-style chunks to the frontend.
 
 ---
 
@@ -296,99 +239,58 @@ Argus handles all Feishu message types natively:
 
 | Message Type | Processing |
 |-------------|-----------|
-| **text** | Frontend inbound stores raw JSON → media goroutine extracts text (instant) |
-| **image** | Frontend inbound stores raw JSON → media goroutine downloads to `.files/` + saves `file_paths` to DB |
-| **post** (rich text) | Frontend inbound stores raw JSON → media goroutine extracts text + downloads images + saves `file_paths` to DB |
-| **audio** | Frontend inbound stores raw JSON → media goroutine downloads `.opus` → Whisper → LLM correction |
-| **file** (PDF, docx, etc.) | Frontend inbound stores raw JSON → media goroutine downloads to `.files/` → registers for RAG |
+| **text** | Fast path: extract text from JSON, instant |
+| **image** | Download to `.files/` + save file_path |
+| **post** (rich text) | Extract text + download embedded images |
+| **audio** | Download `.opus` → Whisper transcription (OpenAI-compatible endpoint) |
+| **file** (PDF, docx, etc.) | Download to `.files/` → register for document RAG ingestion |
 
-Media processing runs in async goroutines spawned by the Frontend
-inbound loop. The inbound path is sub-millisecond: INSERT + construct
-Task + `agent.SubmitTask` + spawn media goroutine. The media goroutine
-sends the processed `Payload` through `task.ReadyCh` when complete.
-The Agent opens the thinking card (via `task.Frontend.SubmitMessage`)
-immediately on task pop, then blocks on `ReadyCh` until content is
-ready.
-
-### Vision (Multimodal Image Understanding)
-
-Images flow end-to-end to vision-capable models (GPT-5.4, Gemini, Claude):
-
-```
-Feishu image/post → download to .files/ → file_paths saved to DB
-    → Agent loads from disk via Payload.FilePaths → base64 data URL
-    → NewMultimodalMessage(text, dataURLs...)
-    → OpenAI: ContentPart array (native)
-    → Anthropic: {type:"image", source:{type:"base64",...}}
-    → Gemini: {inlineData:{mimeType, data}}
-```
-
-**Context budget**:
-- Only the most recent image-bearing message in history gets real
-  image data. Older image messages → text placeholder.
-- Per-message hard limits: max 4 images, max 1 MB per image file.
-  Excess images → `"[N image(s) omitted]"` text placeholder.
-- Semantic recall returns text-only (no image re-injection); image
-  messages that appear in both recall and sliding window stay in the
-  sliding window path to preserve image data.
-
-**Storage**: images are NOT stored as base64 in the DB (too heavy).
-`messages.file_paths` stores the relative path to `.files/`; images
-are loaded from disk on-demand when building model context.
+Media processing runs as async futures inside the IM adapter's
+`FuturesUnordered` pool. The inbound path is fast: parse → dedup →
+INSERT → `task_tx.send()` → return `MediaWork`. The media future sends
+the processed `Payload` through `task.ready_tx` when complete. The
+Agent opens the thinking card (via `task.port.send(msg)`) immediately
+on task pop, then awaits `ready` until content is ready.
 
 ### Audio Pipeline
 
 ```
 Feishu audio → download → save .opus to .files/
-    → Whisper v3 transcription (with domain vocabulary prompt)
-    → confidence check (avg_logprob > -0.15 = high quality)
-    → IF low confidence: LLM post-processing (punctuation, fix terms)
-    → IF high confidence: skip LLM correction (saves ~5-10s)
+    → Whisper v3 transcription (OpenAI-compatible /v1/audio/transcriptions)
+    → verbose_json response with avg_logprob per segment
+    → confidence computed as mean(avg_logprob)
     → text sent to orchestrator
 ```
 
-The transcription prompt includes hints for:
-- Mixed Chinese/English code-switching
-- Technology terms (API, Kubernetes, Docker, LLM, MLX, omlx, vLLM)
-- Finance terms (ETF, PE ratio, derivatives, hedge fund)
-- Classical composers in Latin + Chinese (Chopin 肖邦, Scriabin 斯克里亚宾,
-  Prokofiev 普罗科菲耶夫, Rachmaninoff 拉赫玛尼诺夫, …). Paired translit
-  helps Whisper disambiguate proper names across languages.
-
-Low-confidence transcriptions (avg_logprob < -0.15) are post-processed by
-the orchestrator LLM to add punctuation and fix misheard terms. High-
-confidence transcriptions skip this step (~5-10s savings). When correction
-occurs, both raw and corrected text are logged for debugging.
+The transcription prompt includes domain vocabulary hints for:
+- Technology terms (API, Kubernetes, Docker, LLM, MLX, vLLM, omlx)
+- Finance terms (ETF, hedge fund, quantitative)
+- Classical composers in Chinese/Latin (Chopin 肖邦, Beethoven 贝多芬, ...)
 
 ### Document RAG (Personal Knowledge Base)
 
-Non-image files (PDF, docx, etc.) go through the `docindex` ingester:
-download → extract text via sandbox CLI (`pdftotext`, `pandoc`) → chunk →
-embed each chunk → store in `chunks` table with pgvector index.
+Non-image files go through the document ingester:
+- Small files (≤ 1MB): processed inline during upload (extract → chunk → save)
+- Large files: saved as "pending", processed by the Embedder background worker
 
-Retrieval happens through two complementary paths:
+Text extraction:
+- PDF: `pdftotext` (host CLI)
+- DOCX: `python3 -c` with `python-docx`
+- txt/md/csv/json/yaml/xml: read directly
 
-1. **Passive recall.** The harness's `curateHistory` embeds the current
-   message and searches chunk embeddings via pgvector. Only chunks above
-   a similarity threshold (0.35) are injected, with a total byte budget
-   (4 KB) to prevent context pollution. When the knowledge base grows
-   large, low-relevance chunks are silently dropped — the Orchestrator
-   can always use `search_docs` for explicit retrieval.
+Chunks: 1500 chars with 300-char overlap. Stored in `chunks` table with
+pgvector embeddings (768-dim, async-filled by the Embedder worker).
 
-2. **Active retrieval.** The Orchestrator has two tools for on-demand
-   document access:
-   - `list_docs` — lists all documents (ready, pending, processing, error)
-     with chunk count and status. Shows errors for failed ingestions to
-     help users troubleshoot.
-   - `search_docs` — semantic search over chunks. Accepts a `query`,
-     optional `limit` (default 5, max 20), and optional `filename` filter.
-     The query is embedded via `EmbedOne`, then matched against chunk
-     embeddings. When `filename` is specified, the tool over-fetches 5×
-     and filters in Go (simpler than SQL-level filtering for small corpora).
+Retrieval happens through two paths:
 
-The Orchestrator prompt instructs the model to use `list_docs` → `search_docs`
-for user-uploaded documents, and explicitly prohibits reading binary files
-via `read_file` or `cli`.
+1. **Active retrieval.** The Orchestrator has two tools:
+   - `list_docs` — lists all documents with status
+   - `search_docs` — semantic search over chunks (query embedded on demand,
+     matched against chunk embeddings via pgvector cosine distance)
+
+2. **Passive recall.** The harness's `build_context` does NOT currently
+   inject document chunks (only conversation history). Active retrieval
+   via tools is the primary path.
 
 ---
 
@@ -401,55 +303,44 @@ curation pipeline; the synthesizer receives no history at all (only user
 question + materials from Phase 1).
 
 ```
-Agent pops a task, opens card via Frontend, waits on ReadyCh for Payload
+Agent pops a task, opens card via port, waits on ready for Payload
         ↓
 [1] History Curation (orchestrator only)
-    - Load recent N messages (sliding window)
-    - Semantic recall: embed current message, pgvector search older messages
-      ▸ similarity threshold (0.30), byte budget on effective size
-      ▸ sort recalled by time, not similarity
-    - Both paths → unified curateHistory:
-      ▸ Filter: user + assistant final replies only (no tool noise)
-      ▸ Long assistant replies (>800 runes): summary or truncation
-      ▸ Re-inject images from .files/ (sliding window only, not recalled)
-    - Document chunk recall: threshold 0.35, 4 KB budget
+    - Semantic recall: embed current message, pgvector search both
+      user messages and agent replies (notifications table)
+      ▸ similarity threshold (0.50), byte budget (6 KB)
+      ▸ dedup against sliding window by row ID
+    - Sliding window: recent N conversation turns (channel-scoped)
+      ▸ each turn = user message + optional notification reply
+    - Pinned memories from `memories` table (active only)
         ↓
 [2a] Orchestrator Prompt                [2b] Synthesizer Prompt
-     - OrchestratorPrompt (tool-only         - SynthesizerPrompt (answer-only
+     - ORCHESTRATOR_PROMPT (tool-only        - SYNTHESIZER_PROMPT (answer-only
        rules, loop prevention)                 rules, language matching)
-     - Environment (date, workspace)          - Environment
-     - Pinned memories                        - Pinned memories
-     - Builtin skill prompts                  (no history, no skills/tools)
-     - User skill catalog (name + desc)
+     - Pinned memories appended              (no history, no skills/tools)
+     - Skill catalog (name + description)
         ↓                                        ↓
 [3] Assemble                            [3] Assemble
-    [sys] + [history] + [user]              [sys] + [user]
-                                              + [materials from Phase 1]
+    [sys] + [recalled] + [recent] +         [sys] + [user + materials]
+    [user]
         ↓                                        ↓
-   Model.Chat (with tools)                  Model.ChatStream (no tools)
+   chat_with_early_abort (with tools)       chat_stream (no tools)
 ```
 
-### Assistant Reply Summarization
+### Conversation View
 
-Long assistant replies in context can dominate the orchestrator's attention
-and cause it to respond to old topics instead of the current message. To
-prevent this while preserving context capability:
-
-- **Async summaries**: a background worker (sharing the embedding worker
-  loop) calls the synthesizer model to generate 2-3 sentence summaries for
-  assistant messages exceeding ~800 runes. Stored in `messages.summary`.
-- **In curateHistory**: if `summary` is available, the long reply is replaced
-  with `[Summary of previous reply] <summary>`. Otherwise, truncated to
-  800 runes as fallback.
-- **On-demand retrieval**: the `search_history` tool lets the orchestrator
-  retrieve full original text via semantic search when a summary isn't
-  sufficient (e.g., user says "expand on your third point earlier").
+The `conversation` SQL view joins messages with their notification
+replies, filtering to `ready=TRUE` only. This ensures the harness
+never sees raw JSON content from unprocessed messages. Recall searches
+both user messages (by embedding) and agent replies (notifications
+table), deduped by content to avoid double-injection.
 
 ### Safety
 
 - Tool results truncated to 16 KB max before entering context
 - Messages saved BEFORE context assembly (prevents duplicates on retry/crash)
-- Async embedding worker — saving is never blocked on the embed endpoint
+- Async embedding via the Embedder worker — saving is never blocked on embed
+- Semantic recall results sorted by time, not similarity
 
 ---
 
@@ -460,7 +351,7 @@ models. Argus enforces hard limits at the harness layer:
 
 | Safeguard | Trigger | Action |
 |-----------|---------|--------|
-| **Per-tool budget** | `search`≤3, `fetch`≤4, `db`≤6, `cli`≤5, `write_file`≤3, `remember`≤3 per turn | Harness rejects further calls without dispatching; returns error "budget exhausted, call finish_task NOW" |
+| **Per-tool budget** | `search`≤3, `fetch`≤4, `db`≤6, `cli`≤5, `write_file`≤3, `remember`≤3, `search_history`≤2 per turn | Harness rejects further calls without dispatching; returns error "budget exhausted, call finish_task NOW" |
 | **Cumulative rejection strike-out** | 5 budget-exhausted rejections in a turn | Force-exit orchestrator, pass gathered materials to synthesizer |
 | **Text-only early abort** | Streaming detects >80 tokens of text without tool calls | Cancel stream immediately (~1s), retry with enforcement prompt instead of waiting 10-30s for full generation |
 | **Tool-only retry** | First iteration produces no tool calls after early abort | Inject "You MUST call a tool" user message, retry once |
@@ -479,63 +370,45 @@ then force-synthesized with whatever materials exist.
 
 When the orchestrator receives multiple tool calls in a single model
 response (e.g. 2 searches + 1 fetch), they execute concurrently via
-goroutines + `sync.WaitGroup`. Results are appended to the context in
+`futures::future::join_all`. Results are appended to the context in
 the original order for deterministic history. `finish_task` is
 pre-scanned before dispatch; budget checks run serially (shared state).
 
-Latency: `max(tool_time)` instead of `Σ(tool_time)`.
+Latency: `max(tool_time)` instead of `sum(tool_time)`.
 
-### ChatWithEarlyAbort (Streaming Phase 1)
+### chat_with_early_abort (Streaming Phase 1)
 
-The orchestrator uses `ChatWithEarlyAbort` instead of blocking `Chat`.
-This method opens an SSE stream and accumulates both `delta.content`
-AND `delta.tool_calls` (OpenAI streaming format). Two exit paths:
+The orchestrator uses `chat_with_early_abort` instead of blocking `chat`.
+This method opens an SSE stream and accumulates both content deltas
+AND tool call deltas. Two exit paths:
 
 - **Model calls tools**: tool_call deltas appear in the stream →
   accumulate until stream completes → return full Response with ToolCalls.
-  Behaves identically to blocking Chat.
+  Behaves identically to blocking chat.
 - **Model outputs text only** (ignored tool-only rule): content text
   exceeds 80 estimated tokens with no tool_call delta seen → cancel
-  context immediately → return partial text → orchestrator retries.
+  stream immediately → return partial text → orchestrator retries.
   Saves 10-30s of wasted generation.
-
-### Confidence-Based Transcription Skip
-
-Whisper `avg_logprob > -0.15` indicates high-quality transcription. The
-LLM correction step is skipped entirely, saving one model call (~5-10s)
-per confident audio message. Threshold derived from production data:
-`-0.104` (clear speech, skip) vs `-0.239` (noisy/proper-noun-heavy,
-correct).
-
-### Dynamic Streaming Throttle
-
-Phase 2 card updates use a burst + throttle pattern:
-- First 3 updates: sent immediately (user sees first tokens instantly)
-- Subsequent updates: throttled to one per 500ms (Feishu rate-limit safe)
-
-Perceived first-token latency drops from 500ms to ~0ms.
 
 ---
 
 ## Streaming
 
-Phase 2 (synthesizer) streams its output via Server-Sent Events:
+Phase 2 (synthesizer) streams its output:
 
-- `model.Client.ChatStream` returns `<-chan StreamChunk` with incremental
-  deltas from an OpenAI-compatible streaming endpoint
-- Agent emits `EventReplyDelta` with accumulated text on each chunk
-- Feishu adapter uses burst + throttle (see above)
-- During streaming, LaTeX rendering is skipped — partial `$...$` would
-  break parsing. The final `EventReply` triggers full processing
-  (LaTeX → PNG upload → `![](image_key)` embedding)
+- `client.chat_stream` returns a `Pin<Box<dyn Stream<Item = StreamChunk>>>` 
+  of incremental deltas from an OpenAI-compatible streaming endpoint
+- Agent emits `Event::Reply` with the full accumulated text
+- Feishu adapter renders as interactive card updates
+- During streaming, LaTeX rendering is not applied — the final
+  `Event::Reply` triggers full processing (LaTeX → PNG upload →
+  `![](image_key)` embedding)
 
 ---
 
 ## Request Tracing
 
 Every message processing is recorded in `traces` + `tool_calls` tables.
-The Agent tees its own event stream — one path through `msg.Events` to
-the Frontend (UI), one path to the trace collector (DB).
 
 `traces`: one row per user-message → reply cycle. Fields: `message_id`,
 `reply_id`, `chat_id`, `orchestrator_model`, `synthesizer_model`,
@@ -546,37 +419,9 @@ the Frontend (UI), one path to the trace collector (DB).
 `seq`, `tool_name`, `arguments` (raw), `normalized_args` (parsed),
 `result`, `is_error`, `duration_ms`.
 
-### Normalized Args Schema
-
-For the `db` tool, `normalized_args` is the deterministic output of
-`Command.Normalize()` — a JSON object with stable key ordering:
-
-```json
-{
-  "verb": "query",
-  "table": "food_log",
-  "where": [
-    {"field": "meal_date", "op": "gte", "value": "2026-04-16"},
-    {"field": "calories", "op": "gt", "value": 500}
-  ],
-  "sort": [{"field": "created_at", "order": "desc"}],
-  "limit": 20
-}
-```
-
-`where` is expanded from the `__` suffix syntax to explicit `{field, op,
-value}` triples. This is the input format for future skill induction —
-patterns like "user asks about food → verb=query, table=food_log,
-where includes meal_date" can be extracted directly without re-parsing
-the raw command string.
-
-For non-db tools, `normalized_args` equals `arguments` (pass-through).
-
-### Query defaults
-
-`query` without `limit` defaults to 50 rows. Hard cap is 200 (enforced
-by the tool regardless of what the model passes). `query` without `sort`
-defaults to `created_at desc`.
+The `TraceBuilder` is created at the start of orchestration, accumulates
+usage from each orchestrator call, and is finalized with synthesizer
+stats at the end.
 
 ---
 
@@ -587,117 +432,123 @@ defaults to `created_at desc`.
 The original design used local models exclusively (Qwen 3.5 MoE on Mac
 Studio). This worked for basic queries but had fundamental limitations:
 
-- **Orchestrator quality**: local models (including Qwen 3.5 35B MoE)
-  frequently misused tools — calling skill names as tool names, using
-  wrong column names in SQL, looping the same search 20+ times, or
-  ignoring tool-only instructions entirely. The harness budgets,
-  early-abort, and retry mechanisms were all built to survive these
-  failures. With commercial models (even Haiku-class), these harness
-  mechanisms rarely fire — the model follows instructions correctly
-  on the first attempt.
+- **Orchestrator quality**: local models frequently misused tools —
+  calling skill names as tool names, using wrong column names in SQL,
+  looping the same search 20+ times. The harness budgets, early-abort,
+  and retry mechanisms were all built to survive these failures. With
+  commercial models (even Haiku-class), these mechanisms rarely fire.
 - **Synthesizer quality**: local models produced shallow, repetitive
   answers. Commercial models produce structured, insightful responses.
 - **Cost reality**: at ~50-200 queries/day for a personal assistant,
-  commercial API costs ($5-20/month) are negligible compared to the
-  electricity cost of running a Mac Studio 24/7.
+  commercial API costs ($5-20/month) are negligible.
 
 ### Multi-Backend Architecture
 
 Argus supports multiple model providers via named **upstreams**. Each
-agent role (orchestrator, synthesizer, transcription) selects
-its own upstream and model independently.
+agent role (orchestrator, synthesizer, transcription, embedding,
+summarization) selects its own upstream and model independently.
 
-```yaml
-upstreams:
-  local:    {type: openai,    base_url: "http://localhost:8000/v1", api_key: "..."}
-  openai:   {type: openai,    base_url: "https://api.openai.com/v1", api_key: "..."}
-  anthropic:{type: anthropic,  api_key: "..."}
-  gemini:   {type: gemini,     api_key: "..."}
+```toml
+[upstream.local]
+type = "openai"
+base_url = "http://localhost:8000/v1"
+api_key = "omlx"
+timeout_secs = 240
 
-model:
-  orchestrator:  {upstream: openai,    model_name: "gpt-5.4"}
-  synthesizer:   {upstream: gemini,    model_name: "gemini-2.5-flash-lite"}
-  # No fallback — errors returned to user; message stays in queue for retry
-  transcription: {upstream: local,     model_name: "whisper-large-v3"}
+[upstream.anthropic]
+type = "anthropic"
+api_key = "sk-ant-xxx"
+
+[upstream.gemini]
+type = "gemini"
+api_key = "..."
+
+[agent.orchestrator]
+upstream = "anthropic"
+model_name = "claude-haiku-4-5"
+
+[agent.synthesizer]
+upstream = "gemini"
+model_name = "gemini-2.5-flash-lite"
+max_tokens = 32768
 ```
 
-Four upstream types, all implemented with plain `net/http` (no SDKs):
+Three upstream types, all implemented with `reqwest` (no SDKs):
 
 | Type | Endpoint | Auth |
 |------|----------|------|
 | `openai` | Any OpenAI-compatible API | Bearer token |
 | `anthropic` | Anthropic Messages API | `x-api-key` header |
-| `gemini` | Google Gemini REST API | API key in URL |
+| `gemini` | Google Gemini via OpenAI-compatible endpoint | API key (in URL or bearer) |
 
-**RetryClient** wraps each role's client. On 429 (rate limit), retries
-up to 2× with 30s context-aware delay. Other errors are returned
-directly to the user — no silent quality degradation. The user's
-message stays in the DB queue and can be retried later.
+Gemini is accessed through Google's OpenAI-compatible endpoint
+(`generativelanguage.googleapis.com/v1beta/openai`), reusing the
+OpenAI client implementation.
 
 ### Recommended Configurations
 
 | Orchestrator | Synthesizer | Cost | Quality |
 |---|---|---|---|
-| GPT-5.4 | Gemini 2.5 Flash Lite | ~$15/mo | Excellent tool calling + fast synthesis |
 | Claude Haiku 4.5 | Gemini 2.5 Flash Lite | ~$5/mo | Good quality, best value |
+| GPT-5.4 | Gemini 2.5 Flash Lite | ~$15/mo | Excellent tool calling + fast synthesis |
 | Qwen 3.5 (local) | Qwen 3.5 (local) | $0 | Functional but needs all harness guardrails |
 
 ### Local Models (Transcription + Embedding)
 
 Local models serve two specialized roles:
-- **Transcription**: Whisper Large v3 via omlx
-- **Embedding**: modernbert-embed-base (768 dim) via omlx
-
-KV cache 4-bit quantization recommended for local MoE models on
-unified-memory Macs.
+- **Transcription**: Whisper Large v3 via OpenAI-compatible endpoint
+- **Embedding**: modernbert-embed-base (768 dim) via OpenAI-compatible endpoint
 
 ---
 
 ## Output Rendering
 
-All agent output is delivered as **Feishu interactive cards** (`msg_type: "interactive"`), schema 2.0 with `update_multi: true` so the same card can be PATCHed multiple times as state evolves:
+All agent output is delivered as **Feishu interactive cards** (schema 2.0
+with `update_multi: true`) so the same card can be PATCHed as state evolves:
 
-1. **Thinking card** — opened by the Frontend render loop on `SubmitMessage` pop ("💭 正在思考…")
-2. **Tool status card** — humanized per tool (e.g. `🔍 正在搜索: X`)
-3. **Composing card** — Phase 1→2 transition ("✍️ 正在撰写回复…")
-4. **Streaming reply card** — first 3 updates instant, then ~500 ms throttle
-5. **Final reply card** — full markdown + LaTeX images
+1. **Thinking card** — opened on Message receive ("💭 正在思考...")
+2. **Tool status card** — stacked lines per tool, deduped by tool name
+   (e.g. "🔍 Searching: X"). New tools append; same tool updates its line.
+3. **Composing card** — Phase 1→2 transition ("✏️ Composing answer...")
+4. **Final reply card** — full markdown with code blocks as collapsible
+   panels + LaTeX images
 
-All cards are PATCHed onto the same `reply_channel_id` created when the
-Frontend opens the thinking card. The Frontend render loop consumes
-`msg.Events` pushed by the Agent and drives the card lifecycle; closing
-`msg.Events` is the signal to close (finalize) the card.
+All cards are PATCHed onto the same card_id created when the adapter
+opens the thinking card. Dropping the `events` channel signals the
+render future to finalize.
+
+### Card Building
+
+- Code blocks (` ```lang...``` `) are extracted and rendered as Feishu
+  `collapsible_panel` elements with the language name as header
+- Non-code markdown is rendered as `markdown` elements
+- Unclosed code blocks are treated as text
 
 ### LaTeX Rendering
 
-Display LaTeX blocks (`$$…$$` or `\[…\]`) are detected in the final reply,
-rendered to PNG via the embedded **RaTeX** renderer (Rust, via CGo),
-uploaded to Feishu as images, and inline-replaced with
-`[[IMG:image_key]]` markers — which the Feishu card's markdown block
-renders as images.
+Display LaTeX blocks (`$$...$$`) and inline (`$...$`) are detected via
+regex. Display-mode blocks are rendered to PNG via **RaTeX** (pure Rust
+crate — `ratex-parser`, `ratex-layout`, `ratex-render` with embedded
+fonts), uploaded to Feishu as images, and inline-replaced with
+`![](image_key)` markers. Inline LaTeX is detected but not rendered
+to images (too small for useful image output).
 
 ---
 
 ## Skills
 
-Skills follow the [Agent Skills open standard](https://agentskills.io) (same SKILL.md format as Claude Code).
+Skills follow the SKILL.md format (same as Claude Code agent skills).
 
-### Two Types
+### Loading
 
-**Builtin skills** — compiled into the binary, platform-conditional (`//go:build unix` / `windows`). Their full prompt is always injected into the orchestrator system prompt. Example: `posix-cli` teaches the model how to use grep, find, awk, sed, jq, pipelines, and enforces rules like "NEVER use `ls -R`, ALWAYS use `find`".
-
-**User skills** — SKILL.md files in `workspace/.skills/`, authored by humans
-(not the model). Loaded at startup, background-rescanned every 30 s. Only
-name + description appear in the orchestrator's system prompt catalog; full
-prompt loaded via `activate_skill` tool on demand. The model cannot create
-or modify skills — `save_skill` has been removed from the tool registry.
-
-User skills with the same name as a builtin override it.
+Skills are loaded **once at startup** from `{workspace_dir}/skills/*/SKILL.md`.
+No hot-reload, no background rescan. The `SkillIndex` is an in-memory
+`HashMap<String, SkillEntry>` built synchronously during `Agent::new`.
 
 ### SKILL.md Format
 
 ```
-workspace/.skills/
+workspace/skills/
   calorie/
     SKILL.md
     setup.sql
@@ -720,12 +571,19 @@ tools:
 (table schema, command examples, nutrition estimation rules...)
 ```
 
+If no YAML frontmatter is present, the directory name is used as the
+skill name, and the first non-header paragraph as the description.
+
+### Catalog Injection
+
+Only skill name + description appear in the orchestrator's system
+prompt (under "## Available Skills"). The full prompt is loaded on
+demand when the orchestrator calls the `activate_skill` tool.
+
 ### Skill Lifecycle
 
 Skills are authored and maintained by humans. The model can only read
-them (via `activate_skill`), not create or modify them. Future: a
-backend skill-induction system will analyze traces to propose new
-skills, but the final authoring remains human-controlled.
+them (via `activate_skill`), not create or modify them.
 
 ---
 
@@ -733,34 +591,52 @@ skills, but the final authoring remains human-controlled.
 
 | Tool | Purpose | Budget |
 |------|---------|--------|
+| `finish_task` | Sentinel — signals orchestrator → synthesizer transition | — |
+| `current_time` | Date/time with timezone support | — |
+| `search` | Web search (Tavily API, DuckDuckGo fallback) | 3/turn |
+| `fetch` | URL → readable text (HTML stripped via `scraper` crate) | 4/turn |
 | `read_file` | Read file contents (anywhere in workspace) | — |
 | `write_file` | Write file (restricted to `.users/` directory) | 3/turn |
-| `cli` | Execute shell commands via sandbox | 5/turn |
-| `search` | Web search (Tavily API, DuckDuckGo fallback) | 3/turn |
-| `fetch` | URL → readable text | 4/turn |
-| `current_time` | Date/time with timezone support | — |
-| `activate_skill` | Load a skill's full instructions on demand | — |
-| `finish_task` | Sentinel — signals orchestrator → synthesizer transition | — |
-| `db` | Structured data access (see below) | 6/turn |
+| `cli` | Execute shell commands on host (`bash -c` or `sh -c`) | 5/turn |
 | `remember` | Pin a persistent memory (pgvector indexed) | 3/turn |
 | `forget` | Deactivate a pinned memory by ID | — |
 | `search_docs` | Semantic search over indexed document chunks | — |
 | `list_docs` | List all indexed documents in knowledge base | — |
-| `search_history` | Semantic search over conversation history | — |
+| `search_history` | Semantic search over conversation history | 2/turn |
+| `db` | Structured data access (see below) | 6/turn |
+| `activate_skill` | Load a skill's full instructions on demand | — |
 
-Removed tools: `save_skill` (skills are human-authored), `db_exec` (replaced
-by the structured `db` tool).
+### Tool Trait
+
+Every tool implements a common trait:
+
+```rust
+#[async_trait]
+trait Tool: Send + Sync {
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+    fn parameters(&self) -> serde_json::Value;  // JSON Schema
+    async fn execute(&self, ctx: &ToolContext<'_>, args: &str) -> String;
+    fn status_label(&self, args: &str) -> String;
+    fn normalize_args(&self, args: &str) -> String;
+}
+```
+
+The `ToolRegistry` holds `Vec<Box<dyn Tool + 'a>>` and is rebuilt per
+task (tools borrow `&Database`, `&EmbedService`, etc. via lifetimes,
+not `Arc`).
 
 ### Safety
 
-- `read_file`: can read anywhere in workspace. Binary files (images,
-  audio) return a description instead of raw bytes.
+- `read_file`: can read anywhere in workspace. Binary files return a
+  description instead of raw bytes.
 - `write_file`: **restricted to `.users/` directory**. The tool silently
   prepends `.users/` to any path. The model cannot overwrite skills
   (`.skills/`), media (`.files/`), or config files.
-- `cli`: execution delegated to sandbox (local or Docker with resource limits).
+- `cli`: direct host execution (`bash -c`). No sandbox abstraction —
+  runs on the host machine with no resource limits. Suitable for
+  development on a personal Mac.
 - `db`: structured CLI+JSON interface — the model never writes SQL.
-  See below.
 - Tool output truncated to 16 KB to prevent context overflow.
 - All tool calls logged with full arguments + normalized form for traces.
 
@@ -781,37 +657,46 @@ update food_log 42 {"calories": 550}
 
 7 verbs: `list`, `describe`, `create`, `query`, `count`, `insert`, `update`.
 No `delete` / `drop` / `truncate`. Data is append-only with in-place
-correction: records are never removed, but `update` can modify field
-values (e.g. correcting a calorie estimate). Every update sets
-`updated_at` automatically, providing a basic audit trail. Full audit
-history (storing every version of a row) is a future consideration.
+correction.
 
 **Namespace isolation**: the tool prepends `argus_` to all table names
 internally. The model writes `food_log`; PG sees `argus_food_log`. System
 tables (`messages`, `memories`, etc.) are unreachable because they don't
-carry the prefix. No SQL parser needed — prefix is applied at the tool
-layer before generating parameterized queries.
+carry the prefix.
 
-**Column validation**: before execution, the tool checks all referenced
-column names against `information_schema.columns`. Unknown columns trigger
-a Levenshtein fuzzy match suggestion: `"calory" → did you mean "calories"?`
+**Column validation**: all identifiers validated against regex
+`^[a-z][a-z0-9_]{0,62}$`. Auto-managed columns (`id`, `created_at`,
+`updated_at`) are rejected if specified by the model.
 
-**Query results**: returned as JSON arrays (preserving types), not
-tab-separated text. `create` is idempotent (IF NOT EXISTS + returns
-current schema). `update` only works by ID (no WHERE conditions).
+**Typed parameter casting**: before binding query parameters, the tool
+looks up each column's PostgreSQL data type via `information_schema.columns`
+and applies the correct SQL cast (`::date`, `::double precision`,
+`::boolean`, etc.). This prevents type mismatch errors that cause query
+failures with untyped string parameters.
+
+**Query results**: returned as JSON arrays with proper type preservation
+(integers, floats, booleans, dates, timestamps, JSONB all round-trip
+correctly). `create` uses `CREATE TABLE` (not IF NOT EXISTS). `update`
+only works by ID (no WHERE conditions).
 
 **Types**: `text`, `number` (DOUBLE PRECISION), `date`, `boolean`,
-`timestamp`, `json` (JSONB). Every table auto-gets `id` + `created_at` +
-`updated_at`.
+`timestamp` (TIMESTAMPTZ), `json` (JSONB). Every table auto-gets
+`id` + `created_at` + `updated_at`. Append `!` to a type for NOT NULL.
 
 **Where operators**: exact match (default), `__gt`, `__gte`, `__lt`,
-`__lte`, `__contains` (ILIKE), `__neq`.
+`__lte`, `__contains` (ILIKE), `__neq`. NULL-aware: `{"field": null}`
+generates `IS NULL`, `{"field__neq": null}` generates `IS NOT NULL`.
+
+**Batch insert**: accepts a JSON array of objects, wraps in a transaction.
+
+**Query defaults**: `query` without `limit` defaults to 50 rows. Hard
+cap is 200. `query` without `sort` defaults to `created_at DESC`.
 
 ---
 
 ## Media Storage
 
-All downloaded media is saved to `workspace/.files/`:
+All downloaded media is saved to `{workspace_dir}/.files/`:
 
 ```
 workspace/.files/
@@ -820,10 +705,9 @@ workspace/.files/
   file_v3_xxx.pdf         # Uploaded files → ingested into pgvector
 ```
 
-Files are named by their Feishu file key + original extension. This directory serves as:
-- Source for multi-turn image re-injection into context
-- Source for document RAG ingestion
-- Archive for the memory system to reference
+Files are named by their Feishu file key + original extension. Path
+traversal is blocked: file keys containing `/`, `\`, `..`, or empty
+strings are rejected.
 
 ---
 
@@ -833,47 +717,72 @@ Argus has three memory layers, all active:
 
 | Layer | Scope | Mechanism |
 |-------|-------|-----------|
-| **Sliding window** | Last `orchestrator_context_window` messages | Direct load from `messages` table; long replies replaced with summaries |
-| **Semantic recall** | All historical messages | pgvector cosine search on the current message's embedding, deduped against the window |
-| **Pinned memories** | User-curated persistent notes | `memories` table; agent uses `remember`/`forget` tools; pgvector embeds them for recall |
+| **Sliding window** | Last `orchestrator_context_window` turns | Direct load from `conversation` view; user messages paired with notification replies |
+| **Semantic recall** | All historical messages + replies | pgvector cosine search on the current message's embedding; searches both user messages and agent replies (notifications), deduped by content |
+| **Pinned memories** | User-curated persistent notes | `memories` table; agent uses `remember`/`forget` tools; pgvector-indexed for recall; injected into system prompt |
 
-### Startup Repair
+### Embedder Worker
 
-On server startup, the `RepairableStore` interface runs:
-- `RepairStuckDocuments` — mark stuck-in-processing docs as failed
-- `RepairOrphanChunks` — clean chunks pointing at missing documents
-- `CountUnembeddedMessages` — warn if embedding backlog
-- `FailedTranscriptions` — warn on persistent audio failures
+The `Embedder` runs two interval loops:
+- **Embed interval** (default 30s): batch-embeds unembedded rows from
+  `messages`, `notifications`, `chunks`, and `memories` tables. Also
+  runs the document ingestion cycle (picks up "pending" documents).
+- **Summary interval** (default 5 min): generates 2-3 sentence summaries
+  for long, unsummarized assistant replies in `notifications`. Uses the
+  synthesizer model.
+
+### Notification Summaries
+
+Long agent replies stored in `notifications` are summarized by the
+Embedder worker. The `conversation` view exposes both `reply_content`
+and `reply_summary`; the harness can use summaries to reduce context
+pollution from verbose past replies. Summary failures leave
+`summary IS NULL` — the notification stays in the unsummarized pool
+and is retried next cycle.
 
 ---
 
 ## Data Model (PostgreSQL + pgvector)
 
+After all migrations (001–007), the schema has evolved to separate user
+messages from agent replies:
+
 ```sql
--- Core conversation history
+-- User messages (inbound only; assistant/tool rows deleted in migration 006)
 CREATE TABLE messages (
-    id          BIGSERIAL PRIMARY KEY,
-    chat_id     TEXT NOT NULL,
-    role        TEXT NOT NULL,
-    content     TEXT NOT NULL,
-    tool_name   TEXT,
-    tool_call_id TEXT,
-    -- metadata
-    source_im   TEXT NOT NULL DEFAULT 'unknown',  -- feishu / cli / ...
-    channel     TEXT NOT NULL DEFAULT '',
-    source_ts   TIMESTAMPTZ,
-    msg_type    TEXT NOT NULL DEFAULT 'text',     -- text / image / audio / file
-    file_paths  TEXT[],
-    sender_id   TEXT,
-    embedding   vector(768),                      -- nullable; async-filled
-    summary     TEXT,                             -- nullable; async-generated for long assistant replies
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    -- Pipeline state (user messages only; NULL for assistant/tool msgs)
-    content_status   TEXT,                        -- raw/downloaded/processed
-    reply_status     TEXT,                        -- received/processing/done
-    reply_channel_id TEXT,                        -- IM-abstract card handle (audit placeholder, not actively persisted)
-    trigger_msg_id   TEXT                         -- IM trigger message ID (reply thread root)
+    id              BIGSERIAL PRIMARY KEY,
+    channel         TEXT NOT NULL DEFAULT '',   -- "feishu:p2p:ou_xxx" or "feishu:group:oc_xxx"
+    content         TEXT NOT NULL,              -- raw content (JSON for non-text types)
+    msg_type        TEXT NOT NULL DEFAULT 'text',
+    file_paths      TEXT[],
+    sender_id       TEXT,
+    source_ts       TIMESTAMPTZ,
+    trigger_msg_id  TEXT,                       -- IM message ID (for reply threading)
+    embedding       vector(768),                -- async-filled by Embedder
+    ready           BOOLEAN NOT NULL DEFAULT FALSE,  -- media processing complete
+    reply_id        BIGINT REFERENCES notifications(id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Agent replies (split from messages in migration 006)
+CREATE TABLE notifications (
+    id          BIGSERIAL PRIMARY KEY,
+    message_id  BIGINT REFERENCES messages(id),
+    content     TEXT NOT NULL,
+    embedding   vector(768),
+    summary     TEXT,                           -- async-generated by Embedder
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Conversation view: joins ready messages with their replies
+CREATE VIEW conversation AS
+SELECT m.id, m.channel, m.content AS user_content,
+       m.embedding AS user_embedding, m.created_at AS user_ts,
+       n.content AS reply_content, n.summary AS reply_summary,
+       n.created_at AS reply_ts
+FROM messages m
+LEFT JOIN notifications n ON n.id = m.reply_id
+WHERE m.ready = TRUE;
 
 -- Agent-curated persistent memories
 CREATE TABLE memories (
@@ -892,7 +801,7 @@ CREATE TABLE documents (
     filename   TEXT NOT NULL,
     file_path  TEXT NOT NULL,
     channel    TEXT,
-    status     TEXT NOT NULL DEFAULT 'pending',  -- pending / processing / done / failed
+    status     TEXT NOT NULL DEFAULT 'pending',  -- pending / processing / ready / error
     error_msg  TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -905,223 +814,215 @@ CREATE TABLE chunks (
     embedding   vector(768),
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Request tracing
+CREATE TABLE traces (
+    id                       BIGSERIAL PRIMARY KEY,
+    message_id               BIGINT NOT NULL,
+    reply_id                 BIGINT,
+    chat_id                  TEXT NOT NULL,
+    orchestrator_model       TEXT NOT NULL DEFAULT '',
+    synthesizer_model        TEXT NOT NULL DEFAULT '',
+    iterations               INT NOT NULL DEFAULT 0,
+    summary                  TEXT,
+    total_prompt_tokens      INT NOT NULL DEFAULT 0,
+    total_completion_tokens  INT NOT NULL DEFAULT 0,
+    synth_prompt_tokens      INT NOT NULL DEFAULT 0,
+    synth_completion_tokens  INT NOT NULL DEFAULT 0,
+    duration_ms              INT,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE tool_calls (
+    id              BIGSERIAL PRIMARY KEY,
+    trace_id        BIGINT NOT NULL REFERENCES traces(id) ON DELETE CASCADE,
+    iteration       INT NOT NULL,
+    seq             INT NOT NULL DEFAULT 0,
+    tool_name       TEXT NOT NULL,
+    arguments       TEXT NOT NULL DEFAULT '',
+    normalized_args TEXT NOT NULL DEFAULT '',
+    result          TEXT,
+    is_error        BOOLEAN NOT NULL DEFAULT FALSE,
+    duration_ms     INT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 ```
 
-IVFFlat cosine indexes on all three embedding columns. Agent-created
-business tables (e.g. `argus_food_log`) live alongside these and are
-created via the structured `db` tool's `create` verb. The `argus_` prefix
-is applied transparently by the tool layer.
+IVFFlat cosine indexes on all embedding columns. Agent-created business
+tables (e.g. `argus_food_log`) live alongside these and are created via
+the `db` tool's `create` verb. The `argus_` prefix is applied transparently
+by the tool layer.
+
+### Database Sub-objects
+
+The `Database` struct groups operations by feature, each holding a clone
+of the underlying `PgPool` (zero-cost, `PgPool` is internally `Arc`):
+
+```rust
+pub(crate) struct Database {
+    pub(crate) messages: Messages,
+    pub(crate) notifications: Notifications,
+    pub(crate) conversation: Conversation,
+    pub(crate) documents: Documents,
+    pub(crate) memories: Memories,
+    pub(crate) traces: Traces,
+}
+```
 
 ### Write Safety (Idempotent Async Updates)
 
-The database is the single source of truth. Background workers (embedding,
-summarization) and the ingester all write asynchronously, which creates
-potential for concurrent updates on the same row. All async UPDATE
-statements include a precondition WHERE clause to prevent overwrite and
-ensure idempotency:
+Background workers (embedding, summarization) write asynchronously.
+All async UPDATE statements use precondition WHERE clauses:
 
-| Operation | Precondition | Reason |
-|-----------|-------------|--------|
-| `SetMessageEmbedding` | `WHERE embedding IS NULL` | Two worker cycles may pick up the same message; second write is a no-op |
-| `SetMessageSummary` | `WHERE summary IS NULL` | Same — prevents re-summarization if worker restarts mid-batch |
-| `SetMemoryEmbedding` | `WHERE embedding IS NULL` | Consistent with message embedding |
-| `SetChunkEmbedding` | `WHERE embedding IS NULL` | Consistent with message embedding |
-| `UpdateDocumentStatus` | `WHERE status = ANY(valid_from_states)` + `RowsAffected` check | Enforces state machine: `pending→processing→ready\|error`, `processing→pending` (repair). Returns explicit error on stale transition (0 rows affected) so the ingester can abort early instead of producing orphan chunks |
+| Operation | Precondition |
+|-----------|-------------|
+| `set_embedding` (messages, notifications, memories, chunks) | `WHERE embedding IS NULL` |
+| `set_summary` (notifications) | `WHERE summary IS NULL` |
+| `update_status` (documents) | State machine enforcement via valid_from_states |
 
-`UpdateDocumentStatus` returns an error when `RowsAffected == 0` (stale
-transition). The ingester checks this at every status change:
-`pending→processing` failure aborts the entire document; `processing→error`
-and `processing→ready` failures are logged as warnings.
-
-Summary generation failures leave `summary IS NULL` — the message stays
-in the unsummarized pool and is retried next worker cycle. No error
-sentinel is written, so `curateHistory` always falls back to 800-rune
-truncation for messages that haven't been summarized yet.
-
-Database is optional — server mode falls back to memory store if PostgreSQL is unavailable, though semantic recall, pinned memories, and document RAG are disabled in that mode.
-
-`docker-compose.yaml` provided for one-command PostgreSQL+pgvector setup: `make up`.
+Database is **required** — no fallback to in-memory store. PostgreSQL with
+pgvector must be running. `docker-compose.yaml` provided for one-command
+setup.
 
 ---
 
 ## Configuration
 
-Single config file at `<workspace>/config.yaml`. CLI flag: `--workspace <dir>`.
+Single TOML config file. CLI flag: `--config <path>` (default
+`~/.config/argus/argus.toml`). Workspace directory is configured in the
+file (default `~/.local/share/argus`).
 
-```yaml
-server:
-  port: "8088"
+```toml
+workspace_dir = "/data/argus"
 
-feishu:
-  app_id: ""
-  app_secret: ""
-  verification_token: ""
-  encrypt_key: ""
+[gateway.feishu]
+app_id = ""
+app_secret = ""
+# base_url = "https://open.feishu.cn"  # default; use Lark URL for international
 
-# Named upstream providers. Supported types: openai, anthropic, gemini.
-upstreams:
-  local:
-    type: openai
-    base_url: "http://localhost:8000/v1"
-    api_key: "omlx"
-    timeout: 240s
-  openai:
-    type: openai
-    base_url: "https://api.openai.com/v1"
-    api_key: ""
-    timeout: 120s
-  anthropic:
-    type: anthropic
-    api_key: ""
-    timeout: 120s
-  gemini:
-    type: gemini
-    api_key: ""
-    timeout: 120s
+[gateway.feishu.transcription]
+upstream = "local"
+model_name = "whisper-large-v3"
 
-# Each agent role selects its own upstream + model.
-# No fallback — if the API fails, the user is notified.
-model:
-  orchestrator:
-    upstream: anthropic
-    model_name: "claude-haiku-4-5"
-    max_tokens: 4096
-  synthesizer:
-    upstream: gemini
-    model_name: "gemini-2.5-flash-lite"
-    max_tokens: 32768
-  transcription:
-    upstream: local
-    model_name: "whisper-large-v3"
+[upstream.local]
+type = "openai"
+base_url = "http://localhost:8000/v1"
+api_key = "omlx"
+timeout_secs = 240
 
-database:
-  dsn: "postgres://argus:argus@localhost:5432/argus?sslmode=disable"
+[upstream.anthropic]
+type = "anthropic"
+api_key = ""
+# timeout_secs = 120  # default
 
-agent:
-  max_iterations: 10
-  orchestrator_context_window: 10     # orchestrator history window
-  skill_rescan: 30s
+[upstream.gemini]
+type = "gemini"
+api_key = ""
 
-search:
-  tavily_api_key: ""  # optional, falls back to DuckDuckGo
-  include_answer: true
-  max_results: 5
+[agent]
+max_iterations = 10
+orchestrator_context_window = 10
+tavily_api_key = ""
 
-embedding:
-  enabled: true
-  upstream: local                     # uses its own upstream
-  model_name: "modernbert-embed-base"
-  batch_size: 32
-  interval: 2s
+[agent.orchestrator]
+upstream = "anthropic"
+model_name = "claude-haiku-4-5"
+max_tokens = 4096
 
-sandbox:
-  type: local             # "local" for dev, "docker" for production
-  image: argus-sandbox
-  timeout: 30s
-  memory_limit: "512m"    # docker only
-  network: "none"         # docker only
+[agent.synthesizer]
+upstream = "gemini"
+model_name = "gemini-2.5-flash-lite"
+max_tokens = 32768
+
+[database]
+dsn = "postgres://argus:argus@localhost:5432/argus?sslmode=disable"
+
+[embedder]
+upstream = "local"
+model_name = "modernbert-embed-base"
+batch_size = 32
+interval_secs = 30
+summary_interval_ticks = 10  # summarize every 10 × interval_secs = 300s
+
+[embedder.summarizer]
+upstream = "gemini"
+model_name = "gemini-2.5-flash-lite"
 ```
-
-The legacy single-model format (`model.base_url`, `model.model_name`, etc.)
-is still accepted via migration in `config.Load()` for backward compatibility,
-but new deployments should use the `upstreams` + per-role `model` structure.
 
 ---
 
 ## Project Structure
 
 ```
-cmd/argus/main.go            Entry point, --workspace flag (default ~/.argus)
-internal/
+Cargo.toml                   Workspace: root crate + feishu crate
+feishu/                      Feishu SDK (workspace member)
+  src/
+    lib.rs                   Re-exports: Client, api, types, ws
+    client.rs                Unified client: WS connect + REST API
+    auth.rs                  Tenant access token (Mutex + Notify pattern)
+    api.rs                   REST API: reply, update, upload image, download
+    ws.rs                    WebSocket event stream + PBBP2 frame decoder
+    pbbp2.rs                 Feishu binary protocol (protobuf)
+    types.rs                 FeishuEvent, Error, API types
+src/
+  main.rs                    Entry point, --config flag, tokio::join! four services
+  config.rs                  TOML config + tilde expansion + path resolution
   agent/
-    agent.go                 Interface: SubmitTask + Run; Task/Payload/Message
-                             types. Two-phase orchestrator + streaming synthesizer.
-    scheduler.go             Per-chat MPSC channel, sync.Map chat registry,
-                             graceful shutdown (drain current in-hand task)
-    task_store.go            reply_status state transitions (processing → done)
-                             wrapping messages table semantics
-    harness.go               Context curation: history + two prompt builders
-    prompts.go               OrchestratorPrompt + SynthesizerPrompt constants
-    event.go                 Event types: Thinking, ToolCall, ToolResult,
-                             ReplyDelta, Reply, Error
-  frontend/
-    frontend.go              Frontend interface (SubmitMessage / Run /
-                             StopInbound); Registry indexed by source_im
-  replay/
-    replay.go                Startup replay subsystem: scan messages
-                             WHERE reply_status != done; route by
-                             source_im → Registry → construct Task →
-                             agent.SubmitTask
-  config/config.go           YAML config + env overrides
-  docindex/ingest.go         Document RAG ingester (chunk + embed)
-  embedding/
-    client.go                Embedding HTTP client (OpenAI-compatible)
-    worker.go                Async worker: embed unembedded messages/memories/chunks
-  feishu/                    Frontend implementation for Feishu
-    frontend.go              Implements frontend.Frontend; owns inbound +
-                             outbound mpsc loops, per-chat render serialization
-    handler.go               HTTP webhook handler: parse → inbound channel
-    inbound.go               Inbound loop: INSERT raw → construct Task →
-                             SubmitTask → spawn media goroutines
-    media.go                 Download (protected) + process (replayable):
-                             Whisper transcription, LLM correction, post extract
-    render.go                Render loop: open card → consume msg.Events →
-                             patch card → close card
-    client.go                Feishu API: reply, send, upload image, download
-    card.go                  Interactive card builders + per-tool humanizer
-    event.go                 Event type definitions
-    dedup.go                 Event ID deduplication
-  model/
-    model.go                 Client interface (Chat, ChatStream,
-                             ChatWithEarlyAbort, Transcribe)
-    openai.go                OpenAI-compatible (local + api.openai.com)
-    anthropic.go             Anthropic Messages API (Claude)
-    gemini.go                Google Gemini REST API
-    fallback.go              RetryClient wrapper (429 retry, no fallback)
-    factory.go               NewClientFromConfig / NewClientsForAgent
-    types.go                 Message, ToolCall, Response, Usage
-  render/
-    renderer.go              Processor: markdown → LaTeX images → markers
-    latex.go                 LaTeX detection + RaTeX PNG rendering
-  sandbox/
-    sandbox.go               Sandbox interface: Exec(ctx, command, workDir)
-    local.go                 Host execution (bash -c)
-    docker.go                Container execution (docker run)
-  # sqlsandbox/ — removed (replaced by structured db tool)
-  skill/
-    index.go                 SkillIndex: thread-safe catalog + prompt lookup
-    loader.go                FileLoader: load builtins + rescan .skills/
-    builtin.go               Builtin dispatcher
-    builtin_unix.go          POSIX CLI skill (grep/find/awk/sed/jq)
-    builtin_windows.go       PowerShell CLI skill
-  store/
-    store.go                 Interface + sub-interfaces (Semantic, Pinned,
-                             Document, QueueStore)
-    postgres.go              PostgreSQL + pgvector + QueueStore + migrations
-    memory.go                In-memory store (CLI / no-DB mode)
-    repair.go                Startup repair helpers
-    migrations/
-      001_init.sql           messages table
-      002_memory_system.sql  pgvector + memories + documents + chunks
-      003_message_queue.sql  reply_status + reply_channel_id + trigger_msg_id
-      005_message_summary.sql summary column for async assistant reply summarization
-  tool/
-    tool.go                  Tool interface + ToolDef conversion
-    registry.go              Registry with name lookup
-    file.go                  read_file (workspace) + write_file (.users/ only)
-    cli.go                   Shell commands (delegates to sandbox)
-    search.go                Web search (Tavily + DuckDuckGo fallback)
-    fetch.go                 URL fetcher with HTML-to-text conversion
-    current_time.go          Date/time with timezone support
-    db_structured.go         Structured db tool (single CLI+JSON interface)
-    db_command.go            Parser, executor, validator, normalizer
-    activate_skill.go        Load skill prompt on demand
-    remember.go / forget.go  Pinned memory management
-    search_docs.go           Document search + list tools (knowledge base)
-    search_history.go        Conversation history semantic search
-    finish_task.go           Sentinel tool (orchestrator exit signal)
-    context.go               ChatID context key for tools
-third_party/ratex/           Embedded Rust LaTeX renderer (CGo)
+    mod.rs                   Task/Message/Event types, Agent struct, process_task,
+                             run_orchestrator (tool loop), run_synthesizer (streaming),
+                             prompts, tool budgets
+    harness.rs               Context curation: semantic recall + sliding window +
+                             pinned memories
+    skill.rs                 SkillIndex: load SKILL.md files at startup, catalog
+    tool/
+      mod.rs                 Tool trait, ToolRegistry, build_registry
+      finish_task.rs         Sentinel tool (orchestrator exit signal)
+      current_time.rs        Date/time with timezone
+      search.rs              Web search (Tavily + DuckDuckGo fallback)
+      fetch.rs               URL → readable text (HTML stripped via scraper)
+      read_file.rs           Read file (workspace)
+      write_file.rs          Write file (.users/ only)
+      cli.rs                 Shell commands (host execution)
+      db.rs                  Structured DB tool (7 verbs, typed casts)
+      remember.rs            Pin a memory
+      forget.rs              Deactivate a memory
+      search_docs.rs         Semantic search over document chunks
+      list_docs.rs           List indexed documents
+      search_history.rs      Conversation history semantic search
+      skill.rs               activate_skill tool
+  gateway/
+    mod.rs                   Gateway struct, Im trait, recovery routing
+    feishu.rs                Feishu adapter: WS inbound, media processing,
+                             card rendering, recovery handler
+    transcribe.rs            Whisper transcription client (OpenAI-compatible)
+  upstream/
+    mod.rs                   Upstream registry, client_for factory
+    types.rs                 Client trait, Message, ToolCall, Response,
+                             StreamChunk, ChunkStream, errors (thiserror)
+    openai.rs                OpenAI-compatible client (also used for Gemini)
+    anthropic.rs             Anthropic Messages API client
+  database/
+    mod.rs                   Database struct, migration runner, sub-objects
+    messages.rs              Messages table operations
+    notifications.rs         Notifications table (agent replies)
+    conversation.rs          Conversation view queries (recall + recent)
+    documents.rs             Documents + chunks tables
+    memories.rs              Memories table
+    traces.rs                Traces + tool_calls tables, TraceBuilder
+  embedder/
+    mod.rs                   Embedder service: embed/summarize/ingest cycles
+    client.rs                Embedding HTTP client (OpenAI-compatible)
+    docindex.rs              Document ingestion: extract → chunk → save
+  render.rs                  LaTeX detection + RaTeX rendering + Feishu card building
+  recovery.rs                Recovery service: scan unreplied + replay
+migrations/
+  001_init.sql               messages table
+  002_memory_system.sql      pgvector + memories + documents + chunks
+  003_message_queue.sql      reply_status + trigger_msg_id
+  004_traces.sql             traces + tool_calls tables
+  005_message_summary.sql    summary column for assistant replies
+  006_reply_content.sql      Split messages → messages + notifications
+  007_conversation_view.sql  conversation view
 ```
 
 ---
@@ -1130,54 +1031,84 @@ third_party/ratex/           Embedded Rust LaTeX renderer (CGo)
 
 | Component | Choice |
 |-----------|--------|
-| Language | Go |
-| IM | Feishu Bot API (text, image, audio, file, rich text, interactive cards) |
-| Chat Model | Multi-backend: OpenAI (GPT-5.4), Anthropic (Claude), Gemini |
-| Transcription | Whisper Large v3 via `/v1/audio/transcriptions` |
-| Embedding | modernbert-embed-base (768 dim) via `/v1/embeddings` |
-| Database | PostgreSQL + pgvector (optional, memory store fallback) |
-| Sandbox | Local (dev) / Docker (prod) |
+| Language | Rust (edition 2024) |
+| Async runtime | Tokio |
+| IM | Feishu WebSocket (not webhook) + REST API |
+| Feishu SDK | Workspace member crate (`feishu/`): WS via `tokio-tungstenite`, PBBP2 via `prost` |
+| Chat Model | Multi-backend: OpenAI, Anthropic (native), Gemini (OpenAI-compatible) |
+| Transcription | Whisper Large v3 via OpenAI-compatible `/v1/audio/transcriptions` |
+| Embedding | modernbert-embed-base (768 dim) via OpenAI-compatible `/v1/embeddings` |
+| Database | PostgreSQL + pgvector (required) |
+| SQL | sqlx (compile-time-safe queries, PgPool) |
+| HTTP | reqwest + reqwest-eventsource (SSE streaming) |
 | Web Search | Tavily API (DuckDuckGo fallback when no API key) |
-| LaTeX | RaTeX (Rust, CGo-embedded) → PNG → Feishu image |
+| HTML parsing | scraper crate |
+| LaTeX | RaTeX (pure Rust crate, embedded fonts) → PNG |
 | Output Format | Feishu interactive cards (schema 2.0, update_multi) |
-| Streaming | SSE from model → burst first 3 tokens + throttled 500ms |
-| Skills | SKILL.md files (Agent Skills standard) + compiled builtins |
-| Deployment | Single binary, `--workspace` flag, `docker-compose.yaml` for PostgreSQL |
+| Streaming | SSE from model → Event::Reply → card update |
+| Skills | SKILL.md files loaded at startup, activate_skill tool on demand |
+| Config | TOML (via `toml` crate) |
+| CLI | clap (derive) |
+| Errors | thiserror (structured, per-module error enums) |
+| Auth | Mutex + Notify lock-free-during-HTTP pattern (not RwLock) |
+| Deployment | Single binary, `--config` flag, `docker-compose.yaml` for PostgreSQL |
 
 ---
 
 ## Deployment Constraints
 
-- **Single instance only.** Per-chat serialization (inside Agent
-  scheduler and Frontend render loop) relies on in-memory `sync.Map`
-  + goroutine-per-chat. ReadyCh coordination between Frontend media
-  goroutines and Agent task execution assumes a single server process.
-  To support horizontal scaling, the "one consumer per chat" guarantee
-  at both layers would need to be promoted to DB advisory locks or
-  leases, and the ReadyCh channel replaced with a DB-poll or pub/sub
-  mechanism that can cross process boundaries.
+- **Single instance only.** Task ordering relies on a single mpsc
+  channel inside the Agent. The `FuturesUnordered` pool in the Feishu
+  adapter assumes a single event loop. To support horizontal scaling,
+  the task queue would need to move to a database-backed mechanism
+  (e.g. `SKIP LOCKED`) and the WS connection would need leader election.
 
-- **Webhook security.** The Handler currently parses the Feishu webhook
-  envelope and deduplicates by event ID, but does not verify the
-  `verification_token` or decrypt `encrypt_key`. Suitable for trusted
-  networks / development. Before exposing to the public internet,
-  signature verification must be implemented as a blocking requirement.
+- **Host execution.** The `cli` tool runs commands directly on the host
+  via `bash -c` or `sh -c`. No sandbox abstraction, no Docker isolation,
+  no resource limits. Suitable for a trusted personal machine.
+
+- **WebSocket, not webhook.** Feishu events arrive via a persistent
+  WebSocket connection (Feishu's newer protocol), not via HTTP webhook
+  callbacks. This eliminates the need for a public HTTP endpoint but
+  requires reconnection handling (implemented with automatic retry
+  and 5s backoff on transient failures, fatal error detection on
+  auth failures).
 
 ---
 
 ## Future Work
 
-- **Group Silent Listening.** DESIGN.md lists this as an interaction mode
-  but it is not implemented — group messages without @mention are silently
-  dropped. Future implementation needs to decide: should silent messages
-  enter the same timeline? Be embedded for semantic recall? How to handle
-  privacy / group-chat permission boundaries?
+- **Per-chat FIFO within Agent.** Currently uses a single global task
+  queue (sequential processing). The original Go version had per-chat
+  MPSC channels via `sync.Map.LoadOrStore` for cross-chat parallelism.
+  This would need per-chat `select!` loops or a `FuturesUnordered` pool
+  inside the Agent scheduler.
 
-- ~~**Document RAG retrieval.**~~ Implemented: `search_docs` + `list_docs`
-  tools for active retrieval, plus passive chunk recall in `curateHistory`.
+- **Cron / scheduled tasks.** Not implemented. The Go version had plans
+  for cron-driven async tasks.
 
-- ~~**Multi-modal image re-injection.**~~ Implemented: `StoredMessage.FilePaths`
-  populated by `ProcessMedia`, `curateHistory` re-injects from that field.
+- **Sandbox abstraction.** The Go version supported local and Docker
+  sandboxes. The Rust version runs CLI tools directly on the host.
+  Re-introduce sandbox abstraction if production deployment requires
+  isolation.
+
+- **Group Silent Listening.** Listed as an interaction mode but not
+  implemented. Group messages without @mention are silently dropped.
+
+- **Vision (multimodal image understanding).** Images are downloaded and
+  file_paths saved, but base64 encoding and injection into model context
+  as multimodal content parts is not yet implemented. The `ContentPart`
+  enum and `parts` field on `Message` exist in the type system but are
+  not populated.
+
+- **Skill hot-reload.** Skills are loaded once at startup. The Go version
+  rescanned every 30s. Adding a file watcher or periodic rescan would
+  restore hot-reload capability.
+
+- **Assistant reply summarization in context.** The Embedder generates
+  summaries, but `build_context` does not yet substitute long replies
+  with their summaries. The `conversation` view exposes `reply_summary`
+  for this purpose.
 
 ---
 
@@ -1192,79 +1123,30 @@ practice, local models at the 30B parameter range lack the instruction-
 following capability needed for reliable agent orchestration. Trace
 analysis showed: Qwen confused skill names with tool names, hallucinated
 column names in SQL, looped identical searches, and ignored system-level
-constraints. Even with all harness guardrails (budgets, early-abort,
-retry, prompt engineering), the failure rate was too high for daily use.
-Switching to commercial APIs (even the cheapest tier — Claude Haiku)
-eliminated these issues immediately. Local models are retained as
-fallback and for transcription/embedding where they perform well.
+constraints. Even with all harness guardrails, the failure rate was too
+high for daily use. Commercial APIs (even the cheapest tier) eliminated
+these issues immediately.
 
-**Raw SQL tools (db / db\_exec).** The original design exposed raw SQL to
-the model via `db` (read-only) and `db_exec` (write) tools, with an
-AST-based `sqlsandbox` rewriter (libpg_query) to enforce table-name
-prefixing. This was abandoned for three reasons:
-
-1. *Model unreliability.* Local LLMs (Gemma 4, Qwen 3.5) consistently
-   used wrong column names (`date` vs `meal_date`), invented SQL
-   syntax, and looped on failed queries with trivial variations. The
-   schema-hint-on-error mechanism mitigated but didn't solve this.
-2. *Security surface.* Even with AST rewriting, SQL identifiers (table
-   names, column names) were spliced into queries. The rewriter handled
-   known patterns (RangeVar, IndexStmt, DropStmt) but the attack
-   surface was large — every new SQL feature required new AST handlers.
-3. *Trace opacity.* Raw SQL strings are hard to analyze programmatically.
-   Building a skill-induction system on top of SQL traces would require
-   another SQL parser, re-introducing the same complexity we wanted to
-   avoid.
-
-Replaced with a single structured `db` tool (CLI+JSON syntax, 7 verbs).
-The model describes intent (`query food_log where {"meal_date": "..."}`);
-the tool generates parameterized SQL internally. Identifiers are validated
-against a strict regex + double-quoted in SQL. The `sqlsandbox` package
-and `pg_query_go` dependency were deleted entirely.
+**Raw SQL tools.** The original design exposed raw SQL to the model via
+`db` (read-only) and `db_exec` (write) tools with AST-based rewriting.
+Abandoned because: (1) local LLMs consistently used wrong column names
+and invented SQL syntax; (2) the security surface of SQL rewriting was
+large; (3) raw SQL traces are hard to analyze programmatically. Replaced
+with a single structured `db` tool (CLI+JSON syntax, 7 verbs).
 
 **Semantic recall query rewriting.** A lightweight LLM call could rewrite
-pronoun-heavy queries ("那个文件", "它") into self-contained search terms
-before the pgvector lookup. Rejected because each rewrite adds a full
-model round-trip (5-10s on local MoE) to every message — the latency cost
-exceeds the retrieval quality gain. The sliding window of recent messages
-already provides pronoun context for most practical cases. Revisit if a
-sub-100ms rewrite model becomes available locally.
+pronoun-heavy queries into self-contained search terms before pgvector
+lookup. Rejected because each rewrite adds a full model round-trip to
+every message. The sliding window provides pronoun context for most cases.
 
-**Full assistant replies in orchestrator context (removed).** The original
-design passed raw conversation history — including full-length assistant
-replies — to both orchestrator and synthesizer. A production bug exposed
-the flaw: the user sent a short voice message about Mozart (msg 381), but
-the orchestrator's 10-message sliding window contained a previous 3000+
-character reply about AI video storyboard tools (msg 376). GPT-5.4's
-attention was dominated by the voluminous old topic and it ran 4 search
-iterations about AI video tools, completely ignoring the current message.
-The trace confirmed semantic recall was not at fault — the pollution came
-entirely from the sliding window's unabridged assistant replies.
-
-The fix has three parts: (1) long assistant replies (>800 runes) in history
-are replaced with async-generated summaries (background worker, synthesizer
-model), or truncated as fallback; (2) a `search_history` tool lets the
-orchestrator retrieve full original text on demand; (3) the synthesizer
-receives no conversation history at all — only the user's current message
-and materials gathered by Phase 1. This treats past replies like uploaded
-documents: summaries in context, full text retrievable on demand.
+**Full assistant replies in orchestrator context.** Past long agent replies
+in the sliding window dominated orchestrator attention. The notification
+summary system (Embedder worker) addresses this — once `build_context`
+is updated to use summaries from the conversation view.
 
 **Tool output dynamic summarization.** Instead of byte-truncating tool
-results at 16 KB, run a small model to summarize long outputs (web pages,
-large query results). Rejected for the same latency reason: an extra LLM
-call per tool result would add 5-10s per orchestrator iteration. The
-current truncation + schema-hint-on-error approach handles the common
-cases (wrong column name, empty result) without an extra model call.
-The 16 KB limit is large enough for most structured data; for web pages,
-the `fetch` tool already strips HTML to readable text before truncation.
-
-**Media download breakpoint resume.** Feishu media files are typically
-small (audio: 3-30 KB opus, images: 50-200 KB PNG). Download completes
-in under a second even on slow connections. Implementing HTTP range
-requests, partial-download state tracking, and resume logic would add
-significant complexity for negligible benefit. If Argus later supports
-an IM that transfers large files (video, multi-MB documents), this
-decision should be revisited.
+results at 16 KB, run a small model to summarize. Rejected for latency:
+an extra LLM call per tool result adds 5-10s per iteration.
 
 ---
 
@@ -1275,32 +1157,30 @@ decision should be revisited.
 - **Trust no single model output** — harness enforces hard safety limits,
   not prompts
 - Two narrow roles beat one wide role (Orchestrator + Synthesizer)
-- Tool calls and execution are orthogonal (tool layer × sandbox layer)
-- **Three layers, strict import direction** — Frontend → Agent → Backend.
-  Agent does not know which Frontend a task came from; Task carries its
-  own Frontend reference. Layers communicate through value types
-  (Task / Message / Event / Payload), not service registries
+- **Ref-based async, not Arc/spawn** — all services borrow shared state
+  via `&self` and run cooperatively in `tokio::join!`; no `Arc`, no
+  `tokio::spawn`, no shared-nothing concurrency
+- **Three layers, strict import direction** — Gateway → Agent → Upstream.
+  Agent does not know which Gateway a task came from; Task carries its
+  own `mpsc::Sender<Message>` port. Layers communicate through value
+  types (Task / Message / Event / Payload), not service registries
 - **Protect IM bytes, replay everything else** — the shutdown path
-  guarantees webhook bytes + downloaded media land on disk. Transcription,
-  extraction, agent execution, card rendering are all re-playable
-- **Finish the task currently in hand** at shutdown — Agent is slower
-  than Frontend, so the in-flight task is almost always the user's
-  visible thinking card. Completing it preserves UX; dropped queue
-  items are recovered by replay
-- **Single active card per chat is a Frontend concern** — the Agent
-  may be concurrent across chats; rendering serialization is implemented
-  in the Frontend's per-chat render loop because the IM UX requires it
+  guarantees media bytes land on disk. Content processing, agent
+  execution, card rendering are all replayable via Recovery
 - **Store first, process later** — persist the message before any
   processing or acknowledgment. Crash at any point = no data loss
-- **Async tasks are internal** — `SubmitTask` accepts only synchronous,
-  IM-originated tasks. Cron-driven, self-introspection, and subagent
-  tasks are produced inside the Agent and never traverse the external
-  interface; this keeps the surface minimal and future-proof
-- Builtin skills compiled in with platform build tags; user skills are files
+- **Single task queue, sequential processing** — simplicity over
+  cross-chat parallelism. Per-chat FIFO is a documented future
+  enhancement, not a missing feature
+- **High cohesion, low coupling** — each module owns its internal logic.
+  Callers pass config sections, not pre-built internals. Internal types
+  use `pub(crate)` or `pub(super)`, not `pub`. Trait objects at module
+  boundaries, concrete types inside
 - Skills grow organically through use, not through code changes
 - All media saved to workspace for memory system reference
 - **Use the best model for each role** — commercial APIs for orchestrator
   (tool calling quality) and synthesizer (answer quality); local models
-  for fallback, transcription, and embedding. The harness guardrails
-  (budgets, early-abort, retry) remain as safety nets but should rarely
-  fire with capable models
+  for transcription and embedding
+- **Structured errors, no panics** — every module defines its own error
+  enum via `thiserror`. No `unwrap()` on fallible operations, no `anyhow`.
+  Error variants are exhaustive and machine-readable
