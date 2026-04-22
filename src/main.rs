@@ -63,7 +63,13 @@ async fn main() -> Result<(), AppError> {
     let upstream = Upstream::new(&config.upstream);
     let embedder = Embedder::new(&config.embedder, &upstream, &db)?;
     let agent = Agent::new(&config.agent, &upstream, &db, &embedder)?;
-    let gateway = Gateway::new(&config.gateway, agent.port(), &db, &config.workspace_dir);
+    let gateway = Gateway::new(
+        &config.gateway,
+        agent.port(),
+        &upstream,
+        &db,
+        &config.workspace_dir,
+    );
 
     let cancel = CancellationToken::new();
 

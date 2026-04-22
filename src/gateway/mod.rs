@@ -1,4 +1,5 @@
 mod feishu;
+mod transcribe;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -9,6 +10,7 @@ use tracing::{info, warn};
 use crate::agent::Task;
 use crate::config::GatewayImConfig;
 use crate::database::Database;
+use crate::upstream::Upstream;
 
 /// An IM adapter: long-running event loop.
 #[async_trait::async_trait]
@@ -25,6 +27,7 @@ impl<'a> Gateway<'a> {
     pub(crate) fn new(
         configs: &HashMap<String, GatewayImConfig>,
         port: mpsc::Sender<Task>,
+        upstream_reg: &Upstream,
         db: &'a Database,
         workspace_dir: &Path,
     ) -> Self {
@@ -37,7 +40,30 @@ impl<'a> Gateway<'a> {
                         warn!(im = name, "skipping: empty app_id or app_secret");
                         continue;
                     }
-                    let f = feishu::Feishu::new(port.clone(), db, cfg, workspace_dir);
+                    // Build transcription client if configured.
+                    let transcriber = if !cfg.transcription.upstream.is_empty() {
+                        match upstream_reg.get_config(&cfg.transcription.upstream) {
+                            Some(up_cfg) => {
+                                let base_url = up_cfg.effective_base_url();
+                                Some(transcribe::TranscribeClient::new(
+                                    base_url,
+                                    &up_cfg.api_key,
+                                    &cfg.transcription.model_name,
+                                ))
+                            }
+                            None => {
+                                warn!(
+                                    upstream = cfg.transcription.upstream,
+                                    "transcription upstream not found, skipping"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    let f = feishu::Feishu::new(port.clone(), db, cfg, workspace_dir, transcriber);
                     info!(im = name, "IM adapter created");
                     ims.push((name.clone(), Box::new(f)));
                 }

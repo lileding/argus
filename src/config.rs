@@ -91,6 +91,9 @@ pub(crate) struct GatewayImConfig {
     pub(crate) app_secret: String,
     #[serde(default = "default_feishu_base_url")]
     pub(crate) base_url: String,
+    /// Transcription model config (e.g. Whisper via OpenAI-compatible API).
+    #[serde(default)]
+    pub(crate) transcription: RoleConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -104,9 +107,6 @@ pub(crate) struct AgentConfig {
     pub(crate) orchestrator: RoleConfig,
     #[serde(default)]
     pub(crate) synthesizer: RoleConfig,
-    #[serde(default)]
-    #[allow(dead_code)] // Used when whisper transcription is added.
-    pub(crate) transcription: RoleConfig,
 }
 
 impl Default for AgentConfig {
@@ -116,7 +116,6 @@ impl Default for AgentConfig {
             orchestrator_context_window: default_context_window(),
             orchestrator: RoleConfig::default(),
             synthesizer: RoleConfig::default(),
-            transcription: RoleConfig::default(),
         }
     }
 }

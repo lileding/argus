@@ -1,5 +1,10 @@
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -8,6 +13,16 @@ use crate::agent::{Event, Message, Payload, Task};
 use crate::config::{GatewayImConfig, MEDIA_DIR};
 use crate::database::{Database, InboundMessage};
 
+/// Pending media work returned by the fast inbound path.
+struct MediaWork {
+    msg_id: String,
+    chat_id: String,
+    msg_type: String,
+    raw_content: String,
+    db_msg_id: Option<i64>,
+    ready_tx: oneshot::Sender<Payload>,
+}
+
 pub(super) struct Feishu<'a> {
     task_tx: mpsc::Sender<Task>,
     db: &'a Database,
@@ -15,6 +30,7 @@ pub(super) struct Feishu<'a> {
     rx: Mutex<mpsc::Receiver<Message>>,
     feishu_client: feishu::Client,
     workspace_dir: PathBuf,
+    transcriber: Option<super::transcribe::TranscribeClient>,
     /// Dedup inbound events by message_id. Feishu may deliver duplicates.
     seen_msg_ids: std::sync::Mutex<HashSet<String>>,
 }
@@ -25,6 +41,7 @@ impl<'a> Feishu<'a> {
         db: &'a Database,
         cfg: &GatewayImConfig,
         workspace_dir: &Path,
+        transcriber: Option<super::transcribe::TranscribeClient>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(64);
 
@@ -47,16 +64,25 @@ impl<'a> Feishu<'a> {
             rx: Mutex::new(rx),
             feishu_client,
             workspace_dir: workspace_dir.to_path_buf(),
+            transcriber,
             seen_msg_ids: std::sync::Mutex::new(HashSet::new()),
         }
     }
 
-    /// Single event loop: WS inbound + agent outbound + cancel, all in one select.
+    /// Single event loop: WS inbound + outbound rendering + media processing + cancel.
     pub(super) async fn run(&self, cancel: &CancellationToken) {
         info!("feishu frontend started");
 
+        let mut rx = self.rx.lock().await;
+        let api = self.feishu_client.api();
+        // All async work (media download + outbound render) goes into one
+        // FuturesUnordered so the select loop drives them all concurrently.
+        // This prevents deadlocks from shared auth token refresh.
+        let mut tasks: FuturesUnordered<Pin<Box<dyn Future<Output = ()> + Send + '_>>> =
+            FuturesUnordered::new();
+
         loop {
-            // Connect (or reconnect) WS.
+            // Connect (or reconnect) WS. In-flight tasks survive reconnects.
             let mut ws = loop {
                 match self.feishu_client.connect_ws().await {
                     Ok(ws) => {
@@ -78,10 +104,6 @@ impl<'a> Feishu<'a> {
                 }
             };
 
-            let mut rx = self.rx.lock().await;
-            let api = self.feishu_client.api();
-
-            // Unified select: inbound WS events + outbound agent messages + cancel.
             loop {
                 tokio::select! {
                     event = ws.next_event() => {
@@ -89,25 +111,31 @@ impl<'a> Feishu<'a> {
                             info!("feishu WS disconnected, will reconnect");
                             break; // outer loop reconnects
                         };
-                        self.handle_inbound(event).await;
+                        if let Some(work) = self.handle_inbound(event).await {
+                            tasks.push(Box::pin(self.process_media(work)));
+                        }
                     }
                     msg = rx.recv() => {
-                        let Some(mut msg) = msg else {
+                        let Some(msg) = msg else {
                             debug!("outbound channel closed");
                             return;
                         };
-                        self.render_message(&api, &mut msg).await;
+                        debug!(msg_id = %msg.msg_id, "outbound message received, rendering");
+                        tasks.push(Box::pin(self.render_one(&api, msg)));
                     }
+                    _ = tasks.next(), if !tasks.is_empty() => {}
                     _ = cancel.cancelled() => {
                         info!("feishu frontend shutting down, draining outbound");
-                        while let Ok(Some(mut msg)) =
+                        while let Ok(Some(msg)) =
                             tokio::time::timeout(
                                 std::time::Duration::from_millis(500),
                                 rx.recv(),
                             ).await
                         {
-                            self.render_message(&api, &mut msg).await;
+                            tasks.push(Box::pin(self.render_one(&api, msg)));
                         }
+                        // Drain remaining tasks.
+                        while tasks.next().await.is_some() {}
                         info!("feishu frontend stopped");
                         return;
                     }
@@ -116,35 +144,59 @@ impl<'a> Feishu<'a> {
         }
     }
 
-    /// Handle one inbound Feishu WS event: parse, dedup, persist, submit task,
-    /// process media inline, then send ready signal.
-    async fn handle_inbound(&self, event: feishu::types::FeishuEvent) {
+    /// Slow path: download media, transcribe audio, send ready signal.
+    async fn process_media(&self, work: MediaWork) {
+        let payload = self
+            .process_message(&work.msg_id, &work.msg_type, &work.raw_content)
+            .await;
+        debug!(
+            msg_id = work.msg_id,
+            chat_id = work.chat_id,
+            content_len = payload.content.len(),
+            files = payload.file_paths.len(),
+            "payload ready"
+        );
+        if let Some(db_id) = work.db_msg_id
+            && let Err(e) = self
+                .db
+                .messages
+                .save_ready(db_id, &payload.content, &payload.file_paths)
+                .await
+        {
+            warn!(msg_id = work.msg_id, error = %e, "save_ready failed");
+        }
+        let _ = work.ready_tx.send(payload);
+    }
+
+    /// Fast path: parse, dedup, persist, submit task. Returns MediaWork
+    /// for the slow path (media download + transcription).
+    async fn handle_inbound(&self, event: feishu::types::FeishuEvent) -> Option<MediaWork> {
         let feishu::types::FeishuEvent::Message(envelope) = event else {
             debug!("ignoring non-message event");
-            return;
+            return None;
         };
 
         let header = match &envelope.header {
             Some(h) => h,
-            None => return,
+            None => return None,
         };
         if header.event_type.as_deref() != Some("im.message.receive_v1") {
             debug!(
                 event_type = header.event_type.as_deref().unwrap_or(""),
                 "ignoring non-IM event"
             );
-            return;
+            return None;
         }
 
         let event_data = match &envelope.event {
             Some(data) => data,
-            None => return,
+            None => return None,
         };
         let message = match event_data.get("message") {
             Some(m) => m,
             None => {
                 warn!("inbound event missing 'message' field");
-                return;
+                return None;
             }
         };
 
@@ -171,7 +223,7 @@ impl<'a> Feishu<'a> {
         };
         if msg_id.is_empty() || chat_id.is_empty() {
             warn!(msg_id, chat_id, "inbound event missing msg_id or chat_id");
-            return;
+            return None;
         }
 
         // Dedup by message_id. Feishu WS may deliver the same event multiple times.
@@ -182,7 +234,7 @@ impl<'a> Feishu<'a> {
             }
             if !seen.insert(msg_id.to_string()) {
                 debug!(msg_id, "duplicate message, skipping");
-                return;
+                return None;
             }
         }
 
@@ -254,30 +306,19 @@ impl<'a> Feishu<'a> {
         };
         if let Err(e) = self.task_tx.send(task).await {
             warn!(msg_id, chat_id, error = %e, "submit_task failed");
-            return;
+            return None;
         }
         debug!(msg_id, chat_id, "task submitted to agent");
 
-        // Process media inline (no spawn). Blocks the event loop for this
-        // message, which is acceptable for a personal assistant.
-        let payload = self.process_message(&msg_id, &msg_type, &raw_content).await;
-        debug!(
+        // Return media work for the select loop to drive concurrently.
+        Some(MediaWork {
             msg_id,
             chat_id,
-            content_len = payload.content.len(),
-            files = payload.file_paths.len(),
-            "payload ready"
-        );
-        if let Some(db_id) = db_msg_id
-            && let Err(e) = self
-                .db
-                .messages
-                .save_ready(db_id, &payload.content, &payload.file_paths)
-                .await
-        {
-            warn!(msg_id, error = %e, "save_ready failed");
-        }
-        let _ = ready_tx.send(payload);
+            msg_type,
+            raw_content,
+            db_msg_id,
+            ready_tx,
+        })
     }
 
     /// Process a Feishu message by type: extract text, download media files.
@@ -348,21 +389,46 @@ impl<'a> Feishu<'a> {
             };
         };
 
-        match self
+        let filename = match self
             .download_and_save(msg_id, file_key, "file", ".opus")
             .await
         {
-            Ok(filename) => Payload {
-                content: "(transcription not yet available)".into(),
-                file_paths: vec![filename],
-            },
+            Ok(f) => f,
             Err(e) => {
                 warn!(msg_id, file_key, error = %e, "audio download failed");
-                Payload {
+                return Payload {
                     content: "The user sent a voice message (download failed).".into(),
                     file_paths: vec![],
+                };
+            }
+        };
+
+        // Transcribe if client is configured.
+        let transcript = if let Some(tc) = &self.transcriber {
+            let abs_path = self.workspace_dir.join(MEDIA_DIR).join(&filename);
+            match tokio::fs::read(&abs_path).await {
+                Ok(bytes) => match tc.transcribe(&bytes, &filename).await {
+                    Ok(result) => {
+                        info!(msg_id, confidence = result.confidence, "audio transcribed");
+                        result.text
+                    }
+                    Err(e) => {
+                        warn!(msg_id, error = %e, "transcription failed");
+                        "The user sent a voice message (transcription failed).".into()
+                    }
+                },
+                Err(e) => {
+                    warn!(msg_id, error = %e, "read audio file failed");
+                    "The user sent a voice message (transcription failed).".into()
                 }
             }
+        } else {
+            "The user sent a voice message (transcription not configured).".into()
+        };
+
+        Payload {
+            content: transcript,
+            file_paths: vec![filename],
         }
     }
 
@@ -490,7 +556,8 @@ impl<'a> Feishu<'a> {
     }
 
     /// Render a single message: open thinking card → consume events → update card.
-    async fn render_message(&self, api: &feishu::api::Api, msg: &mut Message) {
+    /// Takes ownership of `msg` so it can live inside FuturesUnordered.
+    async fn render_one(&self, api: &feishu::api::Api, mut msg: Message) {
         let lang = "zh";
 
         let card_id = match api

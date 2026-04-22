@@ -152,6 +152,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             warn!("outbound channel closed, dropping message");
             return;
         }
+        debug!(chat_id, msg_id, "message posted to outbound port");
 
         // Wait for payload.
         let payload = match task.ready.await {
