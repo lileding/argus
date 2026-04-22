@@ -166,7 +166,7 @@ impl Agent {
                 Arc::clone(&self.db),
                 Arc::clone(&self.synthesizer),
                 self.cancel.clone(),
-                self.embedding_interval * 5, // summarize less frequently
+                Duration::from_secs(300), // 5 minutes — summary is low priority
             ));
         }
 

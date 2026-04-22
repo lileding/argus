@@ -65,7 +65,7 @@ fn default_batch_size() -> usize {
     32
 }
 fn default_interval_secs() -> u64 {
-    2
+    30
 }
 
 /// Frontend config. The HashMap key is the frontend type ("feishu", etc.).
