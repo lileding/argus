@@ -64,23 +64,38 @@ impl<'a, E: EmbedService> Tool for SearchHistory<'a, E> {
             Err(e) => return format!("error: embedding failed: {e}"),
         };
 
-        let results = match self.db.conversation.search_replies(&embedding, limit).await {
-            Ok(r) => r,
-            Err(e) => return format!("error: {e}"),
-        };
+        // Search both user messages and agent replies across all channels.
+        let mut output = String::new();
+        let mut idx = 0;
 
-        if results.is_empty() {
-            return "No matching conversation history found.".into();
+        // Search user messages across all channels.
+        if let Ok(results) = self.db.conversation.search_all(&embedding, limit).await {
+            for (_, similarity, user_msg, reply_msg) in &results {
+                idx += 1;
+                output.push_str(&format!(
+                    "{}. [user, similarity: {:.2}]\n{}\n",
+                    idx, similarity, user_msg.content,
+                ));
+                if let Some(reply) = reply_msg {
+                    output.push_str(&format!("   → reply: {}\n", reply.content));
+                }
+                output.push('\n');
+            }
         }
 
-        let mut output = String::new();
-        for (i, (similarity, msg)) in results.iter().enumerate() {
-            output.push_str(&format!(
-                "{}. (similarity: {:.2})\n{}\n\n",
-                i + 1,
-                similarity,
-                msg.content,
-            ));
+        // Also search agent replies (notifications).
+        if let Ok(results) = self.db.conversation.search_replies(&embedding, limit).await {
+            for (similarity, msg) in &results {
+                idx += 1;
+                output.push_str(&format!(
+                    "{}. [reply, similarity: {:.2}]\n{}\n\n",
+                    idx, similarity, msg.content,
+                ));
+            }
+        }
+
+        if idx == 0 {
+            return "No matching conversation history found.".into();
         }
         output
     }

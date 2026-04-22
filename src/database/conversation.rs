@@ -109,6 +109,47 @@ impl Conversation {
         Ok(results)
     }
 
+    /// Semantic search across ALL channels (for search_history tool).
+    pub(crate) async fn search_all(
+        &self,
+        embedding: &[f32],
+        limit: i64,
+    ) -> super::DbResult<Vec<(i64, f64, model::Message, Option<model::Message>)>> {
+        let vec = Vector::from(embedding.to_vec());
+        let rows = sqlx::query(
+            "SELECT id, user_content, reply_content, reply_summary, \
+                    1 - (user_embedding <=> $1) AS similarity \
+             FROM conversation \
+             WHERE user_embedding IS NOT NULL \
+             ORDER BY user_embedding <=> $1 \
+             LIMIT $2",
+        )
+        .bind(vec)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut results = Vec::new();
+        for row in &rows {
+            let r = ConversationRow {
+                id: row.get("id"),
+                user_content: row.get("user_content"),
+                reply_content: row.get("reply_content"),
+                reply_summary: row.get("reply_summary"),
+            };
+            let similarity: f64 = row.get("similarity");
+            let reply = format_reply(&r).map(model::Message::assistant);
+            results.push((
+                r.id,
+                similarity,
+                model::Message::user(&r.user_content),
+                reply,
+            ));
+        }
+
+        Ok(results)
+    }
+
     /// Search notifications (agent replies) by embedding similarity.
     /// Returns assistant messages matching the query, with summary truncation.
     pub(crate) async fn search_replies(
