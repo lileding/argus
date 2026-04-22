@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Role {
+pub(crate) enum Role {
     System,
     User,
     Assistant,
@@ -20,27 +20,27 @@ pub enum Role {
 
 /// A chat message. Content is either plain text or multimodal (text + images).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Message {
-    pub role: Role,
+pub(crate) struct Message {
+    pub(crate) role: Role,
     /// Plain text content. For multimodal messages, this is the text part.
     #[serde(default)]
-    pub content: String,
+    pub(crate) content: String,
     /// Multimodal content parts (text + images). Empty for text-only messages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub parts: Vec<ContentPart>,
+    pub(crate) parts: Vec<ContentPart>,
     /// Tool calls made by the assistant.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_calls: Vec<ToolCall>,
+    pub(crate) tool_calls: Vec<ToolCall>,
     /// For tool result messages: links back to the tool call ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
+    pub(crate) tool_call_id: Option<String>,
     /// For tool result messages: the function name (required by Gemini).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_name: Option<String>,
+    pub(crate) tool_name: Option<String>,
 }
 
 impl Message {
-    pub fn system(content: impl Into<String>) -> Self {
+    pub(crate) fn system(content: impl Into<String>) -> Self {
         Self {
             role: Role::System,
             content: content.into(),
@@ -51,7 +51,7 @@ impl Message {
         }
     }
 
-    pub fn user(content: impl Into<String>) -> Self {
+    pub(crate) fn user(content: impl Into<String>) -> Self {
         Self {
             role: Role::User,
             content: content.into(),
@@ -62,7 +62,7 @@ impl Message {
         }
     }
 
-    pub fn assistant(content: impl Into<String>) -> Self {
+    pub(crate) fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
             content: content.into(),
@@ -73,7 +73,7 @@ impl Message {
         }
     }
 
-    pub fn tool_result(
+    pub(crate) fn tool_result(
         call_id: impl Into<String>,
         name: impl Into<String>,
         content: impl Into<String>,
@@ -92,7 +92,7 @@ impl Message {
 /// A part of a multimodal message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
-pub enum ContentPart {
+pub(crate) enum ContentPart {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "image_url")]
@@ -103,37 +103,37 @@ pub enum ContentPart {
 
 /// Tool definition passed to the model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolDef {
-    pub name: String,
-    pub description: String,
+pub(crate) struct ToolDef {
+    pub(crate) name: String,
+    pub(crate) description: String,
     /// JSON Schema for the function parameters (passed as-is to providers).
-    pub parameters: serde_json::Value,
+    pub(crate) parameters: serde_json::Value,
 }
 
 // --- Tool Calls ---
 
 /// A tool call requested by the model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCall {
-    pub id: String,
-    pub name: String,
+pub(crate) struct ToolCall {
+    pub(crate) id: String,
+    pub(crate) name: String,
     /// Raw JSON string of arguments (as returned by the model).
-    pub arguments: String,
+    pub(crate) arguments: String,
 }
 
 // --- Responses ---
 
 /// Response from a non-streaming chat call.
 #[derive(Debug, Clone)]
-pub struct Response {
-    pub content: String,
-    pub tool_calls: Vec<ToolCall>,
-    pub finish_reason: FinishReason,
-    pub usage: Usage,
+pub(crate) struct Response {
+    pub(crate) content: String,
+    pub(crate) tool_calls: Vec<ToolCall>,
+    pub(crate) finish_reason: FinishReason,
+    pub(crate) usage: Usage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FinishReason {
+pub(crate) enum FinishReason {
     Stop,
     ToolCalls,
     Length,
@@ -142,50 +142,50 @@ pub enum FinishReason {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct Usage {
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-    pub total_tokens: u32,
+pub(crate) struct Usage {
+    pub(crate) prompt_tokens: u32,
+    pub(crate) completion_tokens: u32,
+    pub(crate) total_tokens: u32,
 }
 
 // --- Streaming ---
 
 /// Incremental tool call delta from a streaming response.
 #[derive(Debug, Clone)]
-pub struct ToolCallDelta {
+pub(crate) struct ToolCallDelta {
     /// Index of this tool call in the array (for parallel tool calls).
-    pub index: usize,
+    pub(crate) index: usize,
     /// Tool call ID (only present on the first delta for this index).
-    pub id: Option<String>,
+    pub(crate) id: Option<String>,
     /// Function name (only present on the first delta for this index).
-    pub name: Option<String>,
+    pub(crate) name: Option<String>,
     /// Incremental JSON arguments fragment.
-    pub arguments_delta: String,
+    pub(crate) arguments_delta: String,
 }
 
 /// A chunk from a streaming chat response.
 #[derive(Debug, Clone)]
-pub struct StreamChunk {
+pub(crate) struct StreamChunk {
     /// Incremental text delta (appended since previous chunk).
-    pub delta: String,
+    pub(crate) delta: String,
     /// Tool call deltas in this chunk (if any).
-    pub tool_call_deltas: Vec<ToolCallDelta>,
+    pub(crate) tool_call_deltas: Vec<ToolCallDelta>,
     /// True on the final chunk.
-    pub done: bool,
+    pub(crate) done: bool,
     /// Token usage (populated on final chunk if provider reports it).
-    pub usage: Option<Usage>,
+    pub(crate) usage: Option<Usage>,
     /// Error (populated on final chunk if streaming errored).
-    pub error: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
 /// Type alias for a boxed async stream of chunks.
-pub type ChunkStream = Pin<Box<dyn Stream<Item = StreamChunk> + Send>>;
+pub(crate) type ChunkStream = Pin<Box<dyn Stream<Item = StreamChunk> + Send>>;
 
 // --- Client trait ---
 
 /// Model client interface. Each provider implements this.
 #[async_trait::async_trait]
-pub trait Client: Send + Sync {
+pub(crate) trait Client: Send + Sync {
     async fn chat(&self, messages: &[Message], tools: &[ToolDef]) -> ClientResult<Response>;
     async fn chat_stream(
         &self,
@@ -203,7 +203,7 @@ pub trait Client: Send + Sync {
 // --- Errors ---
 
 #[derive(Debug, thiserror::Error)]
-pub enum ClientError {
+pub(crate) enum ClientError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("API error (status {status}): {message}")]
@@ -219,12 +219,12 @@ pub enum ClientError {
 }
 
 impl ClientError {
-    pub fn is_rate_limited(&self) -> bool {
+    pub(crate) fn is_rate_limited(&self) -> bool {
         matches!(self, Self::RateLimited)
     }
 }
 
-pub type ClientResult<T> = std::result::Result<T, ClientError>;
+pub(crate) type ClientResult<T> = std::result::Result<T, ClientError>;
 
 #[cfg(test)]
 mod tests {

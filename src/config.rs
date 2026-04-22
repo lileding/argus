@@ -8,43 +8,41 @@ pub(crate) const MEDIA_DIR: &str = ".files";
 
 /// Application configuration loaded from TOML.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct Config {
+pub(crate) struct Config {
     /// Workspace directory. Supports ~ and relative paths; resolved to
     /// absolute on load.
     #[serde(default = "default_workspace_dir")]
-    pub workspace_dir: PathBuf,
+    pub(crate) workspace_dir: PathBuf,
     /// Named IM adapters. Key is the IM type ("feishu", "slack", etc.).
     #[serde(default)]
-    pub gateway: HashMap<String, GatewayImConfig>,
+    pub(crate) gateway: HashMap<String, GatewayImConfig>,
     #[serde(default)]
-    pub agent: AgentConfig,
+    pub(crate) agent: AgentConfig,
     /// Named upstream model providers.
     #[serde(default)]
-    pub upstream: HashMap<String, UpstreamConfig>,
+    pub(crate) upstream: HashMap<String, UpstreamConfig>,
     /// Database connection.
     #[serde(default)]
-    pub database: DatabaseConfig,
+    pub(crate) database: DatabaseConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
-pub struct DatabaseConfig {
+pub(crate) struct DatabaseConfig {
     #[serde(default)]
-    pub dsn: String,
+    pub(crate) dsn: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct EmbeddingConfig {
+pub(crate) struct EmbeddingConfig {
     /// Which upstream provides the embedding endpoint.
     #[serde(default)]
-    pub upstream: String,
+    pub(crate) upstream: String,
     #[serde(default = "default_embedding_model")]
-    pub model_name: String,
+    pub(crate) model_name: String,
     #[serde(default = "default_batch_size")]
-    pub batch_size: usize,
+    pub(crate) batch_size: usize,
     #[serde(default = "default_interval_secs")]
-    pub interval_secs: u64,
+    pub(crate) interval_secs: u64,
 }
 
 impl Default for EmbeddingConfig {
@@ -72,31 +70,31 @@ fn default_interval_secs() -> u64 {
 /// Currently feishu-only; when adding other frontends, use an enum or
 /// two-pass deserialization for type-specific fields.
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct GatewayImConfig {
+pub(crate) struct GatewayImConfig {
     #[serde(default)]
-    pub app_id: String,
+    pub(crate) app_id: String,
     #[serde(default)]
-    pub app_secret: String,
+    pub(crate) app_secret: String,
     #[serde(default = "default_feishu_base_url")]
-    pub base_url: String,
+    pub(crate) base_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct AgentConfig {
+pub(crate) struct AgentConfig {
     #[serde(default = "default_max_iterations")]
-    pub max_iterations: usize,
+    #[allow(dead_code)] // Used when tool loop is implemented.
+    pub(crate) max_iterations: usize,
     #[serde(default = "default_context_window")]
-    pub orchestrator_context_window: usize,
+    pub(crate) orchestrator_context_window: usize,
     #[serde(default)]
-    pub orchestrator: RoleConfig,
+    pub(crate) orchestrator: RoleConfig,
     #[serde(default)]
-    pub synthesizer: RoleConfig,
+    pub(crate) synthesizer: RoleConfig,
     #[serde(default)]
-    pub transcription: RoleConfig,
+    #[allow(dead_code)] // Used when whisper transcription is added.
+    pub(crate) transcription: RoleConfig,
     #[serde(default)]
-    pub embedding: EmbeddingConfig,
+    pub(crate) embedding: EmbeddingConfig,
 }
 
 impl Default for AgentConfig {
@@ -113,14 +111,13 @@ impl Default for AgentConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct RoleConfig {
+pub(crate) struct RoleConfig {
     #[serde(default)]
-    pub upstream: String,
+    pub(crate) upstream: String,
     #[serde(default)]
-    pub model_name: String,
+    pub(crate) model_name: String,
     #[serde(default = "default_max_tokens")]
-    pub max_tokens: usize,
+    pub(crate) max_tokens: usize,
 }
 
 impl Default for RoleConfig {
@@ -134,21 +131,19 @@ impl Default for RoleConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct UpstreamConfig {
+pub(crate) struct UpstreamConfig {
     #[serde(rename = "type")]
-    pub provider_type: String,
+    pub(crate) provider_type: String,
     #[serde(default)]
-    pub base_url: String,
+    pub(crate) base_url: String,
     #[serde(default)]
-    pub api_key: String,
+    pub(crate) api_key: String,
     #[serde(default = "default_timeout")]
-    pub timeout_secs: u64,
+    pub(crate) timeout_secs: u64,
 }
 
 impl UpstreamConfig {
-    #[allow(dead_code)]
-    pub fn effective_base_url(&self) -> &str {
+    pub(crate) fn effective_base_url(&self) -> &str {
         if !self.base_url.is_empty() {
             return &self.base_url;
         }
@@ -192,7 +187,7 @@ fn default_timeout() -> u64 {
 impl Config {
     /// Load config from TOML file. Falls back to defaults if file doesn't exist.
     /// Resolves workspace_dir to absolute (expand ~, join with cwd if relative).
-    pub fn load(config_path: &Path) -> anyhow::Result<Self> {
+    pub(crate) fn load(config_path: &Path) -> anyhow::Result<Self> {
         let mut config: Config = if config_path.exists() {
             let content = std::fs::read_to_string(config_path)?;
             let c: Config = toml::from_str(&content)?;
@@ -216,14 +211,6 @@ impl Config {
 
         tracing::info!(workspace = %config.workspace_dir.display(), "workspace resolved");
         Ok(config)
-    }
-
-    #[allow(dead_code)]
-    pub fn upstream_for(&self, role: &RoleConfig) -> Option<&UpstreamConfig> {
-        if role.upstream.is_empty() {
-            return None;
-        }
-        self.upstream.get(&role.upstream)
     }
 }
 

@@ -3,8 +3,8 @@ use sqlx::{PgPool, Row};
 
 /// A pinned memory.
 pub(crate) struct Memory {
-    pub category: String,
-    pub content: String,
+    pub(crate) category: String,
+    pub(crate) content: String,
 }
 
 /// Pinned memories persistence.

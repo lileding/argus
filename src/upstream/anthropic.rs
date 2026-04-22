@@ -30,7 +30,7 @@ pub(super) struct AnthropicClient {
 }
 
 impl AnthropicClient {
-    pub fn new(upstream: &UpstreamConfig, role: &RoleConfig) -> Self {
+    pub(super) fn new(upstream: &UpstreamConfig, role: &RoleConfig) -> Self {
         let base_url = if upstream.base_url.is_empty() {
             DEFAULT_BASE_URL.to_string()
         } else {

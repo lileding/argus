@@ -4,12 +4,12 @@ use sqlx::{PgPool, Row};
 
 /// Parameters for saving a new inbound message.
 pub(crate) struct InboundMessage<'a> {
-    pub channel: &'a str,
-    pub content: &'a str,
-    pub msg_type: &'a str,
-    pub sender_id: &'a str,
-    pub trigger_msg_id: &'a str,
-    pub source_ts: Option<DateTime<Utc>>,
+    pub(crate) channel: &'a str,
+    pub(crate) content: &'a str,
+    pub(crate) msg_type: &'a str,
+    pub(crate) sender_id: &'a str,
+    pub(crate) trigger_msg_id: &'a str,
+    pub(crate) source_ts: Option<DateTime<Utc>>,
 }
 
 /// Message persistence. Two states: ready=false (received) → ready=true (processed).

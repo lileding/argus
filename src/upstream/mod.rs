@@ -1,4 +1,4 @@
-#[allow(dead_code)]
+#[allow(dead_code)] // Complete API types — not all used before tool system.
 pub(crate) mod types;
 
 #[allow(dead_code)]

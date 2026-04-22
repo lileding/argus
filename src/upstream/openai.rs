@@ -27,7 +27,7 @@ pub(super) struct OpenAiClient {
 }
 
 impl OpenAiClient {
-    pub fn new(upstream: &UpstreamConfig, role: &RoleConfig) -> Self {
+    pub(super) fn new(upstream: &UpstreamConfig, role: &RoleConfig) -> Self {
         let base_url = upstream.effective_base_url().to_string();
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(upstream.timeout_secs))

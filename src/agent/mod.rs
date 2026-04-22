@@ -17,15 +17,15 @@ use crate::upstream::types as model;
 
 // --- Types ---
 
-pub struct Payload {
+pub(crate) struct Payload {
     pub(crate) content: String,
-    pub file_paths: Vec<String>,
+    pub(crate) file_paths: Vec<String>,
 }
 
 /// Trait for receiving messages from the Agent. Defined in the agent
 /// module so Agent never imports frontend. Frontend implements this.
 #[async_trait::async_trait]
-pub trait MessageSink: Send + Sync {
+pub(crate) trait MessageSink: Send + Sync {
     async fn submit_message(&self, msg: Message);
 }
 
@@ -43,13 +43,13 @@ pub(crate) struct Task {
 pub(crate) struct Message {
     #[allow(dead_code)] // Will be used for per-chat channel routing.
     pub(crate) chat_id: String,
-    pub msg_id: String,
+    pub(crate) msg_id: String,
     /// Agent emits events; frontend consumes them to drive UI.
     /// Dropping the sender signals "message complete".
-    pub events: mpsc::Receiver<Event>,
+    pub(crate) events: mpsc::Receiver<Event>,
 }
 
-pub enum Event {
+pub(crate) enum Event {
     Reply { text: String },
 }
 
@@ -77,7 +77,7 @@ RULES:
 // --- Agent ---
 
 #[derive(Debug, thiserror::Error)]
-pub enum AgentError {
+pub(crate) enum AgentError {
     #[error("task queue closed")]
     QueueClosed,
 }
@@ -98,6 +98,7 @@ pub(crate) struct Agent {
     embedder: Option<Arc<embedding::EmbeddingClient>>,
     embedding_interval: Duration,
     embedding_batch_size: usize,
+    context_window: usize,
 }
 
 impl Agent {
@@ -147,6 +148,7 @@ impl Agent {
             embedder,
             embedding_interval: Duration::from_secs(config.embedding.interval_secs),
             embedding_batch_size: config.embedding.batch_size,
+            context_window: config.orchestrator_context_window,
         }))
     }
 
@@ -238,8 +240,8 @@ impl Agent {
             ORCHESTRATOR_PROMPT,
             &task.channel,
             &payload.content,
-            task.db_msg_id, // exclude current message from history
-            10,             // context window
+            task.db_msg_id,
+            self.context_window,
         )
         .await;
 
@@ -341,7 +343,7 @@ impl Agent {
         Ok(full_reply)
     }
 
-    pub async fn submit_task(&self, task: Task) -> Result<(), AgentError> {
+    pub(crate) async fn submit_task(&self, task: Task) -> Result<(), AgentError> {
         self.tx.send(task).await?;
         Ok(())
     }

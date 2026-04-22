@@ -22,7 +22,6 @@ impl EmbeddingClient {
     }
 
     /// Embed a single text string.
-    #[allow(dead_code)] // Will be used by semantic search.
     pub(crate) async fn embed_one(&self, text: &str) -> anyhow::Result<Vec<f32>> {
         let vecs = self.embed_batch(&[text]).await?;
         vecs.into_iter()

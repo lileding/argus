@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -19,10 +20,12 @@ pub(super) struct Feishu {
     rx: Mutex<mpsc::Receiver<Message>>,
     feishu_client: feishu::Client,
     workspace_dir: PathBuf,
+    /// Dedup inbound events by message_id. Feishu may deliver duplicates.
+    seen_msg_ids: std::sync::Mutex<HashSet<String>>,
 }
 
 impl Feishu {
-    pub fn new(
+    pub(super) fn new(
         agent: Arc<Agent>,
         db: Arc<Database>,
         cfg: &GatewayImConfig,
@@ -50,6 +53,7 @@ impl Feishu {
             rx: Mutex::new(rx),
             feishu_client,
             workspace_dir: workspace_dir.to_path_buf(),
+            seen_msg_ids: std::sync::Mutex::new(HashSet::new()),
         })
     }
 
@@ -170,6 +174,18 @@ impl Feishu {
         if msg_id.is_empty() || chat_id.is_empty() {
             warn!(msg_id, chat_id, "inbound event missing msg_id or chat_id");
             return;
+        }
+
+        // Dedup by message_id. Feishu WS may deliver the same event multiple times.
+        {
+            let mut seen = self.seen_msg_ids.lock().unwrap();
+            if seen.len() > 10_000 {
+                seen.clear();
+            }
+            if !seen.insert(msg_id.to_string()) {
+                debug!(msg_id, "duplicate message, skipping");
+                return;
+            }
         }
 
         let msg_id = msg_id.to_string();
@@ -516,8 +532,12 @@ impl Feishu {
                 }
             }
         }
-        // Drain remaining messages so their replies still get sent.
-        while let Ok(mut msg) = rx.try_recv() {
+        // Drain remaining messages. Under normal shutdown, the agent has already
+        // stopped and all messages are buffered. The timeout is a safety net for
+        // edge cases where messages arrive slightly after cancel.
+        while let Ok(Some(mut msg)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
+        {
             info!(msg_id = %msg.msg_id, "draining message");
             self.render_message(&api, &mut msg).await;
         }
@@ -580,7 +600,9 @@ impl Feishu {
 
         // Step 3: If events closed without any Reply, dismiss the thinking card.
         if !got_reply && let Some(cid) = &card_id {
-            let _ = api.update_message(cid, &markdown_card("✓")).await;
+            let _ = api
+                .update_message(cid, &crate::render::markdown_to_card("✓"))
+                .await;
         }
 
         debug!(msg_id = %msg.msg_id, "message rendering complete");
@@ -612,18 +634,6 @@ impl Im for Feishu {}
 
 // --- Feishu card builders ---
 
-/// Build a Feishu interactive card with markdown content.
-fn markdown_card(md: &str) -> String {
-    serde_json::json!({
-        "schema": "2.0",
-        "config": {"update_multi": true},
-        "body": {
-            "elements": [{"tag": "markdown", "content": md}]
-        }
-    })
-    .to_string()
-}
-
 /// Build a "thinking" status card.
 fn thinking_card(lang: &str) -> String {
     let text = if lang == "zh" {
@@ -631,18 +641,7 @@ fn thinking_card(lang: &str) -> String {
     } else {
         "💭 Thinking..."
     };
-    markdown_card(text)
-}
-
-/// Simple language detection: check for CJK characters.
-#[allow(dead_code)]
-fn detect_lang(text: &str) -> &'static str {
-    for c in text.chars() {
-        if ('\u{4E00}'..='\u{9FFF}').contains(&c) {
-            return "zh";
-        }
-    }
-    "en"
+    crate::render::markdown_to_card(text)
 }
 
 // --- Content extraction helpers ---

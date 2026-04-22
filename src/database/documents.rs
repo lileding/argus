@@ -3,9 +3,9 @@ use sqlx::{PgPool, Row};
 
 /// Document metadata row.
 pub(crate) struct PendingDocument {
-    pub id: i64,
-    pub filename: String,
-    pub file_path: String,
+    pub(crate) id: i64,
+    pub(crate) filename: String,
+    pub(crate) file_path: String,
 }
 
 /// Documents + chunks persistence for RAG.
@@ -36,19 +36,33 @@ impl Documents {
         Ok(row.get("id"))
     }
 
-    /// Update document status.
+    /// Update document status with state machine enforcement.
     pub(crate) async fn update_status(
         &self,
         id: i64,
         status: &str,
         error_msg: &str,
     ) -> anyhow::Result<()> {
-        sqlx::query("UPDATE documents SET status = $1, error_msg = $2 WHERE id = $3")
-            .bind(status)
-            .bind(error_msg)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        let valid_from: &[&str] = match status {
+            "processing" => &["pending"],
+            "ready" => &["processing"],
+            "error" => &["pending", "processing"],
+            _ => anyhow::bail!("invalid document status: {status}"),
+        };
+        let result = sqlx::query(
+            "UPDATE documents SET status = $1, error_msg = $2 \
+             WHERE id = $3 AND status = ANY($4)",
+        )
+        .bind(status)
+        .bind(error_msg)
+        .bind(id)
+        .bind(valid_from)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            anyhow::bail!("document {id}: stale status transition to '{status}'");
+        }
         Ok(())
     }
 
@@ -72,8 +86,9 @@ impl Documents {
             .collect())
     }
 
-    /// Save text chunks for a document.
+    /// Save text chunks for a document (transactional).
     pub(crate) async fn save_chunks(&self, doc_id: i64, chunks: &[String]) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
         for (i, content) in chunks.iter().enumerate() {
             sqlx::query(
                 "INSERT INTO chunks (document_id, chunk_index, content) \
@@ -82,9 +97,10 @@ impl Documents {
             .bind(doc_id)
             .bind(i as i32)
             .bind(content)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 

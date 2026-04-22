@@ -50,6 +50,7 @@ pub(super) async fn build_context(
     // Search both user messages AND agent replies — the answer to "what did I say
     // about X" is often in the agent's reply, not the user's original message.
     let mut recalled_ids = HashSet::new();
+    let mut recalled_replies = HashSet::new();
     if let Some(embedder) = embedder
         && let Ok(vec) = embedder.embed_one(user_text).await
     {
@@ -73,16 +74,20 @@ pub(super) async fn build_context(
                 total_bytes += size;
                 messages.push(user_msg.clone());
                 if let Some(reply) = reply_msg {
+                    recalled_replies.insert(reply.content.clone());
                     messages.push(reply.clone());
                 }
                 recalled_ids.insert(*row_id);
             }
         }
 
-        // 2. Search agent replies (notifications table).
+        // 2. Search agent replies (notifications table), dedup against conversation results.
         if let Ok(results) = db.conversation.search_replies(&vec, 10).await {
             for (similarity, reply_msg) in &results {
                 if *similarity < RECALL_SIMILARITY_THRESHOLD {
+                    continue;
+                }
+                if recalled_replies.contains(&reply_msg.content) {
                     continue;
                 }
                 let size = reply_msg.content.len();
