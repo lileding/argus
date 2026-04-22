@@ -307,9 +307,26 @@ fn sse_to_stream(mut es: EventSource) -> impl Stream<Item = StreamChunk> {
 
 fn parse_sse_data(data: &str) -> Option<StreamChunk> {
     let resp: SseResponse = serde_json::from_str(data).ok()?;
-    let choice = resp.choices.first()?;
-    let delta = &choice.delta;
 
+    let usage = resp.usage.map(|u| Usage {
+        prompt_tokens: u.prompt_tokens,
+        completion_tokens: u.completion_tokens,
+        total_tokens: u.total_tokens,
+    });
+
+    // OpenAI sends a final chunk with usage but empty choices.
+    let Some(choice) = resp.choices.first() else {
+        // Usage-only chunk — return it so token counts are captured.
+        return usage.map(|u| StreamChunk {
+            delta: String::new(),
+            tool_call_deltas: vec![],
+            done: false,
+            usage: Some(u),
+            error: None,
+        });
+    };
+
+    let delta = &choice.delta;
     let text = delta.content.as_deref().unwrap_or("");
 
     // Parse tool call deltas.
@@ -331,12 +348,6 @@ fn parse_sse_data(data: &str) -> Option<StreamChunk> {
                 .collect()
         })
         .unwrap_or_default();
-
-    let usage = resp.usage.map(|u| Usage {
-        prompt_tokens: u.prompt_tokens,
-        completion_tokens: u.completion_tokens,
-        total_tokens: u.total_tokens,
-    });
 
     let done = choice.finish_reason.is_some();
 

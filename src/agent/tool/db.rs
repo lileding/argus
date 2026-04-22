@@ -621,6 +621,19 @@ impl<'a> Tool for Db<'a> {
             super::truncate_display(&cmd, 40)
         )
     }
+
+    /// Normalize DB command arguments: extract the command string,
+    /// sort JSON object keys for deterministic comparison.
+    fn normalize_args(&self, args: &str) -> String {
+        let Ok(v) = serde_json::from_str::<Value>(args) else {
+            return args.to_string();
+        };
+        let Some(cmd) = v.get("command").and_then(|c| c.as_str()) else {
+            return args.to_string();
+        };
+        // Return just the command text (stripped of wrapper JSON).
+        cmd.to_string()
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────

@@ -207,11 +207,15 @@ impl<'a, E: EmbedService> Agent<'a, E> {
         }
         debug!(chat_id, msg_id, "message posted to outbound port");
 
-        // Wait for payload.
-        let payload = match ready.await {
-            Ok(p) => p,
-            Err(_) => {
+        // Wait for payload with timeout (media processing may hang).
+        let payload = match tokio::time::timeout(std::time::Duration::from_secs(120), ready).await {
+            Ok(Ok(p)) => p,
+            Ok(Err(_)) => {
                 warn!(chat_id, msg_id, "ready channel dropped");
+                return;
+            }
+            Err(_) => {
+                warn!(chat_id, msg_id, "media processing timed out (120s)");
                 return;
             }
         };
@@ -457,6 +461,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
                 let tc_id = tc.id.clone();
                 let tc_name = tc.name.clone();
                 let tc_args = tc.arguments.clone();
+                let normalized = tool.normalize_args(&tc.arguments);
                 let seq = seq as i32;
                 let iter = iteration as i32;
 
@@ -469,6 +474,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
                         tc_id,
                         tc_name,
                         tc_args,
+                        normalized,
                         result,
                         is_error,
                         duration_ms,
@@ -487,7 +493,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             }
 
             // Append executed tool results.
-            for (id, name, args, result, is_error, duration_ms, iter, seq) in &results {
+            for (id, name, args, normalized, result, is_error, duration_ms, iter, seq) in &results {
                 let truncated = truncate(result, MAX_TOOL_RESULT_BYTES);
                 messages.push(model::Message::tool_result(id, name, &truncated));
                 all_tool_results.push(format!("[{name}] {truncated}"));
@@ -499,6 +505,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
                             *seq,
                             name,
                             args,
+                            normalized,
                             &truncated,
                             *is_error,
                             *duration_ms,

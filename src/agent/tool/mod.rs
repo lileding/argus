@@ -45,8 +45,14 @@ pub(super) trait Tool: Send + Sync {
     async fn execute(&self, ctx: &ToolContext<'_>, args: &str) -> String;
 
     /// Status line shown on the card while this tool is running.
-    /// Includes emoji + short description based on the arguments.
     fn status_label(&self, args: &str) -> String;
+
+    /// Normalized form of arguments for trace storage.
+    /// Default: returns args unchanged. Override for tools like `db`
+    /// that have structured command syntax worth normalizing.
+    fn normalize_args(&self, args: &str) -> String {
+        args.to_string()
+    }
 }
 
 /// Registry of available tools.

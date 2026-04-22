@@ -73,20 +73,22 @@ impl TraceBuilder {
         seq: i32,
         tool_name: &str,
         arguments: &str,
+        normalized_args: &str,
         result: &str,
         is_error: bool,
         duration_ms: i32,
     ) -> super::DbResult<()> {
         sqlx::query(
             "INSERT INTO tool_calls \
-             (trace_id, iteration, seq, tool_name, arguments, result, is_error, duration_ms) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             (trace_id, iteration, seq, tool_name, arguments, normalized_args, result, is_error, duration_ms) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(self.trace_id)
         .bind(iteration)
         .bind(seq)
         .bind(tool_name)
         .bind(arguments)
+        .bind(normalized_args)
         .bind(result)
         .bind(is_error)
         .bind(duration_ms)
