@@ -488,7 +488,11 @@ impl<'a> Db<'a> {
                 .await
                 .map_err(|e| format!("insert failed: {e}"))?;
 
-            let id: i64 = row.get("id");
+            // Handle both SERIAL (int4) and BIGSERIAL (int8) id columns.
+            let id: i64 = row
+                .try_get::<i64, _>("id")
+                .or_else(|_| row.try_get::<i32, _>("id").map(|v| v as i64))
+                .map_err(|e| format!("failed to read id: {e}"))?;
             ids.push(id);
         }
 
