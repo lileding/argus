@@ -1,22 +1,26 @@
 # Argus configuration.
 # Default location: ~/.config/argus/argus.toml
 
-# Workspace directory for media files, skills, etc.
-# Supports ~, relative paths (resolved from cwd).
+# Workspace directory for media files, skills, user files, etc.
 # workspace_dir = "~/.local/share/argus"  # default
 
 [gateway.feishu]
 app_id = ""
 app_secret = ""
-# base_url = "https://open.feishu.cn"  # default; use https://open.larksuite.com for Lark
+# base_url = "https://open.feishu.cn"  # default
+
+# [gateway.feishu.transcription]
+# upstream = "local"
+# model_name = "whisper-large-v3"
 
 [agent]
 max_iterations = 10
 orchestrator_context_window = 10
+# tavily_api_key = ""  # optional; empty = DuckDuckGo fallback only
 
 [agent.orchestrator]
-upstream = "anthropic"
-model_name = "claude-haiku-4-5"
+upstream = "openai"
+model_name = "gpt-5.4"
 max_tokens = 4096
 
 [agent.synthesizer]
@@ -24,13 +28,19 @@ upstream = "gemini"
 model_name = "gemini-2.5-flash-lite"
 max_tokens = 32768
 
-# [agent.transcription]
-# upstream = "local"
-# model_name = "whisper-large-v3"
+[embedder]
+upstream = "local"
+model_name = "modernbert-embed-base"
+batch_size = 32
+interval_secs = 30
+summary_interval_ticks = 10
+
+[embedder.summarizer]
+upstream = "gemini"
+model_name = "gemini-2.5-flash-lite"
 
 [upstream.openai]
 type = "openai"
-base_url = "https://api.openai.com/v1"
 api_key = ""
 
 [upstream.anthropic]
@@ -46,3 +56,6 @@ api_key = ""
 # base_url = "http://localhost:8000/v1"
 # api_key = "omlx"
 # timeout_secs = 240
+
+[database]
+dsn = "postgres://argus:argus@localhost:5432/argus?sslmode=disable"

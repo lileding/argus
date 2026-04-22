@@ -117,34 +117,34 @@ async fn migrate(pool: &PgPool) -> DbResult<()> {
     Ok(())
 }
 
-/// Embedded migration files. Must match internal/store/migrations/*.sql.
+/// Embedded migration files from migrations/*.sql.
 const MIGRATIONS: &[(&str, &str)] = &[
     (
         "001_init.sql",
-        include_str!("../../internal/store/migrations/001_init.sql"),
+        include_str!("../../migrations/001_init.sql"),
     ),
     (
         "002_memory_system.sql",
-        include_str!("../../internal/store/migrations/002_memory_system.sql"),
+        include_str!("../../migrations/002_memory_system.sql"),
     ),
     (
         "003_message_queue.sql",
-        include_str!("../../internal/store/migrations/003_message_queue.sql"),
+        include_str!("../../migrations/003_message_queue.sql"),
     ),
     (
         "004_traces.sql",
-        include_str!("../../internal/store/migrations/004_traces.sql"),
+        include_str!("../../migrations/004_traces.sql"),
     ),
     (
         "005_message_summary.sql",
-        include_str!("../../internal/store/migrations/005_message_summary.sql"),
+        include_str!("../../migrations/005_message_summary.sql"),
     ),
     (
         "006_reply_content.sql",
-        include_str!("../../internal/store/migrations/006_reply_content.sql"),
+        include_str!("../../migrations/006_reply_content.sql"),
     ),
     (
         "007_conversation_view.sql",
-        include_str!("../../internal/store/migrations/007_conversation_view.sql"),
+        include_str!("../../migrations/007_conversation_view.sql"),
     ),
 ];
