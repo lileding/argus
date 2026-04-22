@@ -1,7 +1,7 @@
 mod conversation;
 mod documents;
 mod memories;
-mod messages;
+pub(crate) mod messages;
 mod notifications;
 pub(crate) mod traces;
 

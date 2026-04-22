@@ -31,6 +31,8 @@ pub(super) struct Feishu<'a> {
     feishu_client: feishu::Client,
     workspace_dir: PathBuf,
     transcriber: Option<super::transcribe::TranscribeClient>,
+    /// Channel for receiving recovery messages from Recovery module.
+    recover_rx: Mutex<mpsc::Receiver<crate::database::messages::UnrepliedMessage>>,
     /// Dedup inbound events by message_id. Feishu may deliver duplicates.
     seen_msg_ids: std::sync::Mutex<HashSet<String>>,
 }
@@ -42,6 +44,7 @@ impl<'a> Feishu<'a> {
         cfg: &GatewayImConfig,
         workspace_dir: &Path,
         transcriber: Option<super::transcribe::TranscribeClient>,
+        recover_rx: mpsc::Receiver<crate::database::messages::UnrepliedMessage>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(64);
 
@@ -65,6 +68,7 @@ impl<'a> Feishu<'a> {
             feishu_client,
             workspace_dir: workspace_dir.to_path_buf(),
             transcriber,
+            recover_rx: Mutex::new(recover_rx),
             seen_msg_ids: std::sync::Mutex::new(HashSet::new()),
         }
     }
@@ -74,6 +78,7 @@ impl<'a> Feishu<'a> {
         info!("feishu frontend started");
 
         let mut rx = self.rx.lock().await;
+        let mut recover_rx = self.recover_rx.lock().await;
         let api = self.feishu_client.api();
         // All async work (media download + outbound render) goes into one
         // FuturesUnordered so the select loop drives them all concurrently.
@@ -123,6 +128,11 @@ impl<'a> Feishu<'a> {
                         debug!(msg_id = %msg.msg_id, "outbound message received, rendering");
                         tasks.push(Box::pin(self.render_one(&api, msg)));
                     }
+                    recover = recover_rx.recv() => {
+                        if let Some(msg) = recover {
+                            tasks.push(Box::pin(self.handle_recover(msg)));
+                        }
+                    }
                     _ = tasks.next(), if !tasks.is_empty() => {}
                     _ = cancel.cancelled() => {
                         info!("feishu frontend shutting down, draining outbound");
@@ -142,6 +152,56 @@ impl<'a> Feishu<'a> {
                 }
             }
         }
+    }
+
+    /// Handle a recovery message: reprocess if needed, then submit to agent.
+    async fn handle_recover(&self, msg: crate::database::messages::UnrepliedMessage) {
+        info!(
+            db_msg_id = msg.db_msg_id,
+            msg_id = msg.trigger_msg_id,
+            ready = msg.ready,
+            "recovering message"
+        );
+
+        let payload = if msg.ready {
+            // Content already processed — use as-is.
+            Payload {
+                content: msg.content.clone(),
+                file_paths: vec![],
+            }
+        } else {
+            // Need to reprocess media (download + transcribe).
+            let p = self
+                .process_message(&msg.trigger_msg_id, &msg.msg_type, &msg.content)
+                .await;
+            // Update DB to ready.
+            if let Err(e) = self
+                .db
+                .messages
+                .save_ready(msg.db_msg_id, &p.content, &p.file_paths)
+                .await
+            {
+                warn!(db_msg_id = msg.db_msg_id, error = %e, "recovery save_ready failed");
+            }
+            p
+        };
+
+        // Submit task to agent (same as normal flow).
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let task = Task {
+            chat_id: msg.channel.clone(),
+            msg_id: msg.trigger_msg_id.clone(),
+            channel: msg.channel,
+            db_msg_id: Some(msg.db_msg_id),
+            ready: ready_rx,
+            port: self.tx.clone(),
+        };
+        if let Err(e) = self.task_tx.send(task).await {
+            warn!(db_msg_id = msg.db_msg_id, error = %e, "recovery submit_task failed");
+            return;
+        }
+        let _ = ready_tx.send(payload);
+        debug!(db_msg_id = msg.db_msg_id, "recovery task submitted");
     }
 
     /// Slow path: download media, transcribe audio, send ready signal.

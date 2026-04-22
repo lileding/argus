@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::database::Database;
 use crate::embedder::Embedder;
 use crate::gateway::Gateway;
+use crate::recovery::Recovery;
 use crate::upstream::Upstream;
 
 mod agent;
@@ -14,6 +15,7 @@ mod config;
 mod database;
 mod embedder;
 mod gateway;
+mod recovery;
 mod render;
 mod upstream;
 
@@ -76,6 +78,7 @@ async fn main() -> Result<(), AppError> {
         &db,
         &config.workspace_dir,
     );
+    let recovery = Recovery::new(&db, &gateway);
 
     let cancel = CancellationToken::new();
 
@@ -83,6 +86,7 @@ async fn main() -> Result<(), AppError> {
         gateway.run(&cancel),
         agent.run(&cancel),
         embedder.run(&cancel),
+        recovery.run(&cancel),
         shutdown_signal(&cancel),
     );
 

@@ -93,4 +93,42 @@ impl Messages {
 
         Ok(())
     }
+
+    /// Find messages that were never replied to (for crash recovery).
+    /// Only looks at recent messages (last 24h) to avoid replaying ancient history.
+    pub(crate) async fn unreplied(&self) -> super::DbResult<Vec<UnrepliedMessage>> {
+        let rows = sqlx::query(
+            "SELECT id, channel, trigger_msg_id, msg_type, content, ready \
+             FROM messages \
+             WHERE reply_id IS NULL \
+               AND created_at > NOW() - INTERVAL '24 hours' \
+             ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| UnrepliedMessage {
+                db_msg_id: r.get("id"),
+                channel: r.get("channel"),
+                trigger_msg_id: r
+                    .get::<Option<String>, _>("trigger_msg_id")
+                    .unwrap_or_default(),
+                msg_type: r.get("msg_type"),
+                content: r.get("content"),
+                ready: r.get("ready"),
+            })
+            .collect())
+    }
+}
+
+/// A message that needs recovery (no reply yet).
+pub(crate) struct UnrepliedMessage {
+    pub(crate) db_msg_id: i64,
+    pub(crate) channel: String,
+    pub(crate) trigger_msg_id: String,
+    pub(crate) msg_type: String,
+    pub(crate) content: String,
+    pub(crate) ready: bool,
 }
