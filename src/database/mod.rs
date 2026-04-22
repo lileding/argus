@@ -118,4 +118,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "007_conversation_view.sql",
         include_str!("../../internal/store/migrations/007_conversation_view.sql"),
     ),
+    (
+        "008_clean_media_paths.sql",
+        include_str!("../../internal/store/migrations/008_clean_media_paths.sql"),
+    ),
 ];
