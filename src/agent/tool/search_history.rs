@@ -30,8 +30,10 @@ impl<'a, E: EmbedService> Tool for SearchHistory<'a, E> {
     }
 
     fn description(&self) -> &str {
-        "Search past conversation history using semantic similarity. Use this to recall previous \
-         discussions, answers, or context from earlier conversations."
+        "Search past conversation history using semantic similarity. Use SHORT, SPECIFIC keywords \
+         as the query — not full sentences. For example, to find when the user asked about \
+         Schrödinger's equation, search \"薛定谔方程\" not \"第一次问薛定谔方程是什么时候\". \
+         Results include timestamps."
     }
 
     fn parameters(&self) -> Value {
