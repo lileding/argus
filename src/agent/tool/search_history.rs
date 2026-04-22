@@ -64,42 +64,34 @@ impl<'a, E: EmbedService> Tool for SearchHistory<'a, E> {
             Err(e) => return format!("error: embedding failed: {e}"),
         };
 
-        let mut output = String::new();
-        let mut idx = 0;
-
-        // Search user messages + replies in the same channel.
-        if let Ok(results) = self
+        // Search user messages + replies with timestamps.
+        let results = match self
             .db
             .conversation
-            .search(&embedding, ctx.channel, None, limit)
+            .search_with_time(&embedding, ctx.channel, limit)
             .await
         {
-            for (_, similarity, user_msg, reply_msg) in &results {
-                idx += 1;
-                output.push_str(&format!(
-                    "{}. [user, similarity: {:.2}]\n{}\n",
-                    idx, similarity, user_msg.content,
-                ));
-                if let Some(reply) = reply_msg {
-                    output.push_str(&format!("   → reply: {}\n", reply.content));
-                }
-                output.push('\n');
-            }
-        }
+            Ok(r) => r,
+            Err(e) => return format!("error: {e}"),
+        };
 
-        // Also search agent replies.
-        if let Ok(results) = self.db.conversation.search_replies(&embedding, limit).await {
-            for (similarity, msg) in &results {
-                idx += 1;
-                output.push_str(&format!(
-                    "{}. [reply, similarity: {:.2}]\n{}\n\n",
-                    idx, similarity, msg.content,
-                ));
-            }
-        }
-
-        if idx == 0 {
+        if results.is_empty() {
             return "No matching conversation history found.".into();
+        }
+
+        let mut output = String::new();
+        for (i, (similarity, ts, user_content, reply_content)) in results.iter().enumerate() {
+            let time = ts.format("%Y-%m-%d %H:%M");
+            output.push_str(&format!(
+                "{}. [{time}, similarity: {:.2}]\nUser: {}\n",
+                i + 1,
+                similarity,
+                user_content,
+            ));
+            if let Some(reply) = reply_content {
+                output.push_str(&format!("Reply: {reply}\n"));
+            }
+            output.push('\n');
         }
         output
     }

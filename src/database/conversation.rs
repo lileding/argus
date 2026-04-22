@@ -109,6 +109,55 @@ impl Conversation {
         Ok(results)
     }
 
+    /// Semantic search with timestamps — for the search_history tool.
+    /// Returns (similarity, timestamp, user_content, reply_content).
+    pub(crate) async fn search_with_time(
+        &self,
+        embedding: &[f32],
+        channel: &str,
+        limit: i64,
+    ) -> super::DbResult<Vec<(f64, chrono::DateTime<chrono::Utc>, String, Option<String>)>> {
+        let vec = Vector::from(embedding.to_vec());
+        let rows = sqlx::query(
+            "SELECT user_content, reply_content, reply_summary, user_ts, \
+                    1 - (user_embedding <=> $1) AS similarity \
+             FROM conversation \
+             WHERE channel = $2 AND user_embedding IS NOT NULL \
+             ORDER BY user_embedding <=> $1 \
+             LIMIT $3",
+        )
+        .bind(vec)
+        .bind(channel)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let similarity: f64 = row.get("similarity");
+                let ts: chrono::DateTime<chrono::Utc> = row.get("user_ts");
+                let user: String = row.get("user_content");
+                let reply: Option<String> = row.get("reply_content");
+                let summary: Option<String> = row.get("reply_summary");
+                // Use summary for long replies (same as format_reply).
+                let reply_text = reply.map(|r| {
+                    if r.chars().count() > SUMMARY_THRESHOLD {
+                        if let Some(s) = summary
+                            && !s.is_empty()
+                        {
+                            return format!("[Summary] {s}");
+                        }
+                        let t: String = r.chars().take(SUMMARY_THRESHOLD).collect();
+                        return format!("{t} …[truncated]");
+                    }
+                    r
+                });
+                (similarity, ts, user, reply_text)
+            })
+            .collect())
+    }
+
     /// Search notifications (agent replies) by embedding similarity.
     /// Returns assistant messages matching the query, with summary truncation.
     pub(crate) async fn search_replies(
