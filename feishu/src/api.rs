@@ -1,5 +1,7 @@
 //! Feishu REST API calls: send/reply/update messages, download resources.
 
+use serde::Deserialize;
+
 use crate::auth::Auth;
 use crate::types::{ApiResponse, Error, Result, SendMessageData};
 
@@ -160,6 +162,45 @@ impl Api {
 
         Ok(resp.bytes().await?.to_vec())
     }
+
+    /// Upload an image to Feishu. Returns the image_key.
+    pub async fn upload_image(&self, png_data: &[u8]) -> Result<String> {
+        let url = format!("{}/open-apis/im/v1/images", self.auth.base_url());
+        let token = self.auth.token().await?;
+
+        let part = reqwest::multipart::Part::bytes(png_data.to_vec())
+            .file_name("image.png")
+            .mime_str("image/png")
+            .unwrap();
+        let form = reqwest::multipart::Form::new()
+            .text("image_type", "message")
+            .part("image", part);
+
+        let resp: ApiResponse<ImageUploadData> = self
+            .auth
+            .http()
+            .post(&url)
+            .bearer_auth(&token)
+            .multipart(form)
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        if resp.code != 0 {
+            return Err(Error::Api {
+                code: resp.code,
+                msg: resp.msg,
+            });
+        }
+
+        Ok(resp.data.and_then(|d| d.image_key).unwrap_or_default())
+    }
+}
+
+#[derive(Deserialize)]
+struct ImageUploadData {
+    image_key: Option<String>,
 }
 
 #[cfg(test)]

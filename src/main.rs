@@ -14,6 +14,7 @@ mod agent;
 mod config;
 mod database;
 mod gateway;
+mod render;
 mod server;
 mod upstream;
 

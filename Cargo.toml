@@ -27,10 +27,15 @@ async-stream = "0.3"
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-native-tls", "postgres", "chrono"] }
 chrono = { version = "0.4", features = ["serde"] }
 pgvector = { version = "0.4", features = ["sqlx"] }
+ratex-parser = { git = "https://github.com/erweixin/RaTeX" }
+ratex-layout = { git = "https://github.com/erweixin/RaTeX" }
+ratex-render = { git = "https://github.com/erweixin/RaTeX", features = ["embed-fonts"] }
+ratex-types = { git = "https://github.com/erweixin/RaTeX" }
+regex = "1"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "multipart"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 prost = "0.13"

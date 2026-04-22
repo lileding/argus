@@ -551,7 +551,9 @@ impl Feishu {
             match event {
                 Event::Reply { text } => {
                     got_reply = true;
-                    let card_json = markdown_card(&text);
+                    // Process markdown: render LaTeX → upload images → build card.
+                    let processed = crate::render::process_markdown(&text, api).await;
+                    let card_json = crate::render::markdown_to_card(&processed);
                     if let Some(cid) = &card_id {
                         // Update the existing thinking card with the reply.
                         match api.update_message(cid, &card_json).await {
