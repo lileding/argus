@@ -341,6 +341,12 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             })
             .collect();
 
+        debug!(
+            tool_count = tool_defs.len(),
+            tools = ?tool_defs.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            "orchestrator tools registered"
+        );
+
         // Begin trace.
         let mut trace = match db_msg_id {
             Some(mid) => {

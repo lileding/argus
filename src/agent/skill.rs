@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::SKILLS_DIR;
 
@@ -51,7 +51,8 @@ impl SkillIndex {
             }
         }
 
-        debug!(count = entries.len(), "skills loaded");
+        let names: Vec<&str> = entries.keys().map(|s| s.as_str()).collect();
+        info!(count = entries.len(), ?names, "skills loaded");
         Self { entries }
     }
 
