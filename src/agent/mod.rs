@@ -70,6 +70,7 @@ const ORCHESTRATOR_PROMPT: &str = r#"You are the ORCHESTRATOR of an AI agent. Yo
 RULES:
 - You MUST call tools. Text output is ignored — only tool calls matter.
 - The conversation history and user memories are already in your context. If the answer is there (e.g. user's preferences, facts, past discussions), call finish_task immediately with a summary. No need to search.
+- If Available Skills are listed below and the user's request matches one, call activate_skill FIRST to load its instructions, then follow them (e.g. use the db tool as the skill directs).
 - For questions requiring external information, call search, fetch, read_file, or other tools first.
 - When you have enough material, call finish_task with a brief summary of what you found.
 - For opinions or reviews, search from 2-3 different angles for comprehensive coverage.
