@@ -1,3 +1,4 @@
+pub(crate) mod docindex;
 mod embedding;
 mod harness;
 mod worker;
@@ -167,6 +168,11 @@ impl Agent {
                 Arc::clone(&self.synthesizer),
                 self.cancel.clone(),
                 Duration::from_secs(300), // 5 minutes — summary is low priority
+            ));
+            worker_handles.push(worker::spawn_ingester(
+                Arc::clone(&self.db),
+                self.cancel.clone(),
+                Duration::from_secs(30),
             ));
         }
 

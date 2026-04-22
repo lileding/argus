@@ -59,10 +59,58 @@ pub(super) fn spawn_summarizer(
     })
 }
 
-/// One embedding cycle: fetch unembedded messages + notifications, embed, write back.
+/// Spawn the document ingester background task.
+pub(super) fn spawn_ingester(
+    db: Arc<Database>,
+    cancel: CancellationToken,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        info!("ingester worker started");
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {
+                    ingest_cycle(&db).await;
+                }
+                _ = cancel.cancelled() => break,
+            }
+        }
+        info!("ingester worker stopped");
+    })
+}
+
+/// One ingestion cycle: process pending large documents.
+async fn ingest_cycle(db: &Database) {
+    let docs = match db.documents.pending(5).await {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(error = %e, "fetch pending documents failed");
+            return;
+        }
+    };
+    for doc in &docs {
+        if let Err(e) = super::docindex::ingest_document(
+            db,
+            doc.id,
+            &doc.filename,
+            std::path::Path::new(&doc.file_path),
+        )
+        .await
+        {
+            warn!(doc_id = doc.id, filename = doc.filename, error = %e, "document ingestion failed");
+            let _ = db
+                .documents
+                .update_status(doc.id, "error", &e.to_string())
+                .await;
+        }
+    }
+}
+
+/// One embedding cycle: fetch unembedded messages + notifications + chunks, embed, write back.
 async fn embed_cycle(db: &Database, embedder: &EmbeddingClient, batch_size: usize) {
     embed_table(&db.messages, embedder, batch_size, "messages").await;
     embed_table(&db.notifications, embedder, batch_size, "notifications").await;
+    embed_table(&db.documents, embedder, batch_size, "chunks").await;
 }
 
 /// Generic embed helper for any table that has unembedded() + set_embedding().
@@ -105,6 +153,16 @@ impl Embeddable for crate::database::Messages {
     }
     async fn set_embedding(&self, id: i64, embedding: &[f32]) -> anyhow::Result<()> {
         self.set_embedding(id, embedding).await
+    }
+}
+
+#[async_trait::async_trait]
+impl Embeddable for crate::database::Documents {
+    async fn unembedded(&self, limit: i64) -> anyhow::Result<Vec<(i64, String)>> {
+        self.unembedded_chunks(limit).await
+    }
+    async fn set_embedding(&self, id: i64, embedding: &[f32]) -> anyhow::Result<()> {
+        self.set_chunk_embedding(id, embedding).await
     }
 }
 

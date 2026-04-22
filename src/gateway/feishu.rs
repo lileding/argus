@@ -381,10 +381,20 @@ impl Feishu {
             .unwrap_or_else(|| ".bin".into());
 
         match self.download_and_save(msg_id, file_key, "file", &ext).await {
-            Ok(filename) => Payload {
-                content: format!("The user sent a file '{file_name}'."),
-                file_paths: vec![filename],
-            },
+            Ok(filename) => {
+                // Index the document for RAG.
+                crate::agent::docindex::process_upload(
+                    &self.db,
+                    &self.workspace_dir,
+                    file_name,
+                    &filename,
+                )
+                .await;
+                Payload {
+                    content: format!("The user sent a file '{file_name}'."),
+                    file_paths: vec![filename],
+                }
+            }
             Err(e) => {
                 warn!(msg_id, file_key, file_name, error = %e, "file download failed");
                 Payload {

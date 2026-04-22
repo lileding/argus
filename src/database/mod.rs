@@ -1,4 +1,5 @@
 mod conversation;
+mod documents;
 mod messages;
 mod notifications;
 
@@ -10,6 +11,7 @@ use tracing::info;
 
 use crate::config::DatabaseConfig;
 
+pub(crate) use documents::Documents;
 pub(crate) use messages::{InboundMessage, Messages};
 pub(crate) use notifications::Notifications;
 
@@ -19,6 +21,7 @@ pub(crate) struct Database {
     pub(crate) messages: messages::Messages,
     pub(crate) notifications: notifications::Notifications,
     pub(crate) conversation: conversation::Conversation,
+    pub(crate) documents: documents::Documents,
 }
 
 impl Database {
@@ -38,7 +41,8 @@ impl Database {
         Ok(Arc::new(Self {
             messages: messages::Messages::new(pool.clone()),
             notifications: notifications::Notifications::new(pool.clone()),
-            conversation: conversation::Conversation::new(pool),
+            conversation: conversation::Conversation::new(pool.clone()),
+            documents: documents::Documents::new(pool),
         }))
     }
 }
