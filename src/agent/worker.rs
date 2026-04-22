@@ -106,11 +106,12 @@ async fn ingest_cycle(db: &Database) {
     }
 }
 
-/// One embedding cycle: fetch unembedded messages + notifications + chunks, embed, write back.
+/// One embedding cycle: fetch unembedded messages + notifications + chunks + memories.
 async fn embed_cycle(db: &Database, embedder: &EmbeddingClient, batch_size: usize) {
     embed_table(&db.messages, embedder, batch_size, "messages").await;
     embed_table(&db.notifications, embedder, batch_size, "notifications").await;
     embed_table(&db.documents, embedder, batch_size, "chunks").await;
+    embed_table(&db.memories, embedder, batch_size, "memories").await;
 }
 
 /// Generic embed helper for any table that has unembedded() + set_embedding().
@@ -148,6 +149,16 @@ trait Embeddable {
 
 #[async_trait::async_trait]
 impl Embeddable for crate::database::Messages {
+    async fn unembedded(&self, limit: i64) -> anyhow::Result<Vec<(i64, String)>> {
+        self.unembedded(limit).await
+    }
+    async fn set_embedding(&self, id: i64, embedding: &[f32]) -> anyhow::Result<()> {
+        self.set_embedding(id, embedding).await
+    }
+}
+
+#[async_trait::async_trait]
+impl Embeddable for crate::database::Memories {
     async fn unembedded(&self, limit: i64) -> anyhow::Result<Vec<(i64, String)>> {
         self.unembedded(limit).await
     }

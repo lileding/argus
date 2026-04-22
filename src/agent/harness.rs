@@ -26,7 +26,25 @@ pub(super) async fn build_context(
     exclude_msg_id: Option<i64>,
     context_window: usize,
 ) -> Vec<model::Message> {
-    let mut messages = vec![model::Message::system(system_prompt)];
+    // Build system prompt with pinned memories.
+    let system_content = if let Ok(memories) = db.memories.list_active().await {
+        if memories.is_empty() {
+            system_prompt.to_string()
+        } else {
+            let memory_lines: Vec<String> = memories
+                .iter()
+                .map(|m| format!("- [{}] {}", m.category, m.content))
+                .collect();
+            format!(
+                "{}\n\n## User Memories\n\n{}",
+                system_prompt,
+                memory_lines.join("\n")
+            )
+        }
+    } else {
+        system_prompt.to_string()
+    };
+    let mut messages = vec![model::Message::system(system_content)];
 
     // Semantic recall (if embedder available).
     // Search both user messages AND agent replies — the answer to "what did I say
