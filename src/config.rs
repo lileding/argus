@@ -24,6 +24,9 @@ pub(crate) struct Config {
     /// Database connection.
     #[serde(default)]
     pub(crate) database: DatabaseConfig,
+    /// Background indexer (embedding, summarization, ingestion).
+    #[serde(default)]
+    pub(crate) embedder: EmbedderConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -33,7 +36,7 @@ pub(crate) struct DatabaseConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct EmbeddingConfig {
+pub(crate) struct EmbedderConfig {
     /// Which upstream provides the embedding endpoint.
     #[serde(default)]
     pub(crate) upstream: String,
@@ -43,15 +46,23 @@ pub(crate) struct EmbeddingConfig {
     pub(crate) batch_size: usize,
     #[serde(default = "default_interval_secs")]
     pub(crate) interval_secs: u64,
+    /// Run summarizer every N ticks (default 10 = 5min at 30s base).
+    #[serde(default = "default_summary_interval_ticks")]
+    pub(crate) summary_interval_ticks: u64,
+    /// Which upstream + model for generating summaries.
+    #[serde(default)]
+    pub(crate) summarizer: RoleConfig,
 }
 
-impl Default for EmbeddingConfig {
+impl Default for EmbedderConfig {
     fn default() -> Self {
         Self {
             upstream: String::new(),
             model_name: default_embedding_model(),
             batch_size: default_batch_size(),
             interval_secs: default_interval_secs(),
+            summary_interval_ticks: default_summary_interval_ticks(),
+            summarizer: RoleConfig::default(),
         }
     }
 }
@@ -64,6 +75,9 @@ fn default_batch_size() -> usize {
 }
 fn default_interval_secs() -> u64 {
     30
+}
+fn default_summary_interval_ticks() -> u64 {
+    10
 }
 
 /// Frontend config. The HashMap key is the frontend type ("feishu", etc.).
@@ -93,14 +107,11 @@ pub(crate) struct AgentConfig {
     #[serde(default)]
     #[allow(dead_code)] // Used when whisper transcription is added.
     pub(crate) transcription: RoleConfig,
-    #[serde(default)]
-    pub(crate) embedding: EmbeddingConfig,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            embedding: EmbeddingConfig::default(),
             max_iterations: default_max_iterations(),
             orchestrator_context_window: default_context_window(),
             orchestrator: RoleConfig::default(),
@@ -182,12 +193,22 @@ fn default_timeout() -> u64 {
     120
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ConfigError {
+    #[error("toml: {0}")]
+    Toml(#[from] toml::de::Error),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Invalid(String),
+}
+
 // --- Loading ---
 
 impl Config {
     /// Load config from TOML file. Falls back to defaults if file doesn't exist.
     /// Resolves workspace_dir to absolute (expand ~, join with cwd if relative).
-    pub(crate) fn load(config_path: &Path) -> anyhow::Result<Self> {
+    pub(crate) fn load(config_path: &Path) -> Result<Self, ConfigError> {
         let mut config: Config = if config_path.exists() {
             let content = std::fs::read_to_string(config_path)?;
             let c: Config = toml::from_str(&content)?;
@@ -205,7 +226,7 @@ impl Config {
         let ws_str = config
             .workspace_dir
             .to_str()
-            .ok_or_else(|| anyhow::anyhow!("workspace_dir contains invalid UTF-8"))?;
+            .ok_or_else(|| ConfigError::Invalid("workspace_dir contains invalid UTF-8".into()))?;
         config.workspace_dir = resolve_path(ws_str)?;
         std::fs::create_dir_all(&config.workspace_dir)?;
 
@@ -215,7 +236,7 @@ impl Config {
 }
 
 /// Expand ~ and resolve relative paths to absolute using cwd.
-fn resolve_path(path: &str) -> anyhow::Result<PathBuf> {
+fn resolve_path(path: &str) -> Result<PathBuf, ConfigError> {
     let expanded = expand_tilde(path);
     if expanded.is_absolute() {
         Ok(expanded)

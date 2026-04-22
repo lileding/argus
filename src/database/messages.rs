@@ -24,7 +24,7 @@ impl Messages {
 
     /// Save a new inbound user message with ready=false.
     /// Returns the database-assigned message ID.
-    pub(crate) async fn save_received(&self, msg: &InboundMessage<'_>) -> anyhow::Result<i64> {
+    pub(crate) async fn save_received(&self, msg: &InboundMessage<'_>) -> super::DbResult<i64> {
         let row = sqlx::query(
             "INSERT INTO messages \
                 (channel, content, msg_type, sender_id, trigger_msg_id, source_ts, ready) \
@@ -50,7 +50,7 @@ impl Messages {
         msg_id: i64,
         content: &str,
         file_paths: &[String],
-    ) -> anyhow::Result<()> {
+    ) -> super::DbResult<()> {
         sqlx::query(
             "UPDATE messages \
              SET content = $1, file_paths = $2, ready = TRUE \
@@ -66,7 +66,7 @@ impl Messages {
     }
 
     /// Fetch messages that haven't been embedded yet.
-    pub(crate) async fn unembedded(&self, limit: i64) -> anyhow::Result<Vec<(i64, String)>> {
+    pub(crate) async fn unembedded(&self, limit: i64) -> super::DbResult<Vec<(i64, String)>> {
         let rows = sqlx::query(
             "SELECT id, content FROM messages \
              WHERE embedding IS NULL AND content != '' \
@@ -83,7 +83,7 @@ impl Messages {
     }
 
     /// Set the embedding vector for a message.
-    pub(crate) async fn set_embedding(&self, id: i64, embedding: &[f32]) -> anyhow::Result<()> {
+    pub(crate) async fn set_embedding(&self, id: i64, embedding: &[f32]) -> super::DbResult<()> {
         let vec = Vector::from(embedding.to_vec());
         sqlx::query("UPDATE messages SET embedding = $1 WHERE id = $2 AND embedding IS NULL")
             .bind(vec)

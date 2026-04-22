@@ -1,13 +1,9 @@
-#[allow(dead_code)] // Complete API types — not all used before tool system.
 pub(crate) mod types;
 
-#[allow(dead_code)]
 mod anthropic;
-#[allow(dead_code)]
 mod openai;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use tracing::info;
 
 use crate::config::{RoleConfig, UpstreamConfig};
@@ -36,7 +32,7 @@ impl Upstream {
     }
 
     /// Create a model client for a specific agent role.
-    pub(crate) fn client_for(&self, role: &RoleConfig) -> ClientResult<Arc<dyn Client>> {
+    pub(crate) fn client_for(&self, role: &RoleConfig) -> ClientResult<Box<dyn Client>> {
         if role.upstream.is_empty() {
             return Err(ClientError::Other(
                 "no upstream configured for this role".into(),
@@ -61,10 +57,10 @@ impl Upstream {
 fn create_provider_client(
     upstream: &UpstreamConfig,
     role: &RoleConfig,
-) -> ClientResult<Arc<dyn Client>> {
+) -> ClientResult<Box<dyn Client>> {
     match upstream.provider_type.as_str() {
-        "openai" => Ok(Arc::new(openai::OpenAiClient::new(upstream, role))),
-        "anthropic" => Ok(Arc::new(anthropic::AnthropicClient::new(upstream, role))),
+        "openai" => Ok(Box::new(openai::OpenAiClient::new(upstream, role))),
+        "anthropic" => Ok(Box::new(anthropic::AnthropicClient::new(upstream, role))),
         "gemini" => {
             info!("gemini: using OpenAI-compatible endpoint");
             let mut gemini_upstream = upstream.clone();
@@ -72,7 +68,7 @@ fn create_provider_client(
                 gemini_upstream.base_url =
                     "https://generativelanguage.googleapis.com/v1beta/openai".into();
             }
-            Ok(Arc::new(openai::OpenAiClient::new(&gemini_upstream, role)))
+            Ok(Box::new(openai::OpenAiClient::new(&gemini_upstream, role)))
         }
         other => Err(ClientError::Other(format!(
             "unknown provider type: {other}"

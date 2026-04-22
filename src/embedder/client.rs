@@ -3,8 +3,22 @@
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+#[derive(Debug, thiserror::Error)]
+pub(super) enum EmbedClientError {
+    #[error("http: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("api error ({status}): {message}")]
+    Api { status: u16, message: String },
+    #[error("{0}")]
+    Other(String),
+}
+
+pub(super) type EmbedResult<T> = Result<T, EmbedClientError>;
+
 /// Embedding client for converting text → vector.
-pub(crate) struct EmbeddingClient {
+pub(super) struct EmbeddingClient {
     http: reqwest::Client,
     url: String,
     api_key: String,
@@ -12,7 +26,11 @@ pub(crate) struct EmbeddingClient {
 }
 
 impl EmbeddingClient {
-    pub(crate) fn new(base_url: &str, api_key: &str, model: &str) -> Self {
+    pub(super) fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    pub(super) fn new(base_url: &str, api_key: &str, model: &str) -> Self {
         Self {
             http: reqwest::Client::new(),
             url: format!("{}/embeddings", base_url.trim_end_matches('/')),
@@ -22,15 +40,15 @@ impl EmbeddingClient {
     }
 
     /// Embed a single text string.
-    pub(crate) async fn embed_one(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+    pub(super) async fn embed_one(&self, text: &str) -> EmbedResult<Vec<f32>> {
         let vecs = self.embed_batch(&[text]).await?;
         vecs.into_iter()
             .next()
-            .ok_or_else(|| anyhow::anyhow!("empty embedding response"))
+            .ok_or_else(|| EmbedClientError::Other("empty embedding response".into()))
     }
 
     /// Embed a batch of text strings. Returns vectors in the same order.
-    pub(crate) async fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+    pub(super) async fn embed_batch(&self, texts: &[&str]) -> EmbedResult<Vec<Vec<f32>>> {
         let body = EmbedRequest {
             model: &self.model,
             input: texts,
@@ -46,7 +64,10 @@ impl EmbeddingClient {
         let text = resp.text().await?;
 
         if !status.is_success() {
-            anyhow::bail!("embedding API error ({}): {}", status, text);
+            return Err(EmbedClientError::Api {
+                status: status.as_u16(),
+                message: text,
+            });
         }
 
         let parsed: EmbedResponse = serde_json::from_str(&text)?;

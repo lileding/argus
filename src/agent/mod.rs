@@ -1,17 +1,10 @@
-pub(crate) mod docindex;
-mod embedding;
 mod harness;
-mod worker;
-
-use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::database::Database;
-use crate::server::Server;
 use crate::upstream;
 use crate::upstream::types as model;
 
@@ -22,11 +15,16 @@ pub(crate) struct Payload {
     pub(crate) file_paths: Vec<String>,
 }
 
-/// Trait for receiving messages from the Agent. Defined in the agent
-/// module so Agent never imports frontend. Frontend implements this.
+/// Embedding service for semantic recall. Defined here so Agent never
+/// imports Embedder. Embedder implements this; main wires them together.
 #[async_trait::async_trait]
-pub(crate) trait MessageSink: Send + Sync {
-    async fn submit_message(&self, msg: Message);
+pub(crate) trait EmbedService: Send + Sync {
+    async fn embed_one(
+        &self,
+        text: &str,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>>;
+
+    fn model_name(&self) -> &str;
 }
 
 pub(crate) struct Task {
@@ -37,7 +35,7 @@ pub(crate) struct Task {
     /// Database row ID (None if DB not available).
     pub(crate) db_msg_id: Option<i64>,
     pub(crate) ready: oneshot::Receiver<Payload>,
-    pub(crate) frontend: Arc<dyn MessageSink>,
+    pub(crate) port: mpsc::Sender<Message>,
 }
 
 pub(crate) struct Message {
@@ -76,108 +74,46 @@ RULES:
 
 // --- Agent ---
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum AgentError {
-    #[error("task queue closed")]
-    QueueClosed,
-}
-
-impl<T> From<mpsc::error::SendError<T>> for AgentError {
-    fn from(_: mpsc::error::SendError<T>) -> Self {
-        Self::QueueClosed
-    }
-}
-
-pub(crate) struct Agent {
+pub(crate) struct Agent<'a, E: EmbedService> {
     tx: mpsc::Sender<Task>,
     rx: Mutex<mpsc::Receiver<Task>>,
-    cancel: CancellationToken,
-    db: Arc<Database>,
-    orchestrator: Arc<dyn upstream::Client>,
-    synthesizer: Arc<dyn upstream::Client>,
-    embedder: Option<Arc<embedding::EmbeddingClient>>,
-    embedding_interval: Duration,
-    embedding_batch_size: usize,
+    db: &'a Database,
+    orchestrator: Box<dyn upstream::Client>,
+    synthesizer: Box<dyn upstream::Client>,
+    embed_service: &'a E,
     context_window: usize,
 }
 
-impl Agent {
+impl<'a, E: EmbedService> Agent<'a, E> {
     pub(crate) fn new(
         config: &crate::config::AgentConfig,
         upstream_reg: &upstream::Upstream,
-        db: &Arc<Database>,
-    ) -> Result<Arc<Self>, upstream::types::ClientError> {
+        db: &'a Database,
+        embed_service: &'a E,
+    ) -> Result<Self, upstream::types::ClientError> {
         let orchestrator = upstream_reg.client_for(&config.orchestrator)?;
         let synthesizer = upstream_reg.client_for(&config.synthesizer)?;
-
-        // Embedding client (optional: only if upstream is configured).
-        let embedder = if !config.embedding.upstream.is_empty() {
-            let up_cfg = upstream_reg
-                .get_config(&config.embedding.upstream)
-                .ok_or_else(|| {
-                    upstream::types::ClientError::Other(format!(
-                        "embedding upstream '{}' not found",
-                        config.embedding.upstream
-                    ))
-                })?;
-            let base_url = up_cfg.effective_base_url();
-            Some(Arc::new(embedding::EmbeddingClient::new(
-                base_url,
-                &up_cfg.api_key,
-                &config.embedding.model_name,
-            )))
-        } else {
-            None
-        };
 
         info!(
             orchestrator = config.orchestrator.model_name,
             synthesizer = config.synthesizer.model_name,
-            embedding = embedder.is_some(),
-            "agent initialized"
+            embedding = embed_service.model_name(),
         );
 
         let (tx, rx) = mpsc::channel(64);
-        Ok(Arc::new(Agent {
+        Ok(Agent {
             tx,
             rx: Mutex::new(rx),
-            cancel: CancellationToken::new(),
-            db: Arc::clone(db),
+            db,
             orchestrator,
             synthesizer,
-            embedder,
-            embedding_interval: Duration::from_secs(config.embedding.interval_secs),
-            embedding_batch_size: config.embedding.batch_size,
+            embed_service,
             context_window: config.orchestrator_context_window,
-        }))
+        })
     }
 
-    async fn run_inner(self: &Arc<Self>) {
+    pub(crate) async fn run(&self, cancel: &CancellationToken) {
         info!("agent scheduler started");
-
-        // Spawn background workers.
-        let mut worker_handles = Vec::new();
-        if let Some(embedder) = &self.embedder {
-            worker_handles.push(worker::spawn_embedder(
-                Arc::clone(&self.db),
-                Arc::clone(embedder),
-                self.cancel.clone(),
-                self.embedding_batch_size,
-                self.embedding_interval,
-            ));
-            worker_handles.push(worker::spawn_summarizer(
-                Arc::clone(&self.db),
-                Arc::clone(&self.synthesizer),
-                self.cancel.clone(),
-                Duration::from_secs(300), // 5 minutes — summary is low priority
-            ));
-            worker_handles.push(worker::spawn_ingester(
-                Arc::clone(&self.db),
-                self.cancel.clone(),
-                Duration::from_secs(30),
-            ));
-        }
-
         let mut rx = self.rx.lock().await;
         loop {
             tokio::select! {
@@ -188,15 +124,11 @@ impl Agent {
                     };
                     self.process_task(task).await;
                 }
-                _ = self.cancel.cancelled() => {
+                _ = cancel.cancelled() => {
                     info!("agent received shutdown signal");
                     break;
                 }
             }
-        }
-        // Wait for background workers to finish.
-        for handle in worker_handles {
-            let _ = handle.await;
         }
         info!("agent scheduler stopped");
     }
@@ -216,7 +148,10 @@ impl Agent {
             msg_id: task.msg_id.clone(),
             events: events_rx,
         };
-        task.frontend.submit_message(msg).await;
+        if task.port.send(msg).await.is_err() {
+            warn!("outbound channel closed, dropping message");
+            return;
+        }
 
         // Wait for payload.
         let payload = match task.ready.await {
@@ -235,8 +170,8 @@ impl Agent {
 
         // Build context with conversation history (semantic recall + sliding window).
         let orch_messages = harness::build_context(
-            &self.db,
-            self.embedder.as_deref(),
+            self.db,
+            Some(self.embed_service),
             ORCHESTRATOR_PROMPT,
             &task.channel,
             &payload.content,
@@ -343,19 +278,8 @@ impl Agent {
         Ok(full_reply)
     }
 
-    pub(crate) async fn submit_task(&self, task: Task) -> Result<(), AgentError> {
-        self.tx.send(task).await?;
-        Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl Server for Agent {
-    async fn run(self: Arc<Self>) {
-        self.run_inner().await;
-    }
-
-    async fn stop(&self) {
-        self.cancel.cancel();
+    /// Clone the task submission channel for use by IM adapters.
+    pub(crate) fn port(&self) -> mpsc::Sender<Task> {
+        self.tx.clone()
     }
 }

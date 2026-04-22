@@ -509,6 +509,7 @@ fn sse_to_stream(mut es: EventSource) -> impl Stream<Item = StreamChunk> {
     }
 }
 
+#[allow(dead_code)]
 struct PendingToolCall {
     id: String,
     name: String,
@@ -617,6 +618,7 @@ struct SseMessageUsage {
     #[serde(default)]
     input_tokens: u32,
     #[serde(default)]
+    #[allow(dead_code)]
     output_tokens: u32,
 }
 

@@ -23,7 +23,7 @@ impl Documents {
         &self,
         filename: &str,
         file_path: &str,
-    ) -> anyhow::Result<i64> {
+    ) -> super::DbResult<i64> {
         let row = sqlx::query(
             "INSERT INTO documents (filename, file_path, status) \
              VALUES ($1, $2, 'pending') \
@@ -42,12 +42,16 @@ impl Documents {
         id: i64,
         status: &str,
         error_msg: &str,
-    ) -> anyhow::Result<()> {
+    ) -> super::DbResult<()> {
         let valid_from: &[&str] = match status {
             "processing" => &["pending"],
             "ready" => &["processing"],
             "error" => &["pending", "processing"],
-            _ => anyhow::bail!("invalid document status: {status}"),
+            _ => {
+                return Err(super::DatabaseError::InvalidState(format!(
+                    "invalid document status: {status}"
+                )));
+            }
         };
         let result = sqlx::query(
             "UPDATE documents SET status = $1, error_msg = $2 \
@@ -61,13 +65,15 @@ impl Documents {
         .await?;
 
         if result.rows_affected() == 0 {
-            anyhow::bail!("document {id}: stale status transition to '{status}'");
+            return Err(super::DatabaseError::InvalidState(format!(
+                "document {id}: stale status transition to '{status}'"
+            )));
         }
         Ok(())
     }
 
     /// Fetch pending documents for background processing.
-    pub(crate) async fn pending(&self, limit: i64) -> anyhow::Result<Vec<PendingDocument>> {
+    pub(crate) async fn pending(&self, limit: i64) -> super::DbResult<Vec<PendingDocument>> {
         let rows = sqlx::query(
             "SELECT id, filename, file_path FROM documents \
              WHERE status = 'pending' ORDER BY id LIMIT $1",
@@ -87,7 +93,7 @@ impl Documents {
     }
 
     /// Save text chunks for a document (transactional).
-    pub(crate) async fn save_chunks(&self, doc_id: i64, chunks: &[String]) -> anyhow::Result<()> {
+    pub(crate) async fn save_chunks(&self, doc_id: i64, chunks: &[String]) -> super::DbResult<()> {
         let mut tx = self.pool.begin().await?;
         for (i, content) in chunks.iter().enumerate() {
             sqlx::query(
@@ -105,7 +111,10 @@ impl Documents {
     }
 
     /// Fetch chunks without embeddings.
-    pub(crate) async fn unembedded_chunks(&self, limit: i64) -> anyhow::Result<Vec<(i64, String)>> {
+    pub(crate) async fn unembedded_chunks(
+        &self,
+        limit: i64,
+    ) -> super::DbResult<Vec<(i64, String)>> {
         let rows = sqlx::query(
             "SELECT id, content FROM chunks \
              WHERE embedding IS NULL ORDER BY id LIMIT $1",
@@ -125,7 +134,7 @@ impl Documents {
         &self,
         id: i64,
         embedding: &[f32],
-    ) -> anyhow::Result<()> {
+    ) -> super::DbResult<()> {
         let vec = Vector::from(embedding.to_vec());
         sqlx::query("UPDATE chunks SET embedding = $1 WHERE id = $2 AND embedding IS NULL")
             .bind(vec)

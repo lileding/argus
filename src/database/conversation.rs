@@ -32,7 +32,7 @@ impl Conversation {
         channel: &str,
         exclude_id: Option<i64>,
         limit: i64,
-    ) -> anyhow::Result<Vec<(i64, model::Message, Option<model::Message>)>> {
+    ) -> super::DbResult<Vec<(i64, model::Message, Option<model::Message>)>> {
         let rows = sqlx::query(
             "SELECT id, user_content, reply_content, reply_summary \
              FROM conversation \
@@ -70,7 +70,7 @@ impl Conversation {
         channel: &str,
         exclude_id: Option<i64>,
         limit: i64,
-    ) -> anyhow::Result<Vec<(i64, f64, model::Message, Option<model::Message>)>> {
+    ) -> super::DbResult<Vec<(i64, f64, model::Message, Option<model::Message>)>> {
         let vec = Vector::from(embedding.to_vec());
         let rows = sqlx::query(
             "SELECT id, user_content, reply_content, reply_summary, \
@@ -115,7 +115,7 @@ impl Conversation {
         &self,
         embedding: &[f32],
         limit: i64,
-    ) -> anyhow::Result<Vec<(f64, model::Message)>> {
+    ) -> super::DbResult<Vec<(f64, model::Message)>> {
         let vec = Vector::from(embedding.to_vec());
         let rows = sqlx::query(
             "SELECT content, summary, \

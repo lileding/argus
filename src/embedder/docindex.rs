@@ -5,7 +5,17 @@ use std::path::Path;
 use tracing::{info, warn};
 
 use crate::config::MEDIA_DIR;
-use crate::database::Database;
+use crate::database::{Database, DatabaseError};
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum IngestError {
+    #[error(transparent)]
+    Database(#[from] DatabaseError),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Extract(String),
+}
 
 /// Max file size for inline processing (during upload). Larger files are queued.
 const INLINE_SIZE_LIMIT: u64 = 1_000_000; // 1 MB
@@ -63,19 +73,19 @@ pub(crate) async fn process_upload(
 }
 
 /// Ingest a document: extract text → chunk → save chunks → mark ready.
-/// Used both inline (small files) and by the background worker (large files).
+/// Used both inline (small files) and by the background ingester (large files).
 pub(super) async fn ingest_document(
     db: &Database,
     doc_id: i64,
     filename: &str,
     abs_path: &Path,
-) -> anyhow::Result<()> {
+) -> Result<(), IngestError> {
     db.documents.update_status(doc_id, "processing", "").await?;
 
     let text = extract_text(filename, abs_path).await?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        anyhow::bail!("no text content extracted");
+        return Err(IngestError::Extract("no text content extracted".into()));
     }
 
     let chunks = chunk_text(trimmed, CHUNK_SIZE, CHUNK_OVERLAP);
@@ -87,7 +97,7 @@ pub(super) async fn ingest_document(
 }
 
 /// Extract text from a file based on extension.
-async fn extract_text(filename: &str, path: &Path) -> anyhow::Result<String> {
+async fn extract_text(filename: &str, path: &Path) -> Result<String, IngestError> {
     let lower = filename.to_lowercase();
     let path_str = path.to_str().unwrap_or("");
 
@@ -103,7 +113,7 @@ async fn extract_text(filename: &str, path: &Path) -> anyhow::Result<String> {
 }
 
 /// Run a shell command and return its stdout.
-async fn run_command(program: &str, args: &[&str]) -> anyhow::Result<String> {
+async fn run_command(program: &str, args: &[&str]) -> Result<String, IngestError> {
     let output = tokio::process::Command::new(program)
         .args(args)
         .output()
@@ -111,7 +121,7 @@ async fn run_command(program: &str, args: &[&str]) -> anyhow::Result<String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("{program} failed: {stderr}");
+        return Err(IngestError::Extract(format!("{program} failed: {stderr}")));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())

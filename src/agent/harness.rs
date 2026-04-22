@@ -7,7 +7,6 @@ use std::collections::HashSet;
 
 use tracing::debug;
 
-use super::embedding::EmbeddingClient;
 use crate::database::Database;
 use crate::upstream::types as model;
 
@@ -19,7 +18,7 @@ const RECALL_BYTES_BUDGET: usize = 6000;
 /// `exclude_msg_id` is the current message's DB ID (excluded from queries to avoid self-reference).
 pub(super) async fn build_context(
     db: &Database,
-    embedder: Option<&EmbeddingClient>,
+    embedder: Option<&dyn super::EmbedService>,
     system_prompt: &str,
     channel: &str,
     user_text: &str,

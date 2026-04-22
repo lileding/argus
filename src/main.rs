@@ -1,22 +1,33 @@
-use std::sync::Arc;
-
 use clap::Parser;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::agent::Agent;
 use crate::config::Config;
 use crate::database::Database;
+use crate::embedder::Embedder;
 use crate::gateway::Gateway;
-use crate::server::Server;
 use crate::upstream::Upstream;
 
 mod agent;
 mod config;
 mod database;
+mod embedder;
 mod gateway;
 mod render;
-mod server;
 mod upstream;
+
+#[derive(Debug, thiserror::Error)]
+enum AppError {
+    #[error("config: {0}")]
+    Config(#[from] config::ConfigError),
+    #[error("database: {0}")]
+    Database(#[from] database::DatabaseError),
+    #[error("embedder: {0}")]
+    Embedder(#[from] embedder::EmbedderError),
+    #[error("upstream: {0}")]
+    Upstream(#[from] upstream::types::ClientError),
+}
 
 #[derive(Parser)]
 #[command(name = "argus", about = "Personal AI assistant")]
@@ -26,8 +37,15 @@ struct Cli {
     config: String,
 }
 
+async fn shutdown_signal(cancel: &CancellationToken) {
+    info!("argus running, press Ctrl-C to stop");
+    tokio::signal::ctrl_c().await.ok();
+    info!("shutdown initiated");
+    cancel.cancel();
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), AppError> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -43,28 +61,18 @@ async fn main() -> anyhow::Result<()> {
 
     let db = Database::connect(&config.database).await?;
     let upstream = Upstream::new(&config.upstream);
-    let agent = Agent::new(&config.agent, &upstream, &db)?;
-    let gateway = Gateway::new(&config.gateway, &agent, &db, &config.workspace_dir);
+    let embedder = Embedder::new(&config.embedder, &upstream, &db)?;
+    let agent = Agent::new(&config.agent, &upstream, &db, &embedder)?;
+    let gateway = Gateway::new(&config.gateway, agent.port(), &db, &config.workspace_dir);
 
-    // Spawn both servers.
-    let gateway_handle = {
-        let g = Arc::clone(&gateway);
-        tokio::spawn(async move { g.run().await })
-    };
-    let agent_handle = {
-        let a = Arc::clone(&agent);
-        tokio::spawn(async move { a.run().await })
-    };
+    let cancel = CancellationToken::new();
 
-    info!("argus running, press Ctrl-C to stop");
-    tokio::signal::ctrl_c().await.ok();
-    info!("shutdown initiated");
-
-    // Shutdown: agent first, then gateway.
-    agent.stop().await;
-    let _ = agent_handle.await;
-    gateway.stop().await;
-    let _ = gateway_handle.await;
+    tokio::join!(
+        gateway.run(&cancel),
+        agent.run(&cancel),
+        embedder.run(&cancel),
+        shutdown_signal(&cancel),
+    );
 
     info!("argus stopped");
     Ok(())

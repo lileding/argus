@@ -18,7 +18,7 @@ impl Memories {
     }
 
     /// List all active memories (for prompt injection).
-    pub(crate) async fn list_active(&self) -> anyhow::Result<Vec<Memory>> {
+    pub(crate) async fn list_active(&self) -> super::DbResult<Vec<Memory>> {
         let rows = sqlx::query(
             "SELECT category, content FROM memories \
              WHERE active = TRUE ORDER BY created_at",
@@ -36,7 +36,7 @@ impl Memories {
     }
 
     /// Fetch memories without embeddings.
-    pub(crate) async fn unembedded(&self, limit: i64) -> anyhow::Result<Vec<(i64, String)>> {
+    pub(crate) async fn unembedded(&self, limit: i64) -> super::DbResult<Vec<(i64, String)>> {
         let rows = sqlx::query(
             "SELECT id, content FROM memories \
              WHERE embedding IS NULL AND active = TRUE \
@@ -53,7 +53,7 @@ impl Memories {
     }
 
     /// Set embedding for a memory.
-    pub(crate) async fn set_embedding(&self, id: i64, embedding: &[f32]) -> anyhow::Result<()> {
+    pub(crate) async fn set_embedding(&self, id: i64, embedding: &[f32]) -> super::DbResult<()> {
         let vec = Vector::from(embedding.to_vec());
         sqlx::query("UPDATE memories SET embedding = $1 WHERE id = $2 AND embedding IS NULL")
             .bind(vec)

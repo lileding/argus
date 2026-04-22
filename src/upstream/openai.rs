@@ -351,6 +351,7 @@ fn parse_sse_data(data: &str) -> Option<StreamChunk> {
 
 // --- Tracking tool calls during streaming ---
 
+#[allow(dead_code)] // Constructed in chat_with_early_abort.
 struct PendingToolCall {
     id: String,
     name: String,

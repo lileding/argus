@@ -73,6 +73,7 @@ impl Message {
         }
     }
 
+    #[allow(dead_code)] // Used when tool system is implemented.
     pub(crate) fn tool_result(
         call_id: impl Into<String>,
         name: impl Into<String>,
@@ -127,8 +128,11 @@ pub(crate) struct ToolCall {
 #[derive(Debug, Clone)]
 pub(crate) struct Response {
     pub(crate) content: String,
+    #[allow(dead_code)] // Read when tool system dispatches tool calls.
     pub(crate) tool_calls: Vec<ToolCall>,
+    #[allow(dead_code)]
     pub(crate) finish_reason: FinishReason,
+    #[allow(dead_code)]
     pub(crate) usage: Usage,
 }
 
@@ -137,14 +141,18 @@ pub(crate) enum FinishReason {
     Stop,
     ToolCalls,
     Length,
+    #[allow(dead_code)]
     EarlyAbort,
     Other(String),
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Usage {
+    #[allow(dead_code)]
     pub(crate) prompt_tokens: u32,
+    #[allow(dead_code)]
     pub(crate) completion_tokens: u32,
+    #[allow(dead_code)]
     pub(crate) total_tokens: u32,
 }
 
@@ -153,28 +161,25 @@ pub(crate) struct Usage {
 /// Incremental tool call delta from a streaming response.
 #[derive(Debug, Clone)]
 pub(crate) struct ToolCallDelta {
-    /// Index of this tool call in the array (for parallel tool calls).
+    #[allow(dead_code)]
     pub(crate) index: usize,
-    /// Tool call ID (only present on the first delta for this index).
+    #[allow(dead_code)]
     pub(crate) id: Option<String>,
-    /// Function name (only present on the first delta for this index).
+    #[allow(dead_code)]
     pub(crate) name: Option<String>,
-    /// Incremental JSON arguments fragment.
+    #[allow(dead_code)]
     pub(crate) arguments_delta: String,
 }
 
 /// A chunk from a streaming chat response.
 #[derive(Debug, Clone)]
 pub(crate) struct StreamChunk {
-    /// Incremental text delta (appended since previous chunk).
     pub(crate) delta: String,
-    /// Tool call deltas in this chunk (if any).
+    #[allow(dead_code)]
     pub(crate) tool_call_deltas: Vec<ToolCallDelta>,
-    /// True on the final chunk.
     pub(crate) done: bool,
-    /// Token usage (populated on final chunk if provider reports it).
+    #[allow(dead_code)]
     pub(crate) usage: Option<Usage>,
-    /// Error (populated on final chunk if streaming errored).
     pub(crate) error: Option<String>,
 }
 
@@ -184,6 +189,7 @@ pub(crate) type ChunkStream = Pin<Box<dyn Stream<Item = StreamChunk> + Send>>;
 // --- Client trait ---
 
 /// Model client interface. Each provider implements this.
+#[allow(dead_code)] // chat_with_early_abort used when tool system is implemented.
 #[async_trait::async_trait]
 pub(crate) trait Client: Send + Sync {
     async fn chat(&self, messages: &[Message], tools: &[ToolDef]) -> ClientResult<Response>;
@@ -219,6 +225,7 @@ pub(crate) enum ClientError {
 }
 
 impl ClientError {
+    #[allow(dead_code)]
     pub(crate) fn is_rate_limited(&self) -> bool {
         matches!(self, Self::RateLimited)
     }

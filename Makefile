@@ -1,6 +1,6 @@
-.PHONY: build run test check clean
+.PHONY: rebuild run test check clean
 
-build:
+all:
 	cargo build
 
 run:
@@ -16,3 +16,5 @@ check:
 
 clean:
 	cargo clean
+
+rebuild: clean all

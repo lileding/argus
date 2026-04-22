@@ -4,13 +4,21 @@ mod memories;
 mod messages;
 mod notifications;
 
-use std::sync::Arc;
-
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use tracing::info;
 
 use crate::config::DatabaseConfig;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DatabaseError {
+    #[error(transparent)]
+    Sql(#[from] sqlx::Error),
+    #[error("{0}")]
+    InvalidState(String),
+}
+
+pub(crate) type DbResult<T> = Result<T, DatabaseError>;
 
 pub(crate) use documents::Documents;
 pub(crate) use memories::Memories;
@@ -28,8 +36,12 @@ pub(crate) struct Database {
 }
 
 impl Database {
-    pub(crate) async fn connect(config: &DatabaseConfig) -> anyhow::Result<Arc<Self>> {
-        anyhow::ensure!(!config.dsn.is_empty(), "database.dsn is required");
+    pub(crate) async fn connect(config: &DatabaseConfig) -> DbResult<Self> {
+        if config.dsn.is_empty() {
+            return Err(DatabaseError::InvalidState(
+                "database.dsn is required".into(),
+            ));
+        };
 
         let pool = PgPoolOptions::new()
             .max_connections(10)
@@ -41,19 +53,19 @@ impl Database {
         // Run migrations. Uses Go's schema_migrations table for compatibility.
         migrate(&pool).await?;
 
-        Ok(Arc::new(Self {
+        Ok(Self {
             messages: messages::Messages::new(pool.clone()),
             notifications: notifications::Notifications::new(pool.clone()),
             conversation: conversation::Conversation::new(pool.clone()),
             documents: documents::Documents::new(pool.clone()),
             memories: memories::Memories::new(pool),
-        }))
+        })
     }
 }
 
 /// Run SQL migrations from internal/store/migrations/, tracking applied
 /// versions in the `schema_migrations` table (compatible with Go migrator).
-async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
+async fn migrate(pool: &PgPool) -> DbResult<()> {
     // Ensure tracking table exists.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS schema_migrations (\

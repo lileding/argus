@@ -2,33 +2,33 @@ mod feishu;
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::agent::{Agent, MessageSink};
+use crate::agent::Task;
 use crate::config::GatewayImConfig;
 use crate::database::Database;
-use crate::server::Server;
 
-/// An IM adapter that can run (event loop) and receive messages from Agent.
-trait Im: Server + MessageSink {}
-
-/// Gateway manages all IM adapters. One gateway to rule them all.
-///
-/// Implements Server: run() spawns all IMs, stop() stops them all.
-/// Main never sees the individual IMs.
-pub(crate) struct Gateway {
-    ims: Vec<(String, Arc<dyn Im>)>,
+/// An IM adapter: long-running event loop.
+#[async_trait::async_trait]
+trait Im: Send + Sync {
+    async fn run(&self, cancel: &CancellationToken);
 }
 
-impl Gateway {
+/// Gateway manages all IM adapters.
+pub(crate) struct Gateway<'a> {
+    ims: Vec<(String, Box<dyn Im + 'a>)>,
+}
+
+impl<'a> Gateway<'a> {
     pub(crate) fn new(
         configs: &HashMap<String, GatewayImConfig>,
-        agent: &Arc<Agent>,
-        db: &Arc<Database>,
+        port: mpsc::Sender<Task>,
+        db: &'a Database,
         workspace_dir: &Path,
-    ) -> Arc<Self> {
-        let mut ims = Vec::new();
+    ) -> Self {
+        let mut ims: Vec<(String, Box<dyn Im + 'a>)> = Vec::new();
 
         for (name, cfg) in configs {
             match name.as_str() {
@@ -37,10 +37,9 @@ impl Gateway {
                         warn!(im = name, "skipping: empty app_id or app_secret");
                         continue;
                     }
-                    let f =
-                        feishu::Feishu::new(Arc::clone(agent), Arc::clone(db), cfg, workspace_dir);
+                    let f = feishu::Feishu::new(port.clone(), db, cfg, workspace_dir);
                     info!(im = name, "IM adapter created");
-                    ims.push((name.clone(), f as Arc<dyn Im>));
+                    ims.push((name.clone(), Box::new(f)));
                 }
                 other => {
                     warn!(im = other, "unknown IM type, skipping");
@@ -49,37 +48,15 @@ impl Gateway {
         }
 
         info!(count = ims.len(), "gateway created");
-        Arc::new(Self { ims })
-    }
-}
-
-#[async_trait::async_trait]
-impl Server for Gateway {
-    /// Spawn all IM adapters and block until they all finish.
-    async fn run(self: Arc<Self>) {
-        let handles: Vec<_> = self
-            .ims
-            .iter()
-            .map(|(name, im)| {
-                let im = Arc::clone(im);
-                let name = name.clone();
-                tokio::spawn(async move {
-                    info!(im = name, "IM adapter started");
-                    im.run().await;
-                })
-            })
-            .collect();
-
-        for handle in handles {
-            let _ = handle.await;
-        }
+        Self { ims }
     }
 
-    /// Stop all IM adapters.
-    async fn stop(&self) {
-        for (name, im) in &self.ims {
-            info!(im = name, "stopping IM adapter");
-            im.stop().await;
-        }
+    pub(crate) async fn run(&self, cancel: &CancellationToken) {
+        futures::future::join_all(self.ims.iter().map(|(name, im)| async {
+            info!(im = name.as_str(), "IM adapter started");
+            im.run(cancel).await;
+            info!(im = name.as_str(), "IM adapter stopped");
+        }))
+        .await;
     }
 }

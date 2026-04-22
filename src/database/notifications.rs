@@ -18,7 +18,7 @@ impl Notifications {
         &self,
         message_id: Option<i64>,
         content: &str,
-    ) -> anyhow::Result<i64> {
+    ) -> super::DbResult<i64> {
         let mut tx = self.pool.begin().await?;
 
         let row = sqlx::query(
@@ -46,7 +46,7 @@ impl Notifications {
     }
 
     /// Fetch notifications that haven't been embedded yet.
-    pub(crate) async fn unembedded(&self, limit: i64) -> anyhow::Result<Vec<(i64, String)>> {
+    pub(crate) async fn unembedded(&self, limit: i64) -> super::DbResult<Vec<(i64, String)>> {
         let rows = sqlx::query(
             "SELECT id, content FROM notifications \
              WHERE embedding IS NULL AND content != '' \
@@ -63,7 +63,7 @@ impl Notifications {
     }
 
     /// Set the embedding vector for a notification.
-    pub(crate) async fn set_embedding(&self, id: i64, embedding: &[f32]) -> anyhow::Result<()> {
+    pub(crate) async fn set_embedding(&self, id: i64, embedding: &[f32]) -> super::DbResult<()> {
         let vec = Vector::from(embedding.to_vec());
         sqlx::query("UPDATE notifications SET embedding = $1 WHERE id = $2 AND embedding IS NULL")
             .bind(vec)
@@ -75,7 +75,7 @@ impl Notifications {
     }
 
     /// Fetch long notifications without summaries.
-    pub(crate) async fn unsummarized(&self, limit: i64) -> anyhow::Result<Vec<(i64, String)>> {
+    pub(crate) async fn unsummarized(&self, limit: i64) -> super::DbResult<Vec<(i64, String)>> {
         let rows = sqlx::query(
             "SELECT id, content FROM notifications \
              WHERE summary IS NULL AND LENGTH(content) > 2400 \
@@ -92,7 +92,7 @@ impl Notifications {
     }
 
     /// Set the summary for a notification.
-    pub(crate) async fn set_summary(&self, id: i64, summary: &str) -> anyhow::Result<()> {
+    pub(crate) async fn set_summary(&self, id: i64, summary: &str) -> super::DbResult<()> {
         sqlx::query("UPDATE notifications SET summary = $1 WHERE id = $2 AND summary IS NULL")
             .bind(summary)
             .bind(id)

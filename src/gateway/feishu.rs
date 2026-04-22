@@ -1,21 +1,16 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::agent::{Agent, Event, Message, MessageSink, Payload, Task};
+use crate::agent::{Event, Message, Payload, Task};
 use crate::config::{GatewayImConfig, MEDIA_DIR};
 use crate::database::{Database, InboundMessage};
-use crate::server::Server;
 
-use super::Im;
-
-pub(super) struct Feishu {
-    agent: Arc<Agent>,
-    db: Arc<Database>,
-    cancel: CancellationToken,
+pub(super) struct Feishu<'a> {
+    task_tx: mpsc::Sender<Task>,
+    db: &'a Database,
     tx: mpsc::Sender<Message>,
     rx: Mutex<mpsc::Receiver<Message>>,
     feishu_client: feishu::Client,
@@ -24,13 +19,13 @@ pub(super) struct Feishu {
     seen_msg_ids: std::sync::Mutex<HashSet<String>>,
 }
 
-impl Feishu {
+impl<'a> Feishu<'a> {
     pub(super) fn new(
-        agent: Arc<Agent>,
-        db: Arc<Database>,
+        task_tx: mpsc::Sender<Task>,
+        db: &'a Database,
         cfg: &GatewayImConfig,
         workspace_dir: &Path,
-    ) -> Arc<Self> {
+    ) -> Self {
         let (tx, rx) = mpsc::channel(64);
 
         // Ensure media directory exists.
@@ -45,80 +40,85 @@ impl Feishu {
             feishu::Client::with_base_url(&cfg.app_id, &cfg.app_secret, &cfg.base_url)
         };
 
-        Arc::new(Feishu {
-            agent,
+        Feishu {
+            task_tx,
             db,
-            cancel: CancellationToken::new(),
             tx,
             rx: Mutex::new(rx),
             feishu_client,
             workspace_dir: workspace_dir.to_path_buf(),
             seen_msg_ids: std::sync::Mutex::new(HashSet::new()),
-        })
+        }
     }
 
-    /// Main frontend loop: connects WS, dispatches inbound events,
-    /// reconnects on disconnect. Outbound rendering runs in a spawned task.
-    async fn run_inner(self: &Arc<Self>) {
+    /// Single event loop: WS inbound + agent outbound + cancel, all in one select.
+    pub(super) async fn run(&self, cancel: &CancellationToken) {
         info!("feishu frontend started");
 
-        let outbound_handle = {
-            let this = Arc::clone(self);
-            tokio::spawn(async move { this.handle_outbound().await })
-        };
-
-        // Inbound: connect WS, receive events, reconnect on disconnect.
         loop {
-            let mut ws = match self.feishu_client.connect_ws().await {
-                Ok(ws) => {
-                    info!("feishu WS connected");
-                    ws
-                }
-                Err(e) => {
-                    if e.is_fatal() {
-                        warn!(error = %e, "feishu WS fatal error, giving up");
-                        self.cancel.cancel();
-                        break;
+            // Connect (or reconnect) WS.
+            let mut ws = loop {
+                match self.feishu_client.connect_ws().await {
+                    Ok(ws) => {
+                        info!("feishu WS connected");
+                        break ws;
                     }
-                    warn!(error = %e, "feishu WS connect failed, retrying in 5s");
-                    tokio::select! {
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => continue,
-                        _ = self.cancel.cancelled() => break,
+                    Err(e) => {
+                        if e.is_fatal() {
+                            warn!(error = %e, "feishu WS fatal error, giving up");
+                            cancel.cancel();
+                            return;
+                        }
+                        warn!(error = %e, "feishu WS connect failed, retrying in 5s");
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => continue,
+                            _ = cancel.cancelled() => return,
+                        }
                     }
                 }
             };
 
+            let mut rx = self.rx.lock().await;
+            let api = self.feishu_client.api();
+
+            // Unified select: inbound WS events + outbound agent messages + cancel.
             loop {
                 tokio::select! {
                     event = ws.next_event() => {
                         let Some(event) = event else {
                             info!("feishu WS disconnected, will reconnect");
-                            break;
+                            break; // outer loop reconnects
                         };
-                        let this = Arc::clone(self);
-                        tokio::spawn(async move { this.handle_inbound(event).await });
+                        self.handle_inbound(event).await;
                     }
-                    _ = self.cancel.cancelled() => {
-                        info!("feishu frontend received shutdown signal");
-                        let _ = outbound_handle.await;
+                    msg = rx.recv() => {
+                        let Some(mut msg) = msg else {
+                            debug!("outbound channel closed");
+                            return;
+                        };
+                        self.render_message(&api, &mut msg).await;
+                    }
+                    _ = cancel.cancelled() => {
+                        info!("feishu frontend shutting down, draining outbound");
+                        while let Ok(Some(mut msg)) =
+                            tokio::time::timeout(
+                                std::time::Duration::from_millis(500),
+                                rx.recv(),
+                            ).await
+                        {
+                            self.render_message(&api, &mut msg).await;
+                        }
                         info!("feishu frontend stopped");
                         return;
                     }
                 }
             }
         }
-
-        let _ = outbound_handle.await;
-        info!("feishu frontend stopped");
     }
 
-    async fn stop_inner(&self) {
-        self.cancel.cancel();
-    }
-
-    /// Inbound: parse a Feishu WS event, construct a Task with a oneshot
-    /// ReadyCh, submit to Agent, and spawn media processing.
-    async fn handle_inbound(self: Arc<Self>, event: feishu::types::FeishuEvent) {
+    /// Handle one inbound Feishu WS event: parse, dedup, persist, submit task,
+    /// process media inline, then send ready signal.
+    async fn handle_inbound(&self, event: feishu::types::FeishuEvent) {
         let feishu::types::FeishuEvent::Message(envelope) = event else {
             debug!("ignoring non-message event");
             return;
@@ -156,8 +156,6 @@ impl Feishu {
             .get("chat_type")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        // For p2p chats, use the sender's open_id (chat_id is a group-level ID).
-        // For group chats, use the feishu chat_id.
         let chat_id = if chat_type == "p2p" {
             event_data
                 .get("sender")
@@ -210,7 +208,6 @@ impl Feishu {
             .and_then(|s| s.get("open_id"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        // Parse Feishu create_time (milliseconds since epoch).
         let source_ts = envelope
             .header
             .as_ref()
@@ -253,37 +250,34 @@ impl Feishu {
             channel: channel.clone(),
             db_msg_id,
             ready: ready_rx,
-            frontend: Arc::clone(&self) as Arc<dyn MessageSink>,
+            port: self.tx.clone(),
         };
-        if let Err(e) = self.agent.submit_task(task).await {
+        if let Err(e) = self.task_tx.send(task).await {
             warn!(msg_id, chat_id, error = %e, "submit_task failed");
             return;
         }
         debug!(msg_id, chat_id, "task submitted to agent");
 
-        // Spawn media processing: download files, extract text by msg_type.
-        let this = Arc::clone(&self);
-        tokio::spawn(async move {
-            let payload = this.process_message(&msg_id, &msg_type, &raw_content).await;
-            debug!(
-                msg_id,
-                chat_id,
-                content_len = payload.content.len(),
-                files = payload.file_paths.len(),
-                "payload ready"
-            );
-            // Persist: status=ready with processed content.
-            if let Some(db_id) = db_msg_id
-                && let Err(e) = this
-                    .db
-                    .messages
-                    .save_ready(db_id, &payload.content, &payload.file_paths)
-                    .await
-            {
-                warn!(msg_id, error = %e, "save_ready failed");
-            }
-            let _ = ready_tx.send(payload);
-        });
+        // Process media inline (no spawn). Blocks the event loop for this
+        // message, which is acceptable for a personal assistant.
+        let payload = self.process_message(&msg_id, &msg_type, &raw_content).await;
+        debug!(
+            msg_id,
+            chat_id,
+            content_len = payload.content.len(),
+            files = payload.file_paths.len(),
+            "payload ready"
+        );
+        if let Some(db_id) = db_msg_id
+            && let Err(e) = self
+                .db
+                .messages
+                .save_ready(db_id, &payload.content, &payload.file_paths)
+                .await
+        {
+            warn!(msg_id, error = %e, "save_ready failed");
+        }
+        let _ = ready_tx.send(payload);
     }
 
     /// Process a Feishu message by type: extract text, download media files.
@@ -354,7 +348,6 @@ impl Feishu {
             };
         };
 
-        // Download audio file. Content is transcript only (no metadata prefix).
         match self
             .download_and_save(msg_id, file_key, "file", ".opus")
             .await
@@ -398,14 +391,8 @@ impl Feishu {
 
         match self.download_and_save(msg_id, file_key, "file", &ext).await {
             Ok(filename) => {
-                // Index the document for RAG.
-                crate::agent::docindex::process_upload(
-                    &self.db,
-                    &self.workspace_dir,
-                    file_name,
-                    &filename,
-                )
-                .await;
+                crate::embedder::process_upload(self.db, &self.workspace_dir, file_name, &filename)
+                    .await;
                 Payload {
                     content: format!("The user sent a file '{file_name}'."),
                     file_paths: vec![filename],
@@ -434,7 +421,6 @@ impl Feishu {
 
         let (text, image_keys) = extract_post_content(&parsed);
 
-        // Download all embedded images.
         let mut file_paths = Vec::new();
         for key in &image_keys {
             match self.download_and_save(msg_id, key, "image", ".png").await {
@@ -456,7 +442,6 @@ impl Feishu {
     }
 
     /// Download a resource from Feishu API and save to workspace media dir.
-    /// Returns the filename only (e.g. "key.png"), without MEDIA_DIR prefix.
     async fn download_and_save(
         &self,
         msg_id: &str,
@@ -464,7 +449,6 @@ impl Feishu {
         resource_type: &str,
         ext: &str,
     ) -> Result<String, feishu::types::Error> {
-        // Sanitize file_key before any I/O: reject path traversal attempts.
         if file_key.contains('/')
             || file_key.contains('\\')
             || file_key.contains("..")
@@ -480,7 +464,6 @@ impl Feishu {
             .download_resource(msg_id, file_key, resource_type)
             .await?;
 
-        // Sanity check: empty or JSON error response.
         if data.is_empty() {
             return Err(feishu::types::Error::Connection("empty response".into()));
         }
@@ -506,51 +489,10 @@ impl Feishu {
         Ok(filename)
     }
 
-    /// Outbound render loop: receives Messages from the Agent, consumes
-    /// their event streams, and replies via Feishu REST API.
-    ///
-    /// Flow per message:
-    /// 1. Immediately open a thinking card (user sees instant feedback)
-    /// 2. Consume events → update card on each Reply
-    /// 3. If events close without Reply → dismiss card
-    async fn handle_outbound(self: &Arc<Self>) {
-        info!("outbound render loop started");
-        let mut rx = self.rx.lock().await;
-        let api = self.feishu_client.api();
-        loop {
-            tokio::select! {
-                msg = rx.recv() => {
-                    let Some(mut msg) = msg else {
-                        debug!("outbound channel closed");
-                        break;
-                    };
-                    self.render_message(&api, &mut msg).await;
-                }
-                _ = self.cancel.cancelled() => {
-                    info!("outbound render loop shutting down, draining remaining messages");
-                    break;
-                }
-            }
-        }
-        // Drain remaining messages. Under normal shutdown, the agent has already
-        // stopped and all messages are buffered. The timeout is a safety net for
-        // edge cases where messages arrive slightly after cancel.
-        while let Ok(Some(mut msg)) =
-            tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
-        {
-            info!(msg_id = %msg.msg_id, "draining message");
-            self.render_message(&api, &mut msg).await;
-        }
-        info!("outbound render loop stopped");
-    }
-
     /// Render a single message: open thinking card → consume events → update card.
     async fn render_message(&self, api: &feishu::api::Api, msg: &mut Message) {
-        // Default to Chinese (primary user). Full language detection would
-        // require carrying the user's text through Message, deferred for now.
         let lang = "zh";
 
-        // Step 1: Open thinking card immediately.
         let card_id = match api
             .reply_message(&msg.msg_id, "interactive", &thinking_card(lang))
             .await
@@ -565,30 +507,25 @@ impl Feishu {
             }
         };
 
-        // Step 2: Consume events and update card.
         let mut got_reply = false;
         while let Some(event) = msg.events.recv().await {
             match event {
                 Event::Reply { text } => {
                     got_reply = true;
-                    // Process markdown: render LaTeX → upload images → build card.
                     let processed = crate::render::process_markdown(&text, api).await;
                     let card_json = crate::render::markdown_to_card(&processed);
                     if let Some(cid) = &card_id {
-                        // Update the existing thinking card with the reply.
                         match api.update_message(cid, &card_json).await {
                             Ok(()) => {
                                 info!(msg_id = %msg.msg_id, "reply updated on card");
                             }
                             Err(e) => {
                                 warn!(msg_id = %msg.msg_id, error = %e, "card update failed, sending new reply");
-                                // Fallback: send as plain text reply.
                                 let content = serde_json::json!({"text": text}).to_string();
                                 let _ = api.reply_message(&msg.msg_id, "text", &content).await;
                             }
                         }
                     } else {
-                        // No card opened → send as new reply.
                         let content = serde_json::json!({"text": text}).to_string();
                         if let Err(e) = api.reply_message(&msg.msg_id, "text", &content).await {
                             warn!(msg_id = %msg.msg_id, error = %e, "reply failed");
@@ -598,7 +535,6 @@ impl Feishu {
             }
         }
 
-        // Step 3: If events closed without any Reply, dismiss the thinking card.
         if !got_reply && let Some(cid) = &card_id {
             let _ = api
                 .update_message(cid, &crate::render::markdown_to_card("✓"))
@@ -610,31 +546,14 @@ impl Feishu {
 }
 
 #[async_trait::async_trait]
-impl Server for Feishu {
-    async fn run(self: Arc<Self>) {
-        self.run_inner().await;
-    }
-
-    async fn stop(&self) {
-        self.stop_inner().await;
+impl super::Im for Feishu<'_> {
+    async fn run(&self, cancel: &CancellationToken) {
+        Feishu::run(self, cancel).await;
     }
 }
-
-#[async_trait::async_trait]
-impl MessageSink for Feishu {
-    async fn submit_message(&self, msg: Message) {
-        // Push to outbound render queue. The outbound loop consumes these.
-        if self.tx.send(msg).await.is_err() {
-            warn!("outbound channel closed, dropping message");
-        }
-    }
-}
-
-impl Im for Feishu {}
 
 // --- Feishu card builders ---
 
-/// Build a "thinking" status card.
 fn thinking_card(lang: &str) -> String {
     let text = if lang == "zh" {
         "💭 正在思考..."
@@ -646,7 +565,6 @@ fn thinking_card(lang: &str) -> String {
 
 // --- Content extraction helpers ---
 
-/// Extract text from Feishu text message content JSON: `{"text":"..."}`.
 fn extract_text(raw: &str) -> String {
     serde_json::from_str::<serde_json::Value>(raw)
         .ok()
@@ -654,17 +572,13 @@ fn extract_text(raw: &str) -> String {
         .unwrap_or_else(|| raw.to_string())
 }
 
-/// Extract text + image keys from a Feishu rich-text (post) message.
-/// Handles both direct `{title, content}` and language-keyed `{zh_cn: {title, content}}` formats.
 fn extract_post_content(parsed: &serde_json::Value) -> (String, Vec<String>) {
-    // Try direct format first.
     if let Some(content) = parsed.get("content") {
         let title = parsed.get("title").and_then(|t| t.as_str()).unwrap_or("");
         let (body, images) = parse_post_content_array(content);
         return (join_text(title, &body), images);
     }
 
-    // Try language-keyed format: {"zh_cn": {"title": "...", "content": [...]}}
     if let Some(obj) = parsed.as_object() {
         for (_lang, body) in obj {
             if let Some(content) = body.get("content") {
@@ -678,7 +592,6 @@ fn extract_post_content(parsed: &serde_json::Value) -> (String, Vec<String>) {
     (String::new(), vec![])
 }
 
-/// Parse the `content` array of a post message: `[[{tag, text, image_key}, ...], ...]`
 fn parse_post_content_array(content: &serde_json::Value) -> (String, Vec<String>) {
     let Some(lines) = content.as_array() else {
         return (String::new(), vec![]);
