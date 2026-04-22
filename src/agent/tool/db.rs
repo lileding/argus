@@ -742,7 +742,7 @@ fn build_where(
                     (format!("{column} IS NULL"), None)
                 } else {
                     (
-                        format!("{column} = ${idx}"),
+                        format!("{column}::text = ${idx}"),
                         Some(json_value_to_string(value)?),
                     )
                 }
@@ -752,25 +752,25 @@ fn build_where(
                     (format!("{column} IS NOT NULL"), None)
                 } else {
                     (
-                        format!("{column} != ${idx}"),
+                        format!("{column}::text != ${idx}"),
                         Some(json_value_to_string(value)?),
                     )
                 }
             }
             Op::Gt => (
-                format!("{column} > ${idx}"),
+                format!("{column}::text > ${idx}"),
                 Some(json_value_to_string(value)?),
             ),
             Op::Gte => (
-                format!("{column} >= ${idx}"),
+                format!("{column}::text >= ${idx}"),
                 Some(json_value_to_string(value)?),
             ),
             Op::Lt => (
-                format!("{column} < ${idx}"),
+                format!("{column}::text < ${idx}"),
                 Some(json_value_to_string(value)?),
             ),
             Op::Lte => (
-                format!("{column} <= ${idx}"),
+                format!("{column}::text <= ${idx}"),
                 Some(json_value_to_string(value)?),
             ),
             Op::Contains => {
@@ -1014,8 +1014,8 @@ mod tests {
         let clause = build_where(&conditions, &mut params).unwrap();
         assert!(clause.contains("WHERE"));
         // Key order in Map may vary; check both conditions appear with valid placeholders.
-        assert!(clause.contains("status = $"));
-        assert!(clause.contains("age > $"));
+        assert!(clause.contains("status::text = $"));
+        assert!(clause.contains("age::text > $"));
         assert_eq!(params.len(), 2);
         assert!(params.contains(&"active".to_string()));
         assert!(params.contains(&"18".to_string()));
