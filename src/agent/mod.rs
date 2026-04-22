@@ -232,7 +232,8 @@ impl Agent {
             ORCHESTRATOR_PROMPT,
             &task.channel,
             &payload.content,
-            10, // context window
+            task.db_msg_id, // exclude current message from history
+            10,             // context window
         )
         .await;
 

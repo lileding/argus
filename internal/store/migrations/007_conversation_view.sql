@@ -1,5 +1,7 @@
 -- Conversation view: joins messages with their notification replies.
 -- Used by the agent harness to build model context.
+-- Only ready messages with processed content enter the view.
+-- Unprocessed (ready=false) messages contain raw JSON and must not be in context.
 CREATE OR REPLACE VIEW conversation AS
 SELECT
     m.id,
@@ -11,4 +13,5 @@ SELECT
     n.summary       AS reply_summary,
     n.created_at    AS reply_ts
 FROM messages m
-LEFT JOIN notifications n ON n.id = m.reply_id;
+LEFT JOIN notifications n ON n.id = m.reply_id
+WHERE m.ready = TRUE;

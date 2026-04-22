@@ -16,9 +16,9 @@ pub(crate) use notifications::Notifications;
 /// Database handle. Sub-objects group operations by table/feature.
 /// PgPool is internally Arc'd — clone is zero-cost.
 pub(crate) struct Database {
-    pub messages: messages::Messages,
-    pub notifications: notifications::Notifications,
-    pub conversation: conversation::Conversation,
+    pub(crate) messages: messages::Messages,
+    pub(crate) notifications: notifications::Notifications,
+    pub(crate) conversation: conversation::Conversation,
 }
 
 impl Database {

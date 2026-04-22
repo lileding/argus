@@ -8,6 +8,7 @@ const SUMMARY_THRESHOLD: usize = 800;
 
 /// A row from the conversation view.
 struct ConversationRow {
+    id: i64,
     user_content: String,
     reply_content: Option<String>,
     reply_summary: Option<String>,
@@ -24,75 +25,85 @@ impl Conversation {
     }
 
     /// Load the most recent conversation turns for a channel.
-    /// Returns model messages in chronological order (oldest first).
+    /// Excludes a specific message ID (the current one being processed).
+    /// Returns (row_id, user_msg, optional_reply_msg) in chronological order.
     pub(crate) async fn recent(
         &self,
         channel: &str,
+        exclude_id: Option<i64>,
         limit: i64,
-    ) -> anyhow::Result<Vec<model::Message>> {
+    ) -> anyhow::Result<Vec<(i64, model::Message, Option<model::Message>)>> {
         let rows = sqlx::query(
-            "SELECT user_content, reply_content, reply_summary \
+            "SELECT id, user_content, reply_content, reply_summary \
              FROM conversation \
-             WHERE channel = $1 \
+             WHERE channel = $1 AND ($2::bigint IS NULL OR id != $2) \
              ORDER BY user_ts DESC \
-             LIMIT $2",
+             LIMIT $3",
         )
         .bind(channel)
+        .bind(exclude_id)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
 
         // Rows come newest-first; reverse to chronological.
-        let mut messages = Vec::new();
+        let mut results = Vec::new();
         for row in rows.iter().rev() {
             let r = ConversationRow {
+                id: row.get("id"),
                 user_content: row.get("user_content"),
                 reply_content: row.get("reply_content"),
                 reply_summary: row.get("reply_summary"),
             };
-            messages.push(model::Message::user(&r.user_content));
-            if let Some(reply) = format_reply(&r) {
-                messages.push(model::Message::assistant(reply));
-            }
+            let reply = format_reply(&r).map(model::Message::assistant);
+            results.push((r.id, model::Message::user(&r.user_content), reply));
         }
 
-        Ok(messages)
+        Ok(results)
     }
 
     /// Semantic search: find messages similar to the given embedding vector.
-    /// Returns model messages (user + assistant pairs) from matching rows.
+    /// Excludes a specific message ID (the current one being processed).
     pub(crate) async fn search(
         &self,
         embedding: &[f32],
         channel: &str,
+        exclude_id: Option<i64>,
         limit: i64,
-    ) -> anyhow::Result<Vec<(f64, model::Message, Option<model::Message>)>> {
+    ) -> anyhow::Result<Vec<(i64, f64, model::Message, Option<model::Message>)>> {
         let vec = Vector::from(embedding.to_vec());
         let rows = sqlx::query(
-            "SELECT user_content, reply_content, reply_summary, \
+            "SELECT id, user_content, reply_content, reply_summary, \
                     1 - (user_embedding <=> $1) AS similarity \
              FROM conversation \
              WHERE channel = $2 AND user_embedding IS NOT NULL \
+               AND ($3::bigint IS NULL OR id != $3) \
              ORDER BY user_embedding <=> $1 \
-             LIMIT $3",
+             LIMIT $4",
         )
         .bind(vec)
         .bind(channel)
+        .bind(exclude_id)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
 
         let mut results = Vec::new();
         for row in &rows {
-            let similarity: f64 = row.get("similarity");
             let r = ConversationRow {
+                id: row.get("id"),
                 user_content: row.get("user_content"),
                 reply_content: row.get("reply_content"),
                 reply_summary: row.get("reply_summary"),
             };
-            let user_msg = model::Message::user(&r.user_content);
-            let reply_msg = format_reply(&r).map(model::Message::assistant);
-            results.push((similarity, user_msg, reply_msg));
+            let similarity: f64 = row.get("similarity");
+            let reply = format_reply(&r).map(model::Message::assistant);
+            results.push((
+                r.id,
+                similarity,
+                model::Message::user(&r.user_content),
+                reply,
+            ));
         }
 
         Ok(results)
@@ -108,7 +119,6 @@ fn format_reply(row: &ConversationRow) -> Option<String> {
         {
             return Some(format!("[Summary] {summary}"));
         }
-        // No summary available — truncate.
         let truncated: String = content.chars().take(SUMMARY_THRESHOLD).collect();
         return Some(format!("{truncated} …[truncated]"));
     }
