@@ -148,10 +148,25 @@ impl Feishu {
             .get("message_id")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let chat_id = message
-            .get("chat_id")
+        let chat_type = message
+            .get("chat_type")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        // For p2p chats, use the sender's open_id (chat_id is a group-level ID).
+        // For group chats, use the feishu chat_id.
+        let chat_id = if chat_type == "p2p" {
+            event_data
+                .get("sender")
+                .and_then(|s| s.get("sender_id"))
+                .and_then(|s| s.get("open_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+        } else {
+            message
+                .get("chat_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+        };
         if msg_id.is_empty() || chat_id.is_empty() {
             warn!(msg_id, chat_id, "inbound event missing msg_id or chat_id");
             return;
@@ -186,7 +201,11 @@ impl Feishu {
             .and_then(|h| h.create_time.as_deref())
             .and_then(|t| t.parse::<i64>().ok())
             .and_then(chrono::DateTime::from_timestamp_millis);
-        let channel = format!("feishu:{chat_id}");
+        let channel = if chat_type == "p2p" {
+            format!("feishu:p2p:{chat_id}")
+        } else {
+            format!("feishu:group:{chat_id}")
+        };
         let db_msg_id = match self
             .db
             .messages
