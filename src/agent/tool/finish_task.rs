@@ -30,7 +30,7 @@ impl Tool for FinishTask {
         })
     }
 
-    async fn execute(&self, _args: &str) -> String {
+    async fn execute(&self, _ctx: &super::ToolContext<'_>, _args: &str) -> String {
         "error: finish_task should not be executed directly".into()
     }
 

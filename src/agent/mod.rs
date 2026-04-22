@@ -244,7 +244,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
 
         // Phase 1: Orchestrator tool loop.
         let (summary, tool_results, iterations, trace) = self
-            .run_orchestrator(&mut messages, &chat_id, db_msg_id, &events_tx)
+            .run_orchestrator(&mut messages, &chat_id, &channel, db_msg_id, &events_tx)
             .await;
 
         // Transition to Phase 2.
@@ -310,6 +310,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
         &self,
         messages: &mut Vec<model::Message>,
         chat_id: &str,
+        channel: &str,
         db_msg_id: Option<i64>,
         events_tx: &mpsc::Sender<Event>,
     ) -> (
@@ -357,6 +358,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
 
         let mut budgets: HashMap<&str, usize> = TOOL_BUDGETS.iter().copied().collect();
         let mut budget_rejections: usize = 0;
+        let tool_ctx = tool::ToolContext { channel };
         let mut all_tool_results: Vec<String> = Vec::new();
         let mut summary = String::new();
         let mut iterations: i32 = 0;
@@ -460,7 +462,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
 
                 futures.push(async move {
                     let start = Instant::now();
-                    let result = tool.execute(&tc_args).await;
+                    let result = tool.execute(&tool_ctx, &tc_args).await;
                     let duration_ms = start.elapsed().as_millis() as i32;
                     let is_error = result.starts_with("error:");
                     (

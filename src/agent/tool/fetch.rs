@@ -47,7 +47,7 @@ impl<'a> Tool for Fetch<'a> {
         })
     }
 
-    async fn execute(&self, args: &str) -> String {
+    async fn execute(&self, _ctx: &super::ToolContext<'_>, args: &str) -> String {
         let parsed: Args = match serde_json::from_str(args) {
             Ok(a) => a,
             Err(e) => return format!("error: invalid arguments: {e}"),

@@ -33,7 +33,7 @@ impl<'a> Tool for ListDocs<'a> {
         })
     }
 
-    async fn execute(&self, _args: &str) -> String {
+    async fn execute(&self, _ctx: &super::ToolContext<'_>, _args: &str) -> String {
         let docs = match self.db.documents.list_all().await {
             Ok(d) => d,
             Err(e) => return format!("error: {e}"),

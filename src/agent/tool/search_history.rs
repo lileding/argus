@@ -51,7 +51,7 @@ impl<'a, E: EmbedService> Tool for SearchHistory<'a, E> {
         })
     }
 
-    async fn execute(&self, args: &str) -> String {
+    async fn execute(&self, ctx: &super::ToolContext<'_>, args: &str) -> String {
         let parsed: Args = match serde_json::from_str(args) {
             Ok(a) => a,
             Err(e) => return format!("error: invalid arguments: {e}"),
@@ -64,23 +64,42 @@ impl<'a, E: EmbedService> Tool for SearchHistory<'a, E> {
             Err(e) => return format!("error: embedding failed: {e}"),
         };
 
-        let results = match self.db.conversation.search_replies(&embedding, limit).await {
-            Ok(r) => r,
-            Err(e) => return format!("error: {e}"),
-        };
+        let mut output = String::new();
+        let mut idx = 0;
 
-        if results.is_empty() {
-            return "No matching conversation history found.".into();
+        // Search user messages + replies in the same channel.
+        if let Ok(results) = self
+            .db
+            .conversation
+            .search(&embedding, ctx.channel, None, limit)
+            .await
+        {
+            for (_, similarity, user_msg, reply_msg) in &results {
+                idx += 1;
+                output.push_str(&format!(
+                    "{}. [user, similarity: {:.2}]\n{}\n",
+                    idx, similarity, user_msg.content,
+                ));
+                if let Some(reply) = reply_msg {
+                    output.push_str(&format!("   → reply: {}\n", reply.content));
+                }
+                output.push('\n');
+            }
         }
 
-        let mut output = String::new();
-        for (i, (similarity, msg)) in results.iter().enumerate() {
-            output.push_str(&format!(
-                "{}. (similarity: {:.2})\n{}\n\n",
-                i + 1,
-                similarity,
-                msg.content,
-            ));
+        // Also search agent replies.
+        if let Ok(results) = self.db.conversation.search_replies(&embedding, limit).await {
+            for (similarity, msg) in &results {
+                idx += 1;
+                output.push_str(&format!(
+                    "{}. [reply, similarity: {:.2}]\n{}\n\n",
+                    idx, similarity, msg.content,
+                ));
+            }
+        }
+
+        if idx == 0 {
+            return "No matching conversation history found.".into();
         }
         output
     }

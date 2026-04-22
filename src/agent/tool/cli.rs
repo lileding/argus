@@ -77,7 +77,7 @@ impl<'a> Tool for Cli<'a> {
         })
     }
 
-    async fn execute(&self, args: &str) -> String {
+    async fn execute(&self, _ctx: &super::ToolContext<'_>, args: &str) -> String {
         let parsed: Args = match serde_json::from_str(args) {
             Ok(a) => a,
             Err(e) => return format!("error: invalid arguments: {e}"),
@@ -142,7 +142,12 @@ mod tests {
     async fn echo_command() {
         let dir = tempfile::tempdir().unwrap();
         let tool = Cli::new(dir.path());
-        let result = tool.execute(r#"{"command": "echo hello"}"#).await;
+        let result = tool
+            .execute(
+                &super::super::ToolContext { channel: "test" },
+                r#"{"command": "echo hello"}"#,
+            )
+            .await;
         assert_eq!(result, "hello");
     }
 
@@ -150,7 +155,12 @@ mod tests {
     async fn nonzero_exit() {
         let dir = tempfile::tempdir().unwrap();
         let tool = Cli::new(dir.path());
-        let result = tool.execute(r#"{"command": "exit 42"}"#).await;
+        let result = tool
+            .execute(
+                &super::super::ToolContext { channel: "test" },
+                r#"{"command": "exit 42"}"#,
+            )
+            .await;
         assert!(result.starts_with("exit code: 42"));
     }
 
@@ -160,7 +170,10 @@ mod tests {
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         let tool = Cli::new(dir.path());
         let result = tool
-            .execute(r#"{"command": "pwd", "working_dir": "sub"}"#)
+            .execute(
+                &super::super::ToolContext { channel: "test" },
+                r#"{"command": "pwd", "working_dir": "sub"}"#,
+            )
             .await;
         assert!(result.contains("sub"));
     }
@@ -170,7 +183,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tool = Cli::new(dir.path());
         let result = tool
-            .execute(r#"{"command": "pwd", "working_dir": "/tmp"}"#)
+            .execute(
+                &super::super::ToolContext { channel: "test" },
+                r#"{"command": "pwd", "working_dir": "/tmp"}"#,
+            )
             .await;
         assert!(
             result.starts_with("error:"),

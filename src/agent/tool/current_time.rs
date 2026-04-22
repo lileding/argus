@@ -35,7 +35,7 @@ impl Tool for CurrentTime {
         })
     }
 
-    async fn execute(&self, args: &str) -> String {
+    async fn execute(&self, _ctx: &super::ToolContext<'_>, args: &str) -> String {
         let parsed: Args = match serde_json::from_str(args) {
             Ok(a) => a,
             Err(e) => return format!("error: invalid arguments: {e}"),
@@ -80,7 +80,12 @@ mod tests {
     #[tokio::test]
     async fn valid_timezone() {
         let tool = CurrentTime;
-        let result = tool.execute(r#"{"timezone": "Asia/Shanghai"}"#).await;
+        let result = tool
+            .execute(
+                &super::super::ToolContext { channel: "test" },
+                r#"{"timezone": "Asia/Shanghai"}"#,
+            )
+            .await;
         assert!(
             result.contains("timezone: Asia/Shanghai"),
             "expected timezone in output, got: {result}"
@@ -91,7 +96,12 @@ mod tests {
     #[tokio::test]
     async fn invalid_timezone() {
         let tool = CurrentTime;
-        let result = tool.execute(r#"{"timezone": "Foo/Bar"}"#).await;
+        let result = tool
+            .execute(
+                &super::super::ToolContext { channel: "test" },
+                r#"{"timezone": "Foo/Bar"}"#,
+            )
+            .await;
         assert!(
             result.starts_with("error:"),
             "expected error, got: {result}"
@@ -101,7 +111,9 @@ mod tests {
     #[tokio::test]
     async fn empty_args_defaults_to_utc() {
         let tool = CurrentTime;
-        let result = tool.execute("{}").await;
+        let result = tool
+            .execute(&super::super::ToolContext { channel: "test" }, "{}")
+            .await;
         assert!(
             result.contains("timezone: UTC"),
             "expected UTC default, got: {result}"
@@ -111,7 +123,9 @@ mod tests {
     #[tokio::test]
     async fn default_contains_unix() {
         let tool = CurrentTime;
-        let result = tool.execute("{}").await;
+        let result = tool
+            .execute(&super::super::ToolContext { channel: "test" }, "{}")
+            .await;
         assert!(
             result.contains("unix:"),
             "expected unix timestamp, got: {result}"

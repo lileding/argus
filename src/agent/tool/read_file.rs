@@ -85,7 +85,7 @@ impl<'a> Tool for ReadFile<'a> {
         })
     }
 
-    async fn execute(&self, args: &str) -> String {
+    async fn execute(&self, _ctx: &super::ToolContext<'_>, args: &str) -> String {
         let parsed: Args = match serde_json::from_str(args) {
             Ok(a) => a,
             Err(e) => return format!("error: invalid arguments: {e}"),
@@ -182,7 +182,12 @@ mod tests {
         std::fs::write(&file_path, "hello world").unwrap();
 
         let tool = ReadFile::new(dir.path());
-        let result = tool.execute(&format!(r#"{{"path": "hello.txt"}}"#)).await;
+        let result = tool
+            .execute(
+                &super::super::ToolContext { channel: "test" },
+                &format!(r#"{{"path": "hello.txt"}}"#),
+            )
+            .await;
         assert_eq!(result, "hello world");
     }
 
@@ -193,7 +198,12 @@ mod tests {
         std::fs::write(&file_path, "fake png data").unwrap();
 
         let tool = ReadFile::new(dir.path());
-        let result = tool.execute(&format!(r#"{{"path": "image.png"}}"#)).await;
+        let result = tool
+            .execute(
+                &super::super::ToolContext { channel: "test" },
+                &format!(r#"{{"path": "image.png"}}"#),
+            )
+            .await;
         assert!(
             result.starts_with("error:"),
             "expected error for binary file, got: {result}"
@@ -205,7 +215,12 @@ mod tests {
     async fn execute_nonexistent_file() {
         let dir = tempfile::tempdir().unwrap();
         let tool = ReadFile::new(dir.path());
-        let result = tool.execute(r#"{"path": "does_not_exist.txt"}"#).await;
+        let result = tool
+            .execute(
+                &super::super::ToolContext { channel: "test" },
+                r#"{"path": "does_not_exist.txt"}"#,
+            )
+            .await;
         assert!(
             result.starts_with("error:"),
             "expected error for nonexistent file, got: {result}"

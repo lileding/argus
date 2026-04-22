@@ -51,7 +51,7 @@ impl<'a> Tool for WriteFile<'a> {
         })
     }
 
-    async fn execute(&self, args: &str) -> String {
+    async fn execute(&self, _ctx: &super::ToolContext<'_>, args: &str) -> String {
         let parsed: Args = match serde_json::from_str(args) {
             Ok(a) => a,
             Err(e) => return format!("error: invalid arguments: {e}"),
@@ -118,7 +118,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tool = WriteFile::new(dir.path());
         let result = tool
-            .execute(r#"{"path": "notes.txt", "content": "hello"}"#)
+            .execute(
+                &super::super::ToolContext { channel: "test" },
+                r#"{"path": "notes.txt", "content": "hello"}"#,
+            )
             .await;
         assert!(
             result.starts_with("wrote"),
@@ -133,7 +136,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tool = WriteFile::new(dir.path());
         let result = tool
-            .execute(r#"{"path": "sub/deep/file.txt", "content": "nested"}"#)
+            .execute(
+                &super::super::ToolContext { channel: "test" },
+                r#"{"path": "sub/deep/file.txt", "content": "nested"}"#,
+            )
             .await;
         assert!(
             result.starts_with("wrote"),
@@ -149,7 +155,9 @@ mod tests {
         let tool = WriteFile::new(dir.path());
         let content = "line1\nline2\n中文内容";
         let args = serde_json::json!({"path": "test.txt", "content": content}).to_string();
-        let result = tool.execute(&args).await;
+        let result = tool
+            .execute(&super::super::ToolContext { channel: "test" }, &args)
+            .await;
         assert!(result.starts_with("wrote"));
         let written = std::fs::read_to_string(dir.path().join(".users/test.txt")).unwrap();
         assert_eq!(written, content);
@@ -160,7 +168,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tool = WriteFile::new(dir.path());
         let result = tool
-            .execute(r#"{"path": "../../etc/evil.txt", "content": "pwned"}"#)
+            .execute(
+                &super::super::ToolContext { channel: "test" },
+                r#"{"path": "../../etc/evil.txt", "content": "pwned"}"#,
+            )
             .await;
         assert!(
             result.starts_with("error:"),

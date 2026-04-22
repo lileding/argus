@@ -22,6 +22,12 @@ use crate::database::Database;
 
 use super::EmbedService;
 
+/// Execution context passed to every tool call.
+#[derive(Clone, Copy)]
+pub(super) struct ToolContext<'a> {
+    pub(super) channel: &'a str,
+}
+
 /// A tool that the orchestrator can invoke.
 #[async_trait::async_trait]
 pub(super) trait Tool: Send + Sync {
@@ -36,7 +42,7 @@ pub(super) trait Tool: Send + Sync {
 
     /// Execute the tool with the given JSON arguments. Returns a human-readable
     /// string. Errors are returned as `"error: ..."` — never panics.
-    async fn execute(&self, args: &str) -> String;
+    async fn execute(&self, ctx: &ToolContext<'_>, args: &str) -> String;
 
     /// Status line shown on the card while this tool is running.
     /// Includes emoji + short description based on the arguments.
