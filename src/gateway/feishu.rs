@@ -331,11 +331,6 @@ impl Feishu {
         let file_key = parsed
             .as_ref()
             .and_then(|v| v.get("file_key").and_then(|k| k.as_str()));
-        let duration = parsed
-            .as_ref()
-            .and_then(|v| v.get("duration").and_then(|d| d.as_i64()))
-            .unwrap_or(0);
-
         let Some(file_key) = file_key else {
             return Payload {
                 content: "The user sent a voice message.".into(),
@@ -343,28 +338,19 @@ impl Feishu {
             };
         };
 
-        // Download audio file. Transcription is not yet implemented.
+        // Download audio file. Content is transcript only (no metadata prefix).
         match self
             .download_and_save(msg_id, file_key, "file", ".opus")
             .await
         {
-            Ok(rel_path) => {
-                let duration_s = duration / 1000;
-                Payload {
-                    content: format!(
-                        "[Voice message, {}s, saved at {}]\n(transcription not yet available)",
-                        duration_s, rel_path
-                    ),
-                    file_paths: vec![rel_path],
-                }
-            }
+            Ok(filename) => Payload {
+                content: "(transcription not yet available)".into(),
+                file_paths: vec![filename],
+            },
             Err(e) => {
                 warn!(msg_id, file_key, error = %e, "audio download failed");
                 Payload {
-                    content: format!(
-                        "The user sent a voice message ({}s, download failed).",
-                        duration / 1000
-                    ),
+                    content: "The user sent a voice message (download failed).".into(),
                     file_paths: vec![],
                 }
             }
@@ -395,22 +381,14 @@ impl Feishu {
             .unwrap_or_else(|| ".bin".into());
 
         match self.download_and_save(msg_id, file_key, "file", &ext).await {
-            Ok(rel_path) => {
-                let abs_path = self.workspace_dir.join(&rel_path);
-                Payload {
-                    content: format!(
-                        "The user sent a file '{}' (saved at {}, absolute path: {}).",
-                        file_name,
-                        rel_path,
-                        abs_path.display()
-                    ),
-                    file_paths: vec![rel_path],
-                }
-            }
+            Ok(filename) => Payload {
+                content: format!("The user sent a file '{file_name}'."),
+                file_paths: vec![filename],
+            },
             Err(e) => {
                 warn!(msg_id, file_key, file_name, error = %e, "file download failed");
                 Payload {
-                    content: format!("The user sent a file '{}' (download failed).", file_name),
+                    content: format!("The user sent a file '{file_name}' (download failed)."),
                     file_paths: vec![],
                 }
             }
@@ -452,7 +430,7 @@ impl Feishu {
     }
 
     /// Download a resource from Feishu API and save to workspace media dir.
-    /// Returns the relative path (e.g. ".files/key.png").
+    /// Returns the filename only (e.g. "key.png"), without MEDIA_DIR prefix.
     async fn download_and_save(
         &self,
         msg_id: &str,
@@ -493,14 +471,13 @@ impl Feishu {
             feishu::types::Error::Connection(format!("save file {}: {e}", abs_path.display()))
         })?;
 
-        let rel_path = format!("{MEDIA_DIR}/{filename}");
         info!(
             file_key,
-            rel_path,
+            filename,
             size = data.len(),
             "media file downloaded"
         );
-        Ok(rel_path)
+        Ok(filename)
     }
 
     /// Outbound render loop: receives Messages from the Agent, consumes

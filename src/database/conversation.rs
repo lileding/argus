@@ -108,6 +108,53 @@ impl Conversation {
 
         Ok(results)
     }
+
+    /// Search notifications (agent replies) by embedding similarity.
+    /// Returns assistant messages matching the query, with summary truncation.
+    pub(crate) async fn search_replies(
+        &self,
+        embedding: &[f32],
+        limit: i64,
+    ) -> anyhow::Result<Vec<(f64, model::Message)>> {
+        let vec = Vector::from(embedding.to_vec());
+        let rows = sqlx::query(
+            "SELECT content, summary, \
+                    1 - (embedding <=> $1) AS similarity \
+             FROM notifications \
+             WHERE embedding IS NOT NULL \
+             ORDER BY embedding <=> $1 \
+             LIMIT $2",
+        )
+        .bind(vec)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut results = Vec::new();
+        for row in &rows {
+            let similarity: f64 = row.get("similarity");
+            let content: String = row.get("content");
+            let summary: Option<String> = row.get("summary");
+
+            // Apply same summary truncation as conversation replies.
+            let text = if content.chars().count() > SUMMARY_THRESHOLD {
+                if let Some(ref s) = summary
+                    && !s.is_empty()
+                {
+                    format!("[Summary] {s}")
+                } else {
+                    let truncated: String = content.chars().take(SUMMARY_THRESHOLD).collect();
+                    format!("{truncated} …[truncated]")
+                }
+            } else {
+                content
+            };
+
+            results.push((similarity, model::Message::assistant(text)));
+        }
+
+        Ok(results)
+    }
 }
 
 /// Format a reply for context: use summary if content is long and summary exists.

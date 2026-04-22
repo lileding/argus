@@ -29,30 +29,53 @@ pub(super) async fn build_context(
     let mut messages = vec![model::Message::system(system_prompt)];
 
     // Semantic recall (if embedder available).
+    // Search both user messages AND agent replies — the answer to "what did I say
+    // about X" is often in the agent's reply, not the user's original message.
     let mut recalled_ids = HashSet::new();
     if let Some(embedder) = embedder
         && let Ok(vec) = embedder.embed_one(user_text).await
-        && let Ok(results) = db
+    {
+        let mut total_bytes = 0;
+
+        // 1. Search user messages (conversation view).
+        if let Ok(results) = db
             .conversation
             .search(&vec, channel, exclude_msg_id, 10)
             .await
-    {
-        let mut total_bytes = 0;
-        for (row_id, similarity, user_msg, reply_msg) in &results {
-            if *similarity < RECALL_SIMILARITY_THRESHOLD {
-                continue;
+        {
+            for (row_id, similarity, user_msg, reply_msg) in &results {
+                if *similarity < RECALL_SIMILARITY_THRESHOLD {
+                    continue;
+                }
+                let size =
+                    user_msg.content.len() + reply_msg.as_ref().map_or(0, |m| m.content.len());
+                if total_bytes + size > RECALL_BYTES_BUDGET {
+                    break;
+                }
+                total_bytes += size;
+                messages.push(user_msg.clone());
+                if let Some(reply) = reply_msg {
+                    messages.push(reply.clone());
+                }
+                recalled_ids.insert(*row_id);
             }
-            let size = user_msg.content.len() + reply_msg.as_ref().map_or(0, |m| m.content.len());
-            if total_bytes + size > RECALL_BYTES_BUDGET {
-                break; // results ordered by similarity; later ones are worse
-            }
-            total_bytes += size;
-            messages.push(user_msg.clone());
-            if let Some(reply) = reply_msg {
-                messages.push(reply.clone());
-            }
-            recalled_ids.insert(*row_id);
         }
+
+        // 2. Search agent replies (notifications table).
+        if let Ok(results) = db.conversation.search_replies(&vec, 10).await {
+            for (similarity, reply_msg) in &results {
+                if *similarity < RECALL_SIMILARITY_THRESHOLD {
+                    continue;
+                }
+                let size = reply_msg.content.len();
+                if total_bytes + size > RECALL_BYTES_BUDGET {
+                    break;
+                }
+                total_bytes += size;
+                messages.push(reply_msg.clone());
+            }
+        }
+
         debug!(
             recalled = recalled_ids.len(),
             total_bytes, "semantic recall done"
