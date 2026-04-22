@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use sqlx::{PgPool, Row};
@@ -218,6 +220,8 @@ impl<'a> Db<'a> {
         validate_ident(table)?;
         let full_name = format!("{DB_PREFIX}{table}");
 
+        let col_types = get_column_types(self.pool(), &full_name).await?;
+
         let mut params: Vec<String> = Vec::new();
         let mut where_clause = String::new();
         let mut sort_field = "created_at".to_string();
@@ -238,7 +242,7 @@ impl<'a> Db<'a> {
                     let (json_str, after_json) = extract_json_object(after)?;
                     let conditions: Map<String, Value> = serde_json::from_str(&json_str)
                         .map_err(|e| format!("invalid where JSON: {e}"))?;
-                    where_clause = build_where(&conditions, &mut params)?;
+                    where_clause = build_where(&conditions, &mut params, &col_types)?;
                     cursor = after_json;
                 }
                 "sort" => {
@@ -319,6 +323,8 @@ impl<'a> Db<'a> {
         validate_ident(table)?;
         let full_name = format!("{DB_PREFIX}{table}");
 
+        let col_types = get_column_types(self.pool(), &full_name).await?;
+
         let mut params: Vec<String> = Vec::new();
         let mut where_clause = String::new();
         let mut group_by: Vec<String> = Vec::new();
@@ -337,7 +343,7 @@ impl<'a> Db<'a> {
                     let (json_str, after_json) = extract_json_object(after)?;
                     let conditions: Map<String, Value> = serde_json::from_str(&json_str)
                         .map_err(|e| format!("invalid where JSON: {e}"))?;
-                    where_clause = build_where(&conditions, &mut params)?;
+                    where_clause = build_where(&conditions, &mut params, &col_types)?;
                     cursor = after_json;
                 }
                 "group_by" => {
@@ -445,6 +451,8 @@ impl<'a> Db<'a> {
             }
         }
 
+        let col_types = get_column_types(self.pool(), &full_name).await?;
+
         // Use a transaction for multi-row inserts.
         let mut tx = self
             .pool()
@@ -455,7 +463,14 @@ impl<'a> Db<'a> {
 
         for record in &records {
             let columns: Vec<&str> = record.keys().map(|k| k.as_str()).collect();
-            let placeholders: Vec<String> = (1..=columns.len()).map(|i| format!("${i}")).collect();
+            let placeholders: Vec<String> = columns
+                .iter()
+                .enumerate()
+                .map(|(i, col)| {
+                    let cast = pg_cast(col_types.get(*col).map(|s| s.as_str()).unwrap_or("text"));
+                    format!("${}::{cast}", i + 1)
+                })
+                .collect();
 
             let sql = format!(
                 "INSERT INTO {full_name} ({}) VALUES ({}) RETURNING id",
@@ -527,13 +542,15 @@ impl<'a> Db<'a> {
         }
 
         let full_name = format!("{DB_PREFIX}{table}");
+        let col_types = get_column_types(self.pool(), &full_name).await?;
 
         // Build SET clause. Reserve $1 for id.
         let mut set_parts: Vec<String> = Vec::new();
         let mut param_values: Vec<&Value> = Vec::new();
         for (i, (col, val)) in fields.iter().enumerate() {
             let idx = i + 2; // $1 is id
-            set_parts.push(format!("{col} = ${idx}"));
+            let cast = pg_cast(col_types.get(col).map(|s| s.as_str()).unwrap_or("text"));
+            set_parts.push(format!("{col} = ${idx}::{cast}"));
             param_values.push(val);
         }
         set_parts.push("updated_at = NOW()".into());
@@ -718,11 +735,52 @@ fn extract_json_balanced(s: &str, open: char, close: char) -> Result<(String, &s
     Err(format!("unterminated JSON {open}...{close}"))
 }
 
+/// Fetch column name → PostgreSQL data_type for a table.
+async fn get_column_types(
+    pool: &sqlx::PgPool,
+    full_table_name: &str,
+) -> Result<HashMap<String, String>, String> {
+    let rows = sqlx::query(
+        "SELECT column_name, data_type FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = $1",
+    )
+    .bind(full_table_name)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("query column types: {e}"))?;
+
+    Ok(rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("column_name"),
+                r.get::<String, _>("data_type"),
+            )
+        })
+        .collect())
+}
+
+/// Map information_schema `data_type` to an appropriate SQL cast type.
+fn pg_cast(data_type: &str) -> &str {
+    match data_type {
+        "date" => "date",
+        "double precision" => "double precision",
+        "integer" | "bigint" | "smallint" => "bigint",
+        "boolean" => "boolean",
+        "timestamp with time zone" | "timestamp without time zone" => "timestamptz",
+        "jsonb" | "json" => "jsonb",
+        "numeric" | "real" => "double precision",
+        "ARRAY" | "text[]" => "text[]",
+        _ => "text",
+    }
+}
+
 /// Build a WHERE clause from a conditions map. Appends values to `params`
 /// and returns the clause (including leading " WHERE ").
 fn build_where(
     conditions: &Map<String, Value>,
     params: &mut Vec<String>,
+    col_types: &HashMap<String, String>,
 ) -> Result<String, String> {
     if conditions.is_empty() {
         return Ok(String::new());
@@ -735,6 +793,7 @@ fn build_where(
         validate_ident(&column)?;
 
         let idx = params.len() + 1;
+        let cast = pg_cast(col_types.get(&column).map(|s| s.as_str()).unwrap_or("text"));
 
         let (sql_fragment, param_value) = match op {
             Op::Eq => {
@@ -742,7 +801,7 @@ fn build_where(
                     (format!("{column} IS NULL"), None)
                 } else {
                     (
-                        format!("{column}::text = ${idx}"),
+                        format!("{column} = ${idx}::{cast}"),
                         Some(json_value_to_string(value)?),
                     )
                 }
@@ -752,25 +811,25 @@ fn build_where(
                     (format!("{column} IS NOT NULL"), None)
                 } else {
                     (
-                        format!("{column}::text != ${idx}"),
+                        format!("{column} != ${idx}::{cast}"),
                         Some(json_value_to_string(value)?),
                     )
                 }
             }
             Op::Gt => (
-                format!("{column}::text > ${idx}"),
+                format!("{column} > ${idx}::{cast}"),
                 Some(json_value_to_string(value)?),
             ),
             Op::Gte => (
-                format!("{column}::text >= ${idx}"),
+                format!("{column} >= ${idx}::{cast}"),
                 Some(json_value_to_string(value)?),
             ),
             Op::Lt => (
-                format!("{column}::text < ${idx}"),
+                format!("{column} < ${idx}::{cast}"),
                 Some(json_value_to_string(value)?),
             ),
             Op::Lte => (
-                format!("{column}::text <= ${idx}"),
+                format!("{column} <= ${idx}::{cast}"),
                 Some(json_value_to_string(value)?),
             ),
             Op::Contains => {
@@ -1009,13 +1068,21 @@ mod tests {
     #[test]
     fn build_where_simple() {
         let mut params = Vec::new();
+        let col_types: HashMap<String, String> = [
+            ("status".to_string(), "text".to_string()),
+            ("age".to_string(), "double precision".to_string()),
+        ]
+        .into_iter()
+        .collect();
         let conditions: Map<String, Value> =
             serde_json::from_str(r#"{"status": "active", "age__gt": 18}"#).unwrap();
-        let clause = build_where(&conditions, &mut params).unwrap();
+        let clause = build_where(&conditions, &mut params, &col_types).unwrap();
         assert!(clause.contains("WHERE"));
-        // Key order in Map may vary; check both conditions appear with valid placeholders.
-        assert!(clause.contains("status::text = $"));
-        assert!(clause.contains("age::text > $"));
+        // Key order in Map may vary; check both conditions appear with typed casts.
+        assert!(clause.contains("status = $"));
+        assert!(clause.contains("::text"));
+        assert!(clause.contains("age > $"));
+        assert!(clause.contains("::double precision"));
         assert_eq!(params.len(), 2);
         assert!(params.contains(&"active".to_string()));
         assert!(params.contains(&"18".to_string()));
@@ -1024,9 +1091,10 @@ mod tests {
     #[test]
     fn build_where_contains() {
         let mut params = Vec::new();
+        let col_types = HashMap::new();
         let conditions: Map<String, Value> =
             serde_json::from_str(r#"{"name__contains": "alice"}"#).unwrap();
-        let clause = build_where(&conditions, &mut params).unwrap();
+        let clause = build_where(&conditions, &mut params, &col_types).unwrap();
         assert!(clause.contains("ILIKE"));
         assert_eq!(params[0], "%alice%");
     }
@@ -1034,9 +1102,10 @@ mod tests {
     #[test]
     fn build_where_null() {
         let mut params = Vec::new();
+        let col_types = HashMap::new();
         let conditions: Map<String, Value> =
             serde_json::from_str(r#"{"deleted_at": null}"#).unwrap();
-        let clause = build_where(&conditions, &mut params).unwrap();
+        let clause = build_where(&conditions, &mut params, &col_types).unwrap();
         assert!(clause.contains("IS NULL"));
         assert!(params.is_empty());
     }
@@ -1044,11 +1113,25 @@ mod tests {
     #[test]
     fn build_where_neq_null() {
         let mut params = Vec::new();
+        let col_types = HashMap::new();
         let conditions: Map<String, Value> =
             serde_json::from_str(r#"{"deleted_at__neq": null}"#).unwrap();
-        let clause = build_where(&conditions, &mut params).unwrap();
+        let clause = build_where(&conditions, &mut params, &col_types).unwrap();
         assert!(clause.contains("IS NOT NULL"));
         assert!(params.is_empty());
+    }
+
+    #[test]
+    fn pg_cast_mapping() {
+        assert_eq!(pg_cast("date"), "date");
+        assert_eq!(pg_cast("double precision"), "double precision");
+        assert_eq!(pg_cast("integer"), "bigint");
+        assert_eq!(pg_cast("bigint"), "bigint");
+        assert_eq!(pg_cast("boolean"), "boolean");
+        assert_eq!(pg_cast("timestamp with time zone"), "timestamptz");
+        assert_eq!(pg_cast("jsonb"), "jsonb");
+        assert_eq!(pg_cast("text"), "text");
+        assert_eq!(pg_cast("character varying"), "text");
     }
 
     #[test]
