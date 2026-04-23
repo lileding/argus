@@ -51,6 +51,8 @@ pub(crate) struct Message {
 /// Outbound notification (Agent → Gateway).
 pub(crate) struct Notification {
     pub(crate) msg_id: String,
+    /// Database message ID to link the notification to (None for async task results).
+    pub(crate) db_msg_id: Option<i64>,
     /// Agent emits events; frontend consumes them to drive UI.
     /// Dropping the sender signals "notification complete".
     pub(crate) events: mpsc::Receiver<Event>,
@@ -275,6 +277,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
         let (events_tx, events_rx) = mpsc::channel(16);
         let notif = Notification {
             msg_id: msg_id.clone(),
+            db_msg_id,
             events: events_rx,
         };
         if port.send(notif).await.is_err() {
@@ -353,13 +356,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
                 })
                 .await;
             if let Some(trace) = trace {
-                let reply_id = self
-                    .db
-                    .notifications
-                    .save_notification(db_msg_id, &summary)
-                    .await
-                    .ok();
-                let _ = trace.finalize(iterations, &summary, reply_id, 0, 0).await;
+                let _ = trace.finalize(iterations, &summary, None, 0, 0).await;
             }
             info!(channel, msg_id, "task complete (async task created)");
             return;
@@ -369,56 +366,38 @@ impl<'a, E: EmbedService> Agent<'a, E> {
         let _ = events_tx.send(Event::Composing).await;
 
         // Phase 2: Synthesizer — stream the final answer to frontend.
-        let reply_text = match self
+        match self
             .run_synthesizer(&payload.content, &summary, &tool_results, &events_tx)
             .await
         {
             Ok((text, usage)) => {
-                debug!(channel, msg_id, "synthesizer done");
-                // Finalize trace with synthesizer stats.
-                if let Some(trace) = trace {
-                    let reply_id = self
-                        .db
-                        .notifications
-                        .save_notification(db_msg_id, &text)
-                        .await
-                        .ok();
-                    if let Err(e) = trace
+                debug!(channel, msg_id, "synthesizer done, {} chars", text.len());
+                // Finalize trace (reply_id set later by Gateway after delivery).
+                if let Some(trace) = trace
+                    && let Err(e) = trace
                         .finalize(
                             iterations,
                             &summary,
-                            reply_id,
+                            None,
                             usage.prompt_tokens,
                             usage.completion_tokens,
                         )
                         .await
-                    {
-                        warn!(channel, msg_id, error = %e, "trace finalize failed");
-                    }
+                {
+                    warn!(channel, msg_id, error = %e, "trace finalize failed");
                 }
-                text
             }
             Err(e) => {
                 warn!(channel, msg_id, error = %e, "synthesizer failed");
-                let error_text = format!("Error: {e}");
                 let _ = events_tx
                     .send(Event::Reply {
-                        text: error_text.clone(),
+                        text: format!("Error: {e}"),
                     })
                     .await;
-                error_text
             }
-        };
-
-        // Persist reply if trace didn't already (no trace = no DB msg id).
-        if db_msg_id.is_none() {
-            let _ = self
-                .db
-                .notifications
-                .save_notification(None, &reply_text)
-                .await;
         }
 
+        // Notification persistence is handled by Gateway after card delivery.
         info!(channel, msg_id, "task complete");
     }
 
@@ -818,17 +797,11 @@ impl<'a, E: EmbedService> Agent<'a, E> {
         let header = format!("**[Task #{task_id} completed]**\n\n");
         let full_reply = format!("{header}{reply_text}");
 
-        // Persist the task result as a notification linked to the original message.
-        let _ = self
-            .db
-            .notifications
-            .save_notification(None, &full_reply)
-            .await;
-
-        // Send completion notification to Gateway.
+        // Send completion notification to Gateway (persistence handled by Gateway).
         let (events_tx, events_rx) = mpsc::channel(4);
         let notif = Notification {
             msg_id: spec.msg_id,
+            db_msg_id: None, // async task result is not linked to a specific message
             events: events_rx,
         };
         if spec.port.send(notif).await.is_ok() {

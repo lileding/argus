@@ -629,7 +629,7 @@ impl<'a> Feishu<'a> {
             }
         };
 
-        let mut got_reply = false;
+        let mut reply_text: Option<String> = None;
         // (tool_name, display_text) — ordered by first appearance, deduped by name.
         let mut status_lines: Vec<(String, String)> = Vec::new();
 
@@ -654,34 +654,56 @@ impl<'a> Feishu<'a> {
                     }
                 }
                 Event::Reply { text } => {
-                    got_reply = true;
                     let processed = crate::render::process_markdown(&text, api).await;
                     let card_json = crate::render::markdown_to_card(&processed);
-                    if let Some(cid) = &card_id {
+                    let delivered = if let Some(cid) = &card_id {
                         match api.update_message(cid, &card_json).await {
                             Ok(()) => {
                                 info!(msg_id = %notif.msg_id, "reply updated on card");
+                                true
                             }
                             Err(e) => {
                                 warn!(msg_id = %notif.msg_id, error = %e, "card update failed, sending new reply");
                                 let content = serde_json::json!({"text": text}).to_string();
-                                let _ = api.reply_message(&notif.msg_id, "text", &content).await;
+                                api.reply_message(&notif.msg_id, "text", &content)
+                                    .await
+                                    .is_ok()
                             }
                         }
                     } else {
                         let content = serde_json::json!({"text": text}).to_string();
-                        if let Err(e) = api.reply_message(&notif.msg_id, "text", &content).await {
-                            warn!(msg_id = %notif.msg_id, error = %e, "reply failed");
+                        match api.reply_message(&notif.msg_id, "text", &content).await {
+                            Ok(_) => true,
+                            Err(e) => {
+                                warn!(msg_id = %notif.msg_id, error = %e, "reply failed");
+                                false
+                            }
                         }
+                    };
+                    if delivered {
+                        reply_text = Some(text);
                     }
                 }
             }
         }
 
-        if !got_reply && let Some(cid) = &card_id {
+        if reply_text.is_none()
+            && let Some(cid) = &card_id
+        {
             let _ = api
                 .update_message(cid, &crate::render::markdown_to_card("✓"))
                 .await;
+        }
+
+        // Persist notification after successful delivery to user.
+        if let Some(text) = &reply_text
+            && let Err(e) = self
+                .db
+                .notifications
+                .save_notification(notif.db_msg_id, text)
+                .await
+        {
+            warn!(msg_id = %notif.msg_id, error = %e, "save_notification failed");
         }
 
         debug!(msg_id = %notif.msg_id, "notification rendering complete");
