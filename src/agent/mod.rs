@@ -814,19 +814,25 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             "async task completed"
         );
 
-        // Send completion notification.
+        // Build final reply text.
+        let header = format!("**[Task #{task_id} completed]**\n\n");
+        let full_reply = format!("{header}{reply_text}");
+
+        // Persist the task result as a notification linked to the original message.
+        let _ = self
+            .db
+            .notifications
+            .save_notification(None, &full_reply)
+            .await;
+
+        // Send completion notification to Gateway.
         let (events_tx, events_rx) = mpsc::channel(4);
         let notif = Notification {
             msg_id: spec.msg_id,
             events: events_rx,
         };
         if spec.port.send(notif).await.is_ok() {
-            let header = format!("**[Task #{task_id} completed]**\n\n");
-            let _ = events_tx
-                .send(Event::Reply {
-                    text: format!("{header}{reply_text}"),
-                })
-                .await;
+            let _ = events_tx.send(Event::Reply { text: full_reply }).await;
         }
     }
 
