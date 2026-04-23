@@ -171,7 +171,15 @@ impl Embedder<'_> {
                 model::Message::system(SUMMARY_PROMPT),
                 model::Message::user(content.as_str()),
             ];
-            match self.summarizer.chat(&messages, &[]).await {
+            match self
+                .summarizer
+                .chat(
+                    &messages,
+                    &[],
+                    &crate::upstream::types::ChatOptions::default(),
+                )
+                .await
+            {
                 Ok(resp) => {
                     if let Err(e) = self.db.notifications.set_summary(*id, &resp.content).await {
                         warn!(id, error = %e, "set summary failed");

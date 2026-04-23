@@ -48,9 +48,21 @@ impl OpenAiClient {
         format!("{}/chat/completions", self.base_url)
     }
 
-    fn build_request(&self, messages: &[Message], tools: &[ToolDef], stream: bool) -> ChatRequest {
+    fn build_request(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        stream: bool,
+        options: &ChatOptions,
+    ) -> ChatRequest {
         let oai_messages: Vec<OaiMessage> = messages.iter().map(|m| m.into()).collect();
         let oai_tools: Vec<OaiTool> = tools.iter().map(|t| t.into()).collect();
+
+        let reasoning_effort = if options.thinking_budget > 0 {
+            Some("medium".to_string())
+        } else {
+            None
+        };
 
         ChatRequest {
             model: self.model.clone(),
@@ -78,6 +90,7 @@ impl OpenAiClient {
             } else {
                 None
             },
+            reasoning_effort,
         }
     }
 
@@ -141,8 +154,13 @@ impl OpenAiClient {
 
 #[async_trait::async_trait]
 impl Client for OpenAiClient {
-    async fn chat(&self, messages: &[Message], tools: &[ToolDef]) -> ClientResult<Response> {
-        let body = self.build_request(messages, tools, false);
+    async fn chat(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        options: &ChatOptions,
+    ) -> ClientResult<Response> {
+        let body = self.build_request(messages, tools, false, options);
         let resp = self
             .auth_request(self.http.post(self.chat_url()))
             .json(&body)
@@ -169,8 +187,9 @@ impl Client for OpenAiClient {
         &self,
         messages: &[Message],
         tools: &[ToolDef],
+        options: &ChatOptions,
     ) -> ClientResult<ChunkStream> {
-        let body = self.build_request(messages, tools, true);
+        let body = self.build_request(messages, tools, true, options);
         let req = self
             .auth_request(self.http.post(self.chat_url()))
             .json(&body);
@@ -186,8 +205,27 @@ impl Client for OpenAiClient {
         messages: &[Message],
         tools: &[ToolDef],
         max_text_tokens: usize,
+        options: &ChatOptions,
     ) -> ClientResult<Response> {
-        let mut stream = self.chat_stream(messages, tools).await?;
+        // Pre-flight: send request manually to capture error body on failure.
+        // EventSource swallows response bodies on non-2xx status.
+        let body = self.build_request(messages, tools, true, options);
+        let preflight = self
+            .auth_request(self.http.post(self.chat_url()))
+            .json(&body)
+            .send()
+            .await?;
+        let status = preflight.status();
+        if !status.is_success() {
+            let error_body = preflight.text().await.unwrap_or_default();
+            tracing::warn!(status = status.as_u16(), body = %error_body, "chat request failed");
+            return Err(ClientError::Api {
+                status: status.as_u16(),
+                message: error_body,
+            });
+        }
+        // Status is OK — proceed with SSE on a fresh request.
+        let mut stream = self.chat_stream(messages, tools, options).await?;
 
         let mut content = String::new();
         let mut usage = Usage::default();
@@ -384,6 +422,8 @@ struct ChatRequest {
     max_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -697,7 +737,7 @@ mod tests {
         let client = OpenAiClient::new(&upstream, &role);
         assert!(client.use_new_token_field);
 
-        let req = client.build_request(&[], &[], false);
+        let req = client.build_request(&[], &[], false, &ChatOptions::default());
         assert!(req.max_tokens.is_none());
         assert_eq!(req.max_completion_tokens, Some(4096));
     }
@@ -718,7 +758,7 @@ mod tests {
         let client = OpenAiClient::new(&upstream, &role);
         assert!(!client.use_new_token_field);
 
-        let req = client.build_request(&[], &[], false);
+        let req = client.build_request(&[], &[], false, &ChatOptions::default());
         assert_eq!(req.max_tokens, Some(4096));
         assert!(req.max_completion_tokens.is_none());
     }

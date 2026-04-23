@@ -88,6 +88,9 @@ const TASK_TOOL_BUDGETS: &[(&str, usize)] = &[
     ("search_history", 6),
 ];
 
+/// Thinking/reasoning token budget for async tasks.
+const TASK_THINKING_BUDGET: usize = 10000;
+
 /// Max iterations for async tasks (3× sync default of 10).
 const TASK_MAX_ITERATIONS: usize = 30;
 
@@ -107,14 +110,21 @@ RULES:
 - For requests that need deep research, comprehensive reports, multi-step analysis, or code generation — call create_task instead of doing it yourself. create_task runs a background worker with 3× your tool budget. Use it when the user explicitly asks for a thorough/detailed report, or when the work clearly exceeds a quick answer."#;
 
 /// Orchestrator prompt for async background tasks — no create_task, no delegation.
-const TASK_ORCHESTRATOR_PROMPT: &str = r#"You are a RESEARCH WORKER executing a background task. Your job is to thoroughly research the given goal using tools, then call finish_task with a comprehensive summary of ALL findings.
+/// The finish_task summary is delivered directly to the user as the final output.
+const TASK_ORCHESTRATOR_PROMPT: &str = r#"You are a RESEARCH WORKER executing a background task. Your job is to thoroughly research the given goal using tools, then call finish_task with the FINAL REPORT.
+
+CRITICAL: Your finish_task summary is delivered DIRECTLY to the user as the final output. It must be a complete, well-structured, publishable document — not a brief summary. Write it as if it's the finished deliverable.
 
 RULES:
 - You MUST call tools. Text output is ignored — only tool calls matter.
 - Search from multiple angles (3-5 different queries) for comprehensive coverage.
 - Fetch and read primary sources — don't rely on search snippets alone.
 - Cross-reference facts across multiple sources.
-- When you have gathered thorough materials, call finish_task with a detailed summary including all key facts, data points, and source URLs.
+- When you have gathered thorough materials, call finish_task with the COMPLETE REPORT:
+  - Use markdown formatting: headings, tables, lists, code blocks
+  - Include all key facts, data points, analysis, and conclusions
+  - Cite sources with URLs
+  - Match the user's language
 - Do NOT answer from training knowledge alone — use tools to verify facts.
 - Do NOT call the same tool with the same arguments twice.
 - You have a large tool budget — use it. Be thorough, not quick."#;
@@ -251,7 +261,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             tokio::select! {
                 spec = task_rx.recv() => {
                     let Some(spec) = spec else { break; };
-                    info!(task_id = spec.id, goal = spec.goal, "async task started");
+                    info!(task_id = spec.id, thinking_budget = TASK_THINKING_BUDGET, "async task started");
                     tasks.push(Box::pin(self.run_task(spec)));
                 }
                 _ = tasks.next(), if !tasks.is_empty() => {}
@@ -425,7 +435,8 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             events_tx,
             TOOL_BUDGETS,
             self.max_iterations,
-            true, // include create_task for sync messages
+            true,                           // include create_task for sync messages
+            &model::ChatOptions::default(), // instant mode
         )
         .await
     }
@@ -444,6 +455,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
         tool_budgets: &[(&str, usize)],
         max_iterations: usize,
         include_create_task: bool,
+        chat_options: &model::ChatOptions,
     ) -> (
         String,      // summary
         Vec<String>, // tool_results
@@ -473,6 +485,8 @@ impl<'a, E: EmbedService> Agent<'a, E> {
 
         debug!(
             tool_count = tool_defs.len(),
+            thinking = chat_options.thinking_budget > 0,
+            thinking_budget = chat_options.thinking_budget,
             tools = ?tool_defs.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
             "orchestrator tools registered"
         );
@@ -512,7 +526,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             // Call orchestrator with early abort (text-only detection).
             let resp = match self
                 .orchestrator
-                .chat_with_early_abort(messages, &tool_defs, EARLY_ABORT_TOKENS)
+                .chat_with_early_abort(messages, &tool_defs, EARLY_ABORT_TOKENS, chat_options)
                 .await
             {
                 Ok(r) => r,
@@ -713,7 +727,10 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             model::Message::user(user_content),
         ];
 
-        let mut stream = self.synthesizer.chat_stream(&messages, &[]).await?;
+        let mut stream = self
+            .synthesizer
+            .chat_stream(&messages, &[], &model::ChatOptions::default())
+            .await?;
         let mut full_reply = String::new();
         let mut usage = model::Usage::default();
 
@@ -741,8 +758,8 @@ impl<'a, E: EmbedService> Agent<'a, E> {
         Ok((full_reply, usage))
     }
 
-    /// Execute an async background task: orchestrator → synthesizer with
-    /// higher budgets, then send the result as a Notification.
+    /// Execute an async background task: orchestrator with thinking mode,
+    /// no synthesizer — finish_task summary is the final deliverable.
     async fn run_task(&self, spec: TaskSpec) {
         let task_id = spec.id;
         let start = Instant::now();
@@ -753,9 +770,14 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             model::Message::user(&spec.goal),
         ];
 
-        // Phase 1: orchestrator tool loop with higher budgets, no create_task.
+        // Async tasks always use thinking/reasoning mode.
+        let chat_options = model::ChatOptions {
+            thinking_budget: TASK_THINKING_BUDGET,
+        };
+
+        // Orchestrator tool loop with higher budgets, no create_task, thinking enabled.
         let dummy_events = mpsc::channel(1).0;
-        let (summary, tool_results, _iterations, _trace) = self
+        let (summary, _tool_results, _iterations, _trace) = self
             .run_orchestrator_with_budgets(
                 &mut messages,
                 &spec.channel,
@@ -766,26 +788,11 @@ impl<'a, E: EmbedService> Agent<'a, E> {
                 TASK_TOOL_BUDGETS,
                 TASK_MAX_ITERATIONS,
                 false, // no create_task in async tasks
+                &chat_options,
             )
             .await;
 
-        // Phase 2: synthesizer.
-        let reply_text = match self
-            .run_synthesizer(
-                &spec.goal,
-                &summary,
-                &tool_results,
-                &mpsc::channel(1).0, // dummy — we'll send the final result ourselves
-            )
-            .await
-        {
-            Ok((text, _usage)) => text,
-            Err(e) => {
-                warn!(task_id, error = %e, "async task synthesizer failed");
-                format!("Error: {e}")
-            }
-        };
-
+        // No synthesizer — the orchestrator's finish_task summary IS the final output.
         let duration = start.elapsed();
         info!(
             task_id,
@@ -793,9 +800,8 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             "async task completed"
         );
 
-        // Build final reply text.
         let header = format!("**[Task #{task_id} completed]**\n\n");
-        let full_reply = format!("{header}{reply_text}");
+        let full_reply = format!("{header}{summary}");
 
         // Send completion notification to Gateway (persistence handled by Gateway).
         let (events_tx, events_rx) = mpsc::channel(4);

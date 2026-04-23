@@ -2,6 +2,7 @@ pub(crate) mod types;
 
 mod anthropic;
 mod openai;
+mod openai_responses;
 
 use std::collections::HashMap;
 use tracing::info;
@@ -61,6 +62,9 @@ fn create_provider_client(
     match upstream.provider_type.as_str() {
         "openai" => Ok(Box::new(openai::OpenAiClient::new(upstream, role))),
         "anthropic" => Ok(Box::new(anthropic::AnthropicClient::new(upstream, role))),
+        "openai-response" => Ok(Box::new(openai_responses::OpenAiResponsesClient::new(
+            upstream, role,
+        ))),
         "gemini" => {
             info!("gemini: using OpenAI-compatible endpoint");
             let mut gemini_upstream = upstream.clone();

@@ -54,7 +54,13 @@ impl AnthropicClient {
         format!("{}/v1/messages", self.base_url)
     }
 
-    fn build_request(&self, messages: &[Message], tools: &[ToolDef], stream: bool) -> ApiRequest {
+    fn build_request(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        stream: bool,
+        options: &ChatOptions,
+    ) -> ApiRequest {
         let mut system: Option<serde_json::Value> = None;
         let mut api_messages: Vec<ApiMessage> = Vec::new();
 
@@ -152,6 +158,12 @@ impl AnthropicClient {
             })
             .collect();
 
+        let thinking = if options.thinking_budget > 0 {
+            Some(serde_json::json!({"type": "enabled", "budget_tokens": options.thinking_budget}))
+        } else {
+            None
+        };
+
         ApiRequest {
             model: self.model.clone(),
             max_tokens: self.max_tokens,
@@ -163,6 +175,7 @@ impl AnthropicClient {
                 Some(api_tools)
             },
             stream,
+            thinking,
         }
     }
 
@@ -228,8 +241,13 @@ impl AnthropicClient {
 
 #[async_trait::async_trait]
 impl Client for AnthropicClient {
-    async fn chat(&self, messages: &[Message], tools: &[ToolDef]) -> ClientResult<Response> {
-        let body = self.build_request(messages, tools, false);
+    async fn chat(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        options: &ChatOptions,
+    ) -> ClientResult<Response> {
+        let body = self.build_request(messages, tools, false, options);
         let resp = self
             .auth_request(self.http.post(self.messages_url()))
             .json(&body)
@@ -256,8 +274,9 @@ impl Client for AnthropicClient {
         &self,
         messages: &[Message],
         tools: &[ToolDef],
+        options: &ChatOptions,
     ) -> ClientResult<ChunkStream> {
-        let body = self.build_request(messages, tools, true);
+        let body = self.build_request(messages, tools, true, options);
         let req = self
             .auth_request(self.http.post(self.messages_url()))
             .json(&body);
@@ -272,8 +291,9 @@ impl Client for AnthropicClient {
         messages: &[Message],
         tools: &[ToolDef],
         max_text_tokens: usize,
+        options: &ChatOptions,
     ) -> ClientResult<Response> {
-        let mut stream = self.chat_stream(messages, tools).await?;
+        let mut stream = self.chat_stream(messages, tools, options).await?;
 
         let mut content = String::new();
         let mut usage = Usage::default();
@@ -519,6 +539,8 @@ struct ApiRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ApiTool>>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -697,7 +719,7 @@ mod tests {
         let client = AnthropicClient::new(&upstream, &role);
 
         let messages = vec![Message::system("be helpful"), Message::user("hi")];
-        let req = client.build_request(&messages, &[], false);
+        let req = client.build_request(&messages, &[], false, &ChatOptions::default());
 
         // System should be top-level, not in messages.
         assert!(req.system.is_some());
@@ -721,7 +743,7 @@ mod tests {
         let client = AnthropicClient::new(&upstream, &role);
 
         let messages = vec![Message::tool_result("toolu_1", "search", "found it")];
-        let req = client.build_request(&messages, &[], false);
+        let req = client.build_request(&messages, &[], false, &ChatOptions::default());
 
         // Tool result → user message with tool_result content block.
         assert_eq!(req.messages.len(), 1);

@@ -203,23 +203,38 @@ pub(crate) struct StreamChunk {
 /// Type alias for a boxed async stream of chunks.
 pub(crate) type ChunkStream = Pin<Box<dyn Stream<Item = StreamChunk> + Send>>;
 
+// --- Chat options ---
+
+/// Per-call options for chat methods. Default = instant mode.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ChatOptions {
+    /// Thinking/reasoning token budget. 0 = instant mode (no thinking).
+    pub(crate) thinking_budget: usize,
+}
+
 // --- Client trait ---
 
 /// Model client interface. Each provider implements this.
-#[allow(dead_code)] // chat_with_early_abort used when tool system is implemented.
 #[async_trait::async_trait]
 pub(crate) trait Client: Send + Sync {
-    async fn chat(&self, messages: &[Message], tools: &[ToolDef]) -> ClientResult<Response>;
+    async fn chat(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        options: &ChatOptions,
+    ) -> ClientResult<Response>;
     async fn chat_stream(
         &self,
         messages: &[Message],
         tools: &[ToolDef],
+        options: &ChatOptions,
     ) -> ClientResult<ChunkStream>;
     async fn chat_with_early_abort(
         &self,
         messages: &[Message],
         tools: &[ToolDef],
         max_text_tokens: usize,
+        options: &ChatOptions,
     ) -> ClientResult<Response>;
 }
 
