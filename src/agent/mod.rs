@@ -341,6 +341,30 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             )
             .await;
 
+        // If the orchestrator created an async task, skip the synthesizer
+        // and reply with the summary directly. The synthesizer would otherwise
+        // hallucinate an answer without materials.
+        let created_task = tool_results.iter().any(|r| r.starts_with("[create_task]"));
+
+        if created_task {
+            let _ = events_tx
+                .send(Event::Reply {
+                    text: summary.clone(),
+                })
+                .await;
+            if let Some(trace) = trace {
+                let reply_id = self
+                    .db
+                    .notifications
+                    .save_notification(db_msg_id, &summary)
+                    .await
+                    .ok();
+                let _ = trace.finalize(iterations, &summary, reply_id, 0, 0).await;
+            }
+            info!(channel, msg_id, "task complete (async task created)");
+            return;
+        }
+
         // Transition to Phase 2.
         let _ = events_tx.send(Event::Composing).await;
 
