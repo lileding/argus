@@ -680,21 +680,52 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             }
 
             if budget_rejections >= MAX_BUDGET_REJECTIONS {
-                summary = format!(
-                    "(Orchestrator force-stopped after {} budget rejections.)",
-                    budget_rejections
-                );
                 warn!(budget_rejections, "force-stopping orchestrator");
                 break;
             }
         }
 
+        // If orchestrator didn't call finish_task, force one last call with
+        // only finish_task available (no other tools, no reasoning) so the
+        // model writes a report from gathered materials.
         if summary.is_empty() {
-            summary = format!(
-                "(Orchestrator reached max {} iterations; synthesizing from {} materials.)",
-                max_iterations,
-                all_tool_results.len()
+            info!(
+                materials = all_tool_results.len(),
+                "orchestrator didn't finish, forcing final report"
             );
+            messages.push(model::Message::user(
+                "Budget exhausted. You MUST call finish_task NOW with a complete, \
+                 well-structured report based on ALL materials gathered above. \
+                 This is your final output to the user.",
+            ));
+            let finish_only: Vec<model::ToolDef> = registry
+                .iter()
+                .filter(|t| t.name() == "finish_task")
+                .map(|t| model::ToolDef {
+                    name: t.name().to_string(),
+                    description: t.description().to_string(),
+                    parameters: t.parameters(),
+                })
+                .collect();
+            let instant = model::ChatOptions::default(); // no reasoning
+            if let Ok(resp) = self
+                .orchestrator
+                .chat(messages, &finish_only, &instant)
+                .await
+            {
+                if let Some(ft) = resp.tool_calls.iter().find(|tc| tc.name == "finish_task") {
+                    summary = extract_summary(&ft.arguments);
+                } else {
+                    // Model produced text instead of calling finish_task — use it.
+                    summary = resp.content;
+                }
+            }
+            if summary.is_empty() {
+                summary = format!(
+                    "(Orchestrator exhausted budget with {} materials but failed to produce a report.)",
+                    all_tool_results.len()
+                );
+            }
         }
 
         (summary, all_tool_results, iterations, trace)
