@@ -4,7 +4,7 @@
 
 Every `git commit` must go through a codex review cycle:
 
-1. **Before committing**, spawn a general-purpose Agent to review the staged diff. The review prompt must include:
+1. **Before committing**, spawn a `codex` CLI Agent to review the staged diff. The review prompt must include:
    - Read all changed files
    - Check against DESIGN.md architectural requirements
    - Check against the Design Principles below (mandatory)
@@ -18,9 +18,11 @@ Every `git commit` must go through a codex review cycle:
    - If needed, re-review with codex
    - Repeat until review passes or remaining issues are explicitly deferred
 
-4. **Only then commit**.
+4. **Then ask to confirm commit**.
 
 ## Design Principles (STRICT — codex must enforce)
+
+### Read DESIGN.md
 
 ### High Cohesion, Low Coupling
 - Each module owns its internal logic. Callers pass config, not pre-built internals.
@@ -52,7 +54,6 @@ Every `git commit` must go through a codex review cycle:
 ```
 make check    # cargo fmt --check + cargo clippy + cargo test
 make run      # RUST_LOG + cargo run
-cargo fmt --all -- --check   # format check
 ```
 
 ## Architecture
@@ -76,3 +77,10 @@ Import direction: Gateway imports Agent types. Agent imports Upstream. Agent nev
 
 - Code, comments, commit messages: English
 - Conversational replies to user: Chinese
+
+## Test envirionment
+
+- Workspace directory is 'workspace'
+- Config file is 'workspace/config.toml'
+- PostgreSQL runs in docker called 'mm-db'
+
