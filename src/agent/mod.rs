@@ -230,6 +230,12 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             format!("{ORCHESTRATOR_PROMPT}\n\n{catalog}")
         };
 
+        // Load images from payload file_paths for multimodal context.
+        let image_parts = load_image_parts(
+            &self.workspace_dir.join(crate::config::MEDIA_DIR),
+            &payload.file_paths,
+        );
+
         // Build context with conversation history (semantic recall + sliding window).
         let mut messages = harness::build_context(
             self.db,
@@ -239,6 +245,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             &payload.content,
             db_msg_id,
             self.context_window,
+            image_parts,
         )
         .await;
 
@@ -625,6 +632,51 @@ fn truncate(s: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     format!("{}…[truncated, {} bytes total]", &s[..end], s.len())
+}
+
+/// Image file extensions recognized for multimodal injection.
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
+
+/// Read image files from disk, base64-encode them, return as ContentPart::Image.
+/// Non-image files and read failures are silently skipped.
+fn load_image_parts(media_dir: &Path, file_paths: &[String]) -> Vec<model::ContentPart> {
+    use base64::Engine;
+
+    let mut parts = Vec::new();
+    for filename in file_paths {
+        let ext = Path::new(filename)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if !IMAGE_EXTENSIONS
+            .iter()
+            .any(|&img_ext| ext.eq_ignore_ascii_case(img_ext))
+        {
+            continue;
+        }
+        let abs_path = media_dir.join(filename);
+        match std::fs::read(&abs_path) {
+            Ok(bytes) => {
+                let media_type = match ext.to_ascii_lowercase().as_str() {
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "png" => "image/png",
+                    "gif" => "image/gif",
+                    "webp" => "image/webp",
+                    _ => continue,
+                };
+                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                debug!(filename, size = bytes.len(), "image loaded for multimodal");
+                parts.push(model::ContentPart::Image {
+                    media_type: media_type.to_string(),
+                    data,
+                });
+            }
+            Err(e) => {
+                warn!(filename, error = %e, "failed to read image file, skipping");
+            }
+        }
+    }
+    parts
 }
 
 #[cfg(test)]

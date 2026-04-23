@@ -83,24 +83,15 @@ impl AnthropicClient {
                                 ContentPart::Text { text } => {
                                     serde_json::json!({"type": "text", "text": text})
                                 }
-                                ContentPart::ImageUrl { url } => {
-                                    // Anthropic wants base64 source, not data: URL.
-                                    // Parse "data:image/png;base64,<data>" format.
-                                    if let Some((media_type, data)) = parse_data_url(url) {
-                                        serde_json::json!({
-                                            "type": "image",
-                                            "source": {
-                                                "type": "base64",
-                                                "media_type": media_type,
-                                                "data": data
-                                            }
-                                        })
-                                    } else {
-                                        serde_json::json!({
-                                            "type": "image",
-                                            "source": {"type": "url", "url": url}
-                                        })
-                                    }
+                                ContentPart::Image { media_type, data } => {
+                                    serde_json::json!({
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": media_type,
+                                            "data": data
+                                        }
+                                    })
                                 }
                             })
                             .collect();
@@ -516,14 +507,6 @@ struct PendingToolCall {
     arguments: String,
 }
 
-/// Parse a data: URL like "data:image/png;base64,<data>" into (media_type, data).
-fn parse_data_url(url: &str) -> Option<(String, String)> {
-    let rest = url.strip_prefix("data:")?;
-    let (meta, data) = rest.split_once(',')?;
-    let media_type = meta.strip_suffix(";base64")?;
-    Some((media_type.to_string(), data.to_string()))
-}
-
 // --- Anthropic API types ---
 
 #[derive(Serialize)]
@@ -696,19 +679,6 @@ mod tests {
         }"#;
         let err = AnthropicClient::parse_response(json).unwrap_err();
         assert!(err.to_string().contains("bad request"));
-    }
-
-    #[test]
-    fn parse_data_url_valid() {
-        let (media, data) = parse_data_url("data:image/png;base64,abc123").unwrap();
-        assert_eq!(media, "image/png");
-        assert_eq!(data, "abc123");
-    }
-
-    #[test]
-    fn parse_data_url_invalid() {
-        assert!(parse_data_url("https://example.com/image.png").is_none());
-        assert!(parse_data_url("data:image/png,nobase64").is_none());
     }
 
     #[test]

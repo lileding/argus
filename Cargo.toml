@@ -12,6 +12,7 @@ feishu = { path = "feishu" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
+base64 = "0.22"
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

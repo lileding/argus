@@ -16,6 +16,8 @@ const RECALL_BYTES_BUDGET: usize = 6000;
 
 /// Build orchestrator context: system prompt + recalled + recent + current message.
 /// `exclude_msg_id` is the current message's DB ID (excluded from queries to avoid self-reference).
+/// `image_parts` are multimodal content parts for the current message (base64-encoded images).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn build_context(
     db: &Database,
     embedder: Option<&dyn super::EmbedService>,
@@ -24,6 +26,7 @@ pub(super) async fn build_context(
     user_text: &str,
     exclude_msg_id: Option<i64>,
     context_window: usize,
+    image_parts: Vec<model::ContentPart>,
 ) -> Vec<model::Message> {
     // Build system prompt with pinned memories.
     let system_content = if let Ok(memories) = db.memories.list_active().await {
@@ -122,8 +125,12 @@ pub(super) async fn build_context(
         }
     }
 
-    // Current user message (always last).
-    messages.push(model::Message::user(user_text));
+    // Current user message (always last). Include images if present.
+    if image_parts.is_empty() {
+        messages.push(model::Message::user(user_text));
+    } else {
+        messages.push(model::Message::user_with_images(user_text, image_parts));
+    }
 
     messages
 }

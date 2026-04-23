@@ -62,6 +62,21 @@ impl Message {
         }
     }
 
+    /// User message with multimodal content (text + images).
+    pub(crate) fn user_with_images(text: impl Into<String>, images: Vec<ContentPart>) -> Self {
+        let text = text.into();
+        let mut parts = vec![ContentPart::Text { text: text.clone() }];
+        parts.extend(images);
+        Self {
+            role: Role::User,
+            content: text,
+            parts,
+            tool_calls: vec![],
+            tool_call_id: None,
+            tool_name: None,
+        }
+    }
+
     pub(crate) fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
@@ -96,8 +111,10 @@ impl Message {
 pub(crate) enum ContentPart {
     #[serde(rename = "text")]
     Text { text: String },
-    #[serde(rename = "image_url")]
-    ImageUrl { url: String },
+    /// Inline image: raw base64 data + MIME type. Each client serializes
+    /// to its own wire format (OpenAI data-URL, Anthropic source block).
+    #[serde(rename = "image")]
+    Image { media_type: String, data: String },
 }
 
 // --- Tool Definitions ---
@@ -316,10 +333,11 @@ mod tests {
         let json = serde_json::to_string(&text).unwrap();
         assert!(json.contains(r#""type":"text""#));
 
-        let img = ContentPart::ImageUrl {
-            url: "data:image/png;base64,abc".into(),
+        let img = ContentPart::Image {
+            media_type: "image/png".into(),
+            data: "abc".into(),
         };
         let json = serde_json::to_string(&img).unwrap();
-        assert!(json.contains(r#""type":"image_url""#));
+        assert!(json.contains(r#""type":"image""#));
     }
 }

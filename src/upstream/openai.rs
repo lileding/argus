@@ -413,7 +413,8 @@ impl From<&Message> for OaiMessage {
                 .iter()
                 .map(|p| match p {
                     ContentPart::Text { text } => serde_json::json!({"type": "text", "text": text}),
-                    ContentPart::ImageUrl { url } => {
+                    ContentPart::Image { media_type, data } => {
+                        let url = format!("data:{media_type};base64,{data}");
                         serde_json::json!({"type": "image_url", "image_url": {"url": url}})
                     }
                 })
