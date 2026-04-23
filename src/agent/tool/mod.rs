@@ -99,8 +99,9 @@ pub(super) fn build_registry<'a, E: EmbedService>(
     skill_index: &'a SkillIndex,
     task_tx: &'a tokio::sync::mpsc::Sender<super::TaskSpec>,
     next_task_id: &'a std::sync::atomic::AtomicU32,
+    include_create_task: bool,
 ) -> ToolRegistry<'a> {
-    let tools: Vec<Box<dyn Tool + 'a>> = vec![
+    let mut tools: Vec<Box<dyn Tool + 'a>> = vec![
         Box::new(finish_task::FinishTask),
         Box::new(current_time::CurrentTime),
         Box::new(search::Search::new(http, tavily_api_key)),
@@ -115,8 +116,13 @@ pub(super) fn build_registry<'a, E: EmbedService>(
         Box::new(search_history::SearchHistory::new(db, embed_service)),
         Box::new(db::Db::new(db)),
         Box::new(skill::ActivateSkill::new(skill_index)),
-        Box::new(create_task::CreateTask::new(task_tx, next_task_id)),
     ];
+    if include_create_task {
+        tools.push(Box::new(create_task::CreateTask::new(
+            task_tx,
+            next_task_id,
+        )));
+    }
 
     ToolRegistry { tools }
 }

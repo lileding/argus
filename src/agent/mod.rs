@@ -104,6 +104,19 @@ RULES:
 - Do NOT call the same tool with the same arguments twice.
 - For requests that need deep research, comprehensive reports, multi-step analysis, or code generation — call create_task instead of doing it yourself. create_task runs a background worker with 3× your tool budget. Use it when the user explicitly asks for a thorough/detailed report, or when the work clearly exceeds a quick answer."#;
 
+/// Orchestrator prompt for async background tasks — no create_task, no delegation.
+const TASK_ORCHESTRATOR_PROMPT: &str = r#"You are a RESEARCH WORKER executing a background task. Your job is to thoroughly research the given goal using tools, then call finish_task with a comprehensive summary of ALL findings.
+
+RULES:
+- You MUST call tools. Text output is ignored — only tool calls matter.
+- Search from multiple angles (3-5 different queries) for comprehensive coverage.
+- Fetch and read primary sources — don't rely on search snippets alone.
+- Cross-reference facts across multiple sources.
+- When you have gathered thorough materials, call finish_task with a detailed summary including all key facts, data points, and source URLs.
+- Do NOT answer from training knowledge alone — use tools to verify facts.
+- Do NOT call the same tool with the same arguments twice.
+- You have a large tool budget — use it. Be thorough, not quick."#;
+
 const SYNTHESIZER_PROMPT: &str = r#"You are the SYNTHESIZER. You receive the user's question and materials gathered by the orchestrator (tool results + summary). Compose a clear, helpful answer.
 
 RULES:
@@ -409,6 +422,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             events_tx,
             TOOL_BUDGETS,
             self.max_iterations,
+            true, // include create_task for sync messages
         )
         .await
     }
@@ -426,6 +440,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
         events_tx: &mpsc::Sender<Event>,
         tool_budgets: &[(&str, usize)],
         max_iterations: usize,
+        include_create_task: bool,
     ) -> (
         String,      // summary
         Vec<String>, // tool_results
@@ -441,6 +456,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             &self.skill_index,
             &self.task_tx,
             &self.next_task_id,
+            include_create_task,
         );
 
         let tool_defs: Vec<model::ToolDef> = registry
@@ -728,16 +744,13 @@ impl<'a, E: EmbedService> Agent<'a, E> {
         let task_id = spec.id;
         let start = Instant::now();
 
-        // Build orchestrator prompt (no skill catalog for async tasks).
-        let orch_prompt = ORCHESTRATOR_PROMPT.to_string();
-
-        // No conversation history for async tasks — self-contained goal.
+        // Async tasks use a dedicated prompt — no delegation, no create_task.
         let mut messages = vec![
-            model::Message::system(&orch_prompt),
+            model::Message::system(TASK_ORCHESTRATOR_PROMPT),
             model::Message::user(&spec.goal),
         ];
 
-        // Phase 1: orchestrator tool loop with higher budgets.
+        // Phase 1: orchestrator tool loop with higher budgets, no create_task.
         let dummy_events = mpsc::channel(1).0;
         let (summary, tool_results, _iterations, _trace) = self
             .run_orchestrator_with_budgets(
@@ -749,6 +762,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
                 &dummy_events,
                 TASK_TOOL_BUDGETS,
                 TASK_MAX_ITERATIONS,
+                false, // no create_task in async tasks
             )
             .await;
 
