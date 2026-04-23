@@ -101,7 +101,8 @@ RULES:
 - When you have enough material, call finish_task with a brief summary of what you found.
 - For opinions or reviews, search from 2-3 different angles for comprehensive coverage.
 - Do NOT answer from training knowledge alone — use tools to verify real-time facts.
-- Do NOT call the same tool with the same arguments twice."#;
+- Do NOT call the same tool with the same arguments twice.
+- For requests that need deep research, comprehensive reports, multi-step analysis, or code generation — call create_task instead of doing it yourself. create_task runs a background worker with 3× your tool budget. Use it when the user explicitly asks for a thorough/detailed report, or when the work clearly exceeds a quick answer."#;
 
 const SYNTHESIZER_PROMPT: &str = r#"You are the SYNTHESIZER. You receive the user's question and materials gathered by the orchestrator (tool results + summary). Compose a clear, helpful answer.
 
