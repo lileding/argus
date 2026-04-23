@@ -119,7 +119,11 @@ mod tests {
         let tool = WriteFile::new(dir.path());
         let result = tool
             .execute(
-                &super::super::ToolContext { channel: "test" },
+                &super::super::ToolContext {
+                    channel: "test",
+                    msg_id: "test",
+                    port: &tokio::sync::mpsc::channel(1).0,
+                },
                 r#"{"path": "notes.txt", "content": "hello"}"#,
             )
             .await;
@@ -137,7 +141,11 @@ mod tests {
         let tool = WriteFile::new(dir.path());
         let result = tool
             .execute(
-                &super::super::ToolContext { channel: "test" },
+                &super::super::ToolContext {
+                    channel: "test",
+                    msg_id: "test",
+                    port: &tokio::sync::mpsc::channel(1).0,
+                },
                 r#"{"path": "sub/deep/file.txt", "content": "nested"}"#,
             )
             .await;
@@ -156,7 +164,14 @@ mod tests {
         let content = "line1\nline2\n中文内容";
         let args = serde_json::json!({"path": "test.txt", "content": content}).to_string();
         let result = tool
-            .execute(&super::super::ToolContext { channel: "test" }, &args)
+            .execute(
+                &super::super::ToolContext {
+                    channel: "test",
+                    msg_id: "test",
+                    port: &tokio::sync::mpsc::channel(1).0,
+                },
+                &args,
+            )
             .await;
         assert!(result.starts_with("wrote"));
         let written = std::fs::read_to_string(dir.path().join(".users/test.txt")).unwrap();
@@ -169,7 +184,11 @@ mod tests {
         let tool = WriteFile::new(dir.path());
         let result = tool
             .execute(
-                &super::super::ToolContext { channel: "test" },
+                &super::super::ToolContext {
+                    channel: "test",
+                    msg_id: "test",
+                    port: &tokio::sync::mpsc::channel(1).0,
+                },
                 r#"{"path": "../../etc/evil.txt", "content": "pwned"}"#,
             )
             .await;

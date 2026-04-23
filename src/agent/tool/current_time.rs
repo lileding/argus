@@ -82,7 +82,11 @@ mod tests {
         let tool = CurrentTime;
         let result = tool
             .execute(
-                &super::super::ToolContext { channel: "test" },
+                &super::super::ToolContext {
+                    channel: "test",
+                    msg_id: "test",
+                    port: &tokio::sync::mpsc::channel(1).0,
+                },
                 r#"{"timezone": "Asia/Shanghai"}"#,
             )
             .await;
@@ -98,7 +102,11 @@ mod tests {
         let tool = CurrentTime;
         let result = tool
             .execute(
-                &super::super::ToolContext { channel: "test" },
+                &super::super::ToolContext {
+                    channel: "test",
+                    msg_id: "test",
+                    port: &tokio::sync::mpsc::channel(1).0,
+                },
                 r#"{"timezone": "Foo/Bar"}"#,
             )
             .await;
@@ -112,7 +120,14 @@ mod tests {
     async fn empty_args_defaults_to_utc() {
         let tool = CurrentTime;
         let result = tool
-            .execute(&super::super::ToolContext { channel: "test" }, "{}")
+            .execute(
+                &super::super::ToolContext {
+                    channel: "test",
+                    msg_id: "test",
+                    port: &tokio::sync::mpsc::channel(1).0,
+                },
+                "{}",
+            )
             .await;
         assert!(
             result.contains("timezone: UTC"),
@@ -124,7 +139,14 @@ mod tests {
     async fn default_contains_unix() {
         let tool = CurrentTime;
         let result = tool
-            .execute(&super::super::ToolContext { channel: "test" }, "{}")
+            .execute(
+                &super::super::ToolContext {
+                    channel: "test",
+                    msg_id: "test",
+                    port: &tokio::sync::mpsc::channel(1).0,
+                },
+                "{}",
+            )
             .await;
         assert!(
             result.contains("unix:"),

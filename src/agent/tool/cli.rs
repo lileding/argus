@@ -144,7 +144,11 @@ mod tests {
         let tool = Cli::new(dir.path());
         let result = tool
             .execute(
-                &super::super::ToolContext { channel: "test" },
+                &super::super::ToolContext {
+                    channel: "test",
+                    msg_id: "test",
+                    port: &tokio::sync::mpsc::channel(1).0,
+                },
                 r#"{"command": "echo hello"}"#,
             )
             .await;
@@ -157,7 +161,11 @@ mod tests {
         let tool = Cli::new(dir.path());
         let result = tool
             .execute(
-                &super::super::ToolContext { channel: "test" },
+                &super::super::ToolContext {
+                    channel: "test",
+                    msg_id: "test",
+                    port: &tokio::sync::mpsc::channel(1).0,
+                },
                 r#"{"command": "exit 42"}"#,
             )
             .await;
@@ -171,7 +179,11 @@ mod tests {
         let tool = Cli::new(dir.path());
         let result = tool
             .execute(
-                &super::super::ToolContext { channel: "test" },
+                &super::super::ToolContext {
+                    channel: "test",
+                    msg_id: "test",
+                    port: &tokio::sync::mpsc::channel(1).0,
+                },
                 r#"{"command": "pwd", "working_dir": "sub"}"#,
             )
             .await;
@@ -184,7 +196,11 @@ mod tests {
         let tool = Cli::new(dir.path());
         let result = tool
             .execute(
-                &super::super::ToolContext { channel: "test" },
+                &super::super::ToolContext {
+                    channel: "test",
+                    msg_id: "test",
+                    port: &tokio::sync::mpsc::channel(1).0,
+                },
                 r#"{"command": "pwd", "working_dir": "/tmp"}"#,
             )
             .await;

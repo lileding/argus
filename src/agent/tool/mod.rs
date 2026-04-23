@@ -1,4 +1,5 @@
 mod cli;
+mod create_task;
 mod current_time;
 mod db;
 mod fetch;
@@ -23,9 +24,11 @@ use crate::database::Database;
 use super::EmbedService;
 
 /// Execution context passed to every tool call.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct ToolContext<'a> {
     pub(super) channel: &'a str,
+    pub(super) msg_id: &'a str,
+    pub(super) port: &'a tokio::sync::mpsc::Sender<super::Notification>,
 }
 
 /// A tool that the orchestrator can invoke.
@@ -86,6 +89,7 @@ fn truncate_display(s: &str, max: usize) -> String {
 }
 
 /// Build the full tool registry with all available tools.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_registry<'a, E: EmbedService>(
     db: &'a Database,
     embed_service: &'a E,
@@ -93,6 +97,8 @@ pub(super) fn build_registry<'a, E: EmbedService>(
     http: &'a reqwest::Client,
     tavily_api_key: &'a str,
     skill_index: &'a SkillIndex,
+    task_tx: &'a tokio::sync::mpsc::Sender<super::TaskSpec>,
+    next_task_id: &'a std::sync::atomic::AtomicU32,
 ) -> ToolRegistry<'a> {
     let tools: Vec<Box<dyn Tool + 'a>> = vec![
         Box::new(finish_task::FinishTask),
@@ -109,6 +115,7 @@ pub(super) fn build_registry<'a, E: EmbedService>(
         Box::new(search_history::SearchHistory::new(db, embed_service)),
         Box::new(db::Db::new(db)),
         Box::new(skill::ActivateSkill::new(skill_index)),
+        Box::new(create_task::CreateTask::new(task_tx, next_task_id)),
     ];
 
     ToolRegistry { tools }

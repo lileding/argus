@@ -4,8 +4,12 @@ mod tool;
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::pin::Pin;
+use std::sync::atomic::AtomicU32;
 use std::time::Instant;
 
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -62,6 +66,29 @@ pub(crate) enum Event {
     Reply { text: String },
 }
 
+/// Specification for an async background task, created by the `create_task` tool.
+pub(crate) struct TaskSpec {
+    pub(crate) id: u32,
+    pub(crate) goal: String,
+    pub(crate) channel: String,
+    pub(crate) msg_id: String,
+    pub(crate) port: mpsc::Sender<Notification>,
+}
+
+/// Async task budgets: 3× sync defaults.
+const TASK_TOOL_BUDGETS: &[(&str, usize)] = &[
+    ("search", 9),
+    ("fetch", 12),
+    ("cli", 15),
+    ("db", 18),
+    ("write_file", 9),
+    ("remember", 3),
+    ("search_history", 6),
+];
+
+/// Max iterations for async tasks (3× sync default of 10).
+const TASK_MAX_ITERATIONS: usize = 30;
+
 // --- Prompts ---
 
 const ORCHESTRATOR_PROMPT: &str = r#"You are the ORCHESTRATOR of an AI agent. Your job is to gather information using tools, then call finish_task with a summary.
@@ -110,6 +137,10 @@ const MAX_BUDGET_REJECTIONS: usize = 5;
 pub(crate) struct Agent<'a, E: EmbedService> {
     tx: mpsc::Sender<Message>,
     rx: Mutex<mpsc::Receiver<Message>>,
+    /// Async task submission channel (create_task tool → async_task_loop).
+    task_tx: mpsc::Sender<TaskSpec>,
+    task_rx: Mutex<mpsc::Receiver<TaskSpec>>,
+    next_task_id: AtomicU32,
     db: &'a Database,
     orchestrator: Box<dyn upstream::Client>,
     synthesizer: Box<dyn upstream::Client>,
@@ -144,9 +175,13 @@ impl<'a, E: EmbedService> Agent<'a, E> {
         );
 
         let (tx, rx) = mpsc::channel(64);
+        let (task_tx, task_rx) = mpsc::channel(64);
         Ok(Agent {
             tx,
             rx: Mutex::new(rx),
+            task_tx,
+            task_rx: Mutex::new(task_rx),
+            next_task_id: AtomicU32::new(1),
             db,
             orchestrator,
             synthesizer,
@@ -164,6 +199,13 @@ impl<'a, E: EmbedService> Agent<'a, E> {
 
     pub(crate) async fn run(&self, cancel: &CancellationToken) {
         info!("agent scheduler started");
+        tokio::join!(self.sync_message_loop(cancel), self.async_task_loop(cancel),);
+        info!("agent scheduler stopped");
+    }
+
+    /// Sequential message processing. Completes current message before
+    /// checking cancel — guarantees no mid-processing abort.
+    async fn sync_message_loop(&self, cancel: &CancellationToken) {
         let mut rx = self.rx.lock().await;
         loop {
             tokio::select! {
@@ -175,12 +217,34 @@ impl<'a, E: EmbedService> Agent<'a, E> {
                     self.process_message(msg).await;
                 }
                 _ = cancel.cancelled() => {
-                    info!("agent received shutdown signal");
+                    info!("sync_message_loop received shutdown signal");
                     break;
                 }
             }
         }
-        info!("agent scheduler stopped");
+    }
+
+    /// Drives async tasks in parallel via FuturesUnordered.
+    /// On cancel, drops all in-flight tasks immediately.
+    async fn async_task_loop(&self, cancel: &CancellationToken) {
+        let mut task_rx = self.task_rx.lock().await;
+        let mut tasks: FuturesUnordered<
+            Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>,
+        > = FuturesUnordered::new();
+        loop {
+            tokio::select! {
+                spec = task_rx.recv() => {
+                    let Some(spec) = spec else { break; };
+                    info!(task_id = spec.id, goal = spec.goal, "async task started");
+                    tasks.push(Box::pin(self.run_task(spec)));
+                }
+                _ = tasks.next(), if !tasks.is_empty() => {}
+                _ = cancel.cancelled() => {
+                    info!(in_flight = tasks.len(), "async_task_loop shutdown, dropping tasks");
+                    break;
+                }
+            }
+        }
     }
 
     async fn process_message(&self, msg: Message) {
@@ -253,7 +317,14 @@ impl<'a, E: EmbedService> Agent<'a, E> {
 
         // Phase 1: Orchestrator tool loop.
         let (summary, tool_results, iterations, trace) = self
-            .run_orchestrator(&mut messages, &channel, db_msg_id, &events_tx)
+            .run_orchestrator(
+                &mut messages,
+                &channel,
+                &msg_id,
+                &port,
+                db_msg_id,
+                &events_tx,
+            )
             .await;
 
         // Transition to Phase 2.
@@ -313,14 +384,47 @@ impl<'a, E: EmbedService> Agent<'a, E> {
         info!(channel, msg_id, "task complete");
     }
 
-    /// Phase 1: Orchestrator tool loop. Calls model with tools, executes tool
-    /// calls, appends results, loops until finish_task or max iterations.
+    /// Phase 1: Orchestrator tool loop with default budgets.
     async fn run_orchestrator(
         &self,
         messages: &mut Vec<model::Message>,
         channel: &str,
+        msg_id: &str,
+        port: &mpsc::Sender<Notification>,
         db_msg_id: Option<i64>,
         events_tx: &mpsc::Sender<Event>,
+    ) -> (
+        String,
+        Vec<String>,
+        i32,
+        Option<crate::database::traces::TraceBuilder>,
+    ) {
+        self.run_orchestrator_with_budgets(
+            messages,
+            channel,
+            msg_id,
+            port,
+            db_msg_id,
+            events_tx,
+            TOOL_BUDGETS,
+            self.max_iterations,
+        )
+        .await
+    }
+
+    /// Phase 1: Orchestrator tool loop. Calls model with tools, executes tool
+    /// calls, appends results, loops until finish_task or max iterations.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_orchestrator_with_budgets(
+        &self,
+        messages: &mut Vec<model::Message>,
+        channel: &str,
+        msg_id: &str,
+        port: &mpsc::Sender<Notification>,
+        db_msg_id: Option<i64>,
+        events_tx: &mpsc::Sender<Event>,
+        tool_budgets: &[(&str, usize)],
+        max_iterations: usize,
     ) -> (
         String,      // summary
         Vec<String>, // tool_results
@@ -334,6 +438,8 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             &self.http,
             &self.tavily_api_key,
             &self.skill_index,
+            &self.task_tx,
+            &self.next_task_id,
         );
 
         let tool_defs: Vec<model::ToolDef> = registry
@@ -370,14 +476,18 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             None => None,
         };
 
-        let mut budgets: HashMap<&str, usize> = TOOL_BUDGETS.iter().copied().collect();
+        let mut budgets: HashMap<&str, usize> = tool_budgets.iter().copied().collect();
         let mut budget_rejections: usize = 0;
-        let tool_ctx = tool::ToolContext { channel };
+        let tool_ctx = tool::ToolContext {
+            channel,
+            msg_id,
+            port,
+        };
         let mut all_tool_results: Vec<String> = Vec::new();
         let mut summary = String::new();
         let mut iterations: i32 = 0;
 
-        for iteration in 0..self.max_iterations {
+        for iteration in 0..max_iterations {
             iterations = (iteration + 1) as i32;
             // Call orchestrator with early abort (text-only detection).
             let resp = match self
@@ -474,10 +584,11 @@ impl<'a, E: EmbedService> Agent<'a, E> {
                 let normalized = tool.normalize_args(&tc.arguments);
                 let seq = seq as i32;
                 let iter = iteration as i32;
+                let ctx = tool_ctx.clone();
 
                 futures.push(async move {
                     let start = Instant::now();
-                    let result = tool.execute(&tool_ctx, &tc_args).await;
+                    let result = tool.execute(&ctx, &tc_args).await;
                     let duration_ms = start.elapsed().as_millis() as i32;
                     let is_error = result.starts_with("error:");
                     (
@@ -547,7 +658,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
         if summary.is_empty() {
             summary = format!(
                 "(Orchestrator reached max {} iterations; synthesizing from {} materials.)",
-                self.max_iterations,
+                max_iterations,
                 all_tool_results.len()
             );
         }
@@ -608,6 +719,76 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             .await;
 
         Ok((full_reply, usage))
+    }
+
+    /// Execute an async background task: orchestrator → synthesizer with
+    /// higher budgets, then send the result as a Notification.
+    async fn run_task(&self, spec: TaskSpec) {
+        let task_id = spec.id;
+        let start = Instant::now();
+
+        // Build orchestrator prompt (no skill catalog for async tasks).
+        let orch_prompt = ORCHESTRATOR_PROMPT.to_string();
+
+        // No conversation history for async tasks — self-contained goal.
+        let mut messages = vec![
+            model::Message::system(&orch_prompt),
+            model::Message::user(&spec.goal),
+        ];
+
+        // Phase 1: orchestrator tool loop with higher budgets.
+        let dummy_events = mpsc::channel(1).0;
+        let (summary, tool_results, _iterations, _trace) = self
+            .run_orchestrator_with_budgets(
+                &mut messages,
+                &spec.channel,
+                &spec.msg_id,
+                &spec.port,
+                None,
+                &dummy_events,
+                TASK_TOOL_BUDGETS,
+                TASK_MAX_ITERATIONS,
+            )
+            .await;
+
+        // Phase 2: synthesizer.
+        let reply_text = match self
+            .run_synthesizer(
+                &spec.goal,
+                &summary,
+                &tool_results,
+                &mpsc::channel(1).0, // dummy — we'll send the final result ourselves
+            )
+            .await
+        {
+            Ok((text, _usage)) => text,
+            Err(e) => {
+                warn!(task_id, error = %e, "async task synthesizer failed");
+                format!("Error: {e}")
+            }
+        };
+
+        let duration = start.elapsed();
+        info!(
+            task_id,
+            duration_ms = duration.as_millis() as u64,
+            "async task completed"
+        );
+
+        // Send completion notification.
+        let (events_tx, events_rx) = mpsc::channel(4);
+        let notif = Notification {
+            msg_id: spec.msg_id,
+            events: events_rx,
+        };
+        if spec.port.send(notif).await.is_ok() {
+            let header = format!("**[Task #{task_id} completed]**\n\n");
+            let _ = events_tx
+                .send(Event::Reply {
+                    text: format!("{header}{reply_text}"),
+                })
+                .await;
+        }
     }
 
     /// Clone the message submission channel for use by IM adapters.

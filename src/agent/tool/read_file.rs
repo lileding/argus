@@ -184,7 +184,11 @@ mod tests {
         let tool = ReadFile::new(dir.path());
         let result = tool
             .execute(
-                &super::super::ToolContext { channel: "test" },
+                &super::super::ToolContext {
+                    channel: "test",
+                    msg_id: "test",
+                    port: &tokio::sync::mpsc::channel(1).0,
+                },
                 &format!(r#"{{"path": "hello.txt"}}"#),
             )
             .await;
@@ -200,7 +204,11 @@ mod tests {
         let tool = ReadFile::new(dir.path());
         let result = tool
             .execute(
-                &super::super::ToolContext { channel: "test" },
+                &super::super::ToolContext {
+                    channel: "test",
+                    msg_id: "test",
+                    port: &tokio::sync::mpsc::channel(1).0,
+                },
                 &format!(r#"{{"path": "image.png"}}"#),
             )
             .await;
@@ -217,7 +225,11 @@ mod tests {
         let tool = ReadFile::new(dir.path());
         let result = tool
             .execute(
-                &super::super::ToolContext { channel: "test" },
+                &super::super::ToolContext {
+                    channel: "test",
+                    msg_id: "test",
+                    port: &tokio::sync::mpsc::channel(1).0,
+                },
                 r#"{"path": "does_not_exist.txt"}"#,
             )
             .await;
