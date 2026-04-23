@@ -80,19 +80,19 @@ tokio::join!(
 | Service | Responsibility |
 |---------|---------------|
 | **Gateway** | Manages all IM adapters. Each adapter runs its own `select!` loop: WS inbound, outbound rendering, media processing, recovery replay — all in a single `FuturesUnordered` pool |
-| **Agent** | Pops tasks from mpsc, runs two-phase execution (orchestrator → synthesizer), records traces |
+| **Agent** | Two sub-loops via `join!`: `sync_message_loop` processes messages sequentially; `async_task_loop` drives background tasks in `FuturesUnordered` |
 | **Embedder** | Background worker: embeds unembedded rows (messages, notifications, memories, chunks), summarizes long assistant replies, ingests queued documents |
 | **Recovery** | Scans for unreplied messages at startup and every 5 minutes, replays them through the Gateway |
 
-### Task, Message, Event
+### Message, Notification, Event
 
 ```rust
-pub(crate) struct Task {
+pub(crate) struct Message {               // Gateway → Agent (inbound)
     pub(crate) msg_id: String,
     pub(crate) channel: String,           // e.g. "feishu:p2p:ou_xxx"
     pub(crate) db_msg_id: Option<i64>,
     pub(crate) ready: oneshot::Receiver<Payload>,
-    pub(crate) port: mpsc::Sender<Message>,
+    pub(crate) port: mpsc::Sender<Notification>,
 }
 
 pub(crate) struct Payload {
@@ -100,7 +100,7 @@ pub(crate) struct Payload {
     pub(crate) file_paths: Vec<String>,
 }
 
-pub(crate) struct Message {
+pub(crate) struct Notification {          // Agent → Gateway (outbound)
     pub(crate) msg_id: String,
     pub(crate) events: mpsc::Receiver<Event>,
 }
@@ -114,31 +114,31 @@ pub(crate) enum Event {
 
 `ready` is a `oneshot` that carries the processed payload directly —
 no DB round-trip between Gateway and Agent after media is ready.
-Dropping the `events` sender is the sole "this message is done"
+Dropping the `events` sender is the sole "this notification is done"
 signal; no explicit `close()` method.
 
-### Per-Task Lifecycle
+### Per-Message Lifecycle
 
 ```
-Gateway inbound (select! loop)        Agent run loop
-──────────────────────────────        ──────────────
-WS event arrives                      task ← mpsc::recv
-  dedup by message_id                 msg := Message { events }
-  INSERT raw message (ready=false)    task.port.send(msg)
-  Task{ready_rx} constructed          payload := task.ready.await
-  task_tx.send(task)                  execute(payload, events_tx)
+Gateway inbound (select! loop)        Agent sync_message_loop
+──────────────────────────────        ──────────────────────────
+WS event arrives                      msg ← mpsc::recv
+  dedup by message_id                 notif := Notification { events }
+  INSERT raw message (ready=false)    msg.port.send(notif)
+  Message{ready_rx} constructed       payload := msg.ready.await
+  msg_tx.send(msg)                    execute(payload, events_tx)
   → returns MediaWork                 drop(events_tx)
 
 FuturesUnordered                      Gateway render (same select!)
 ────────────────                      ──────────────────────────────
-download bytes → DB(ready=true)       msg ← outbound mpsc
+download bytes → DB(ready=true)       notif ← outbound mpsc
 process → ready_tx.send(payload)      reply_message → thinking card
-                                      for event in msg.events:
+                                      for event in notif.events:
                                           update_message(card)
                                       finalize card
 ```
 
-Agent calls `port.send(msg)` **before** waiting on `ready` — this
+Agent calls `port.send(notif)` **before** waiting on `ready` — this
 preserves the "thinking card appears instantly, even while audio is
 transcribing" UX.
 
@@ -157,12 +157,14 @@ reply_id:    NULL → Some(id)          (reply saved to notifications)
 - **ready=true**: content fully processed. Reproducible from local
   bytes — safe to re-run after crash.
 
-### Single Active Card Per Chat
+### Single Active Card Per Chat (Sync Messages)
 
-The Agent scheduler processes tasks sequentially (single queue). The
-Feishu adapter renders each Message in a concurrent future within its
-`FuturesUnordered` pool. Since the Agent never issues concurrent tasks,
-at most one card is "open" per chat at any instant.
+The Agent processes sync messages sequentially (single loop). The
+Feishu adapter renders each Notification in a concurrent future within
+its `FuturesUnordered` pool. Since the Agent never issues concurrent
+sync notifications, at most one card is "open" per chat at any instant
+for sync messages. Async task completion notifications open separate
+cards (see Async Tasks below).
 
 ### Recovery (Crash Replay)
 
@@ -175,7 +177,7 @@ On startup:
   1. Recovery.scan() queries messages with no reply
   2. For each row: route by channel prefix (e.g. "feishu:..." → feishu IM)
   3. Gateway.replay(msg) sends through the IM's recover channel
-  4. IM adapter receives, reprocesses if needed, constructs Task → agent
+  4. IM adapter receives, reprocesses if needed, constructs Message → agent
 ```
 
 Recovery handles the state combinations:
@@ -197,8 +199,9 @@ cancel.cancel()
     │
     ├── Gateway (each IM adapter):
     │     drain outbound queue, drain in-flight FuturesUnordered, return
-    ├── Agent:
-    │     break select! loop (current task completes naturally), return
+    ├── Agent (two sub-loops via join!):
+    │     sync_message_loop: current message completes naturally, then return
+    │     async_task_loop: break immediately, drop in-flight tasks, return
     ├── Embedder:
     │     break interval loop, return
     └── Recovery:
@@ -207,8 +210,10 @@ cancel.cancel()
 
 Gateway `select!` on cancel: drains remaining outbound messages with a
 500ms timeout, then drains all in-flight futures (media + render).
-Agent completes whatever task is currently mid-execution — no new tasks
-are pulled from the queue.
+Agent `sync_message_loop` completes whatever message is currently
+mid-execution — no new messages are pulled. `async_task_loop` exits
+immediately; in-flight async tasks are dropped (no persistence, no
+retry in v1).
 
 ### Two-Phase Agent (Orchestrator + Synthesizer)
 
@@ -230,6 +235,96 @@ into two narrow roles dramatically improves reliability:
 Both phases use different model clients (e.g. Claude for orchestration,
 Gemini for synthesis). The `run_synthesizer` method streams its output via
 SSE-style chunks to the frontend.
+
+### Async Tasks
+
+Some user requests require long-running work (deep research, code
+generation, multi-step analysis). These are executed as **async tasks**
+that run in the background while the Agent continues processing new
+messages.
+
+#### Concurrency Model
+
+`Agent::run()` uses `tokio::join!` to run two sub-loops as peers:
+
+```rust
+async fn run(&self, cancel: &CancellationToken) {
+    tokio::join!(
+        self.sync_message_loop(cancel),
+        self.async_task_loop(cancel),
+    );
+}
+```
+
+- **`sync_message_loop`**: sequential message processing. Pops from
+  `msg_rx`, runs orchestrator → synthesizer, one at a time. On cancel,
+  finishes the current message then returns.
+- **`async_task_loop`**: drives a `FuturesUnordered` pool of background
+  tasks. Pops `TaskSpec` from `task_rx`, pushes `run_task` futures into
+  the pool. On cancel, returns immediately (drops in-flight tasks).
+
+Both loops yield at `.await` points. `join!` polls them cooperatively
+within a single tokio task — when `sync_message_loop` awaits an HTTP
+response, `join!` polls `async_task_loop`, which drives background
+tasks forward. No `Arc`, no `tokio::spawn`.
+
+#### Trigger: `create_task` Tool
+
+The orchestrator decides whether a request needs async execution. When
+it does, it calls the `create_task` tool:
+
+```
+create_task(goal: "Research Google 8th gen TPU architecture and write a report")
+→ "Created task #35"
+```
+
+The tool assigns a globally unique, human-readable ID (AtomicU32,
+displayed as `#1`, `#2`, …), queues a `TaskSpec` via `task_tx`, and
+returns the ID. The orchestrator then calls `finish_task` with
+"Created async task #35: …". The synthesizer replies to the user
+confirming the task was created.
+
+Task IDs reset on restart (no persistence in v1).
+
+#### Task Execution
+
+Each async task runs its own independent orchestrator → synthesizer
+cycle, reusing the same model clients and tool set:
+
+- The `goal` from `create_task` becomes the user message
+- Higher iteration limit and tool budgets (3× sync defaults)
+- No conversation history context (the task is self-contained)
+- On completion (success or failure), sends a `Notification` through
+  the original message's `port`, using the trigger message's `msg_id`
+  for reply threading
+
+```
+TaskSpec {
+    id: u32,                          // #35
+    goal: String,                     // "Research Google TPU..."
+    channel: String,                  // "feishu:p2p:ou_xxx"
+    msg_id: String,                   // original trigger message
+    port: mpsc::Sender<Notification>, // for completion notification
+}
+```
+
+#### Completion Notification
+
+When a task finishes, a `Notification` is sent to the Gateway:
+
+- **Success**: `[Task #35 completed]\n\n{synthesizer output}`
+- **Failure**: `[Task #35 failed]\n\n{error}`
+
+The notification replies to the original trigger message, creating a
+reply thread in Feishu. The Gateway renders it as a normal card
+(thinking → reply).
+
+#### v1 Limitations
+
+- No persistence: tasks are lost on restart
+- No retry: failure is final
+- No user interaction: no progress queries, no cancellation
+- No dedicated model config: reuses sync orchestrator/synthesizer
 
 ---
 
@@ -605,6 +700,7 @@ them (via `activate_skill`), not create or modify them.
 | `search_history` | Semantic search over conversation history | 2/turn |
 | `db` | Structured data access (see below) | 6/turn |
 | `activate_skill` | Load a skill's full instructions on demand | — |
+| `create_task` | Create an async background task (returns task ID) | — |
 
 ### Tool Trait
 
@@ -968,8 +1064,9 @@ src/
   main.rs                    Entry point, --config flag, tokio::join! four services
   config.rs                  TOML config + tilde expansion + path resolution
   agent/
-    mod.rs                   Task/Message/Event types, Agent struct, process_task,
-                             run_orchestrator (tool loop), run_synthesizer (streaming),
+    mod.rs                   Message/Notification/Event types, Agent struct,
+                             sync_message_loop + async_task_loop (join!),
+                             run_orchestrator, run_synthesizer, run_task,
                              prompts, tool budgets
     harness.rs               Context curation: semantic recall + sliding window +
                              pinned memories
@@ -990,6 +1087,7 @@ src/
       list_docs.rs           List indexed documents
       search_history.rs      Conversation history semantic search
       skill.rs               activate_skill tool
+      create_task.rs         Async task creation tool
   gateway/
     mod.rs                   Gateway struct, Im trait, recovery routing
     feishu.rs                Feishu adapter: WS inbound, media processing,
@@ -1078,37 +1176,29 @@ migrations/
 
 ## Future Work
 
-- **Per-chat FIFO within Agent.** Currently uses a single global task
-  queue (sequential processing). The original Go version had per-chat
-  MPSC channels via `sync.Map.LoadOrStore` for cross-chat parallelism.
-  This would need per-chat `select!` loops or a `FuturesUnordered` pool
-  inside the Agent scheduler.
+- **Async task persistence and retry.** Currently v1: no persistence,
+  no retry, tasks lost on restart. Future: persist TaskSpec to DB,
+  resume on startup, retry on failure.
 
-- **Cron / scheduled tasks.** Not implemented. The Go version had plans
-  for cron-driven async tasks.
+- **Async task user interaction.** Query task status, cancel running
+  tasks, dedicated model config per task.
 
-- **Sandbox abstraction.** The Go version supported local and Docker
-  sandboxes. The Rust version runs CLI tools directly on the host.
-  Re-introduce sandbox abstraction if production deployment requires
-  isolation.
+- **Per-chat FIFO within Agent.** Currently uses a single global
+  sequential loop. Per-chat parallelism would allow cross-chat
+  concurrency while preserving per-chat ordering.
+
+- **Cron / scheduled tasks.** Cron-driven triggers that create async
+  tasks on a schedule.
+
+- **Sandbox abstraction.** The CLI tool runs commands directly on the
+  host. Re-introduce sandbox abstraction (Docker, VM) if production
+  deployment requires isolation.
 
 - **Group Silent Listening.** Listed as an interaction mode but not
   implemented. Group messages without @mention are silently dropped.
 
-- **Vision (multimodal image understanding).** Images are downloaded and
-  file_paths saved, but base64 encoding and injection into model context
-  as multimodal content parts is not yet implemented. The `ContentPart`
-  enum and `parts` field on `Message` exist in the type system but are
-  not populated.
-
-- **Skill hot-reload.** Skills are loaded once at startup. The Go version
-  rescanned every 30s. Adding a file watcher or periodic rescan would
-  restore hot-reload capability.
-
-- **Assistant reply summarization in context.** The Embedder generates
-  summaries, but `build_context` does not yet substitute long replies
-  with their summaries. The `conversation` view exposes `reply_summary`
-  for this purpose.
+- **Skill hot-reload.** Skills are loaded once at startup. Adding a
+  file watcher or periodic rescan would restore hot-reload capability.
 
 ---
 
@@ -1140,9 +1230,10 @@ lookup. Rejected because each rewrite adds a full model round-trip to
 every message. The sliding window provides pronoun context for most cases.
 
 **Full assistant replies in orchestrator context.** Past long agent replies
-in the sliding window dominated orchestrator attention. The notification
-summary system (Embedder worker) addresses this — once `build_context`
-is updated to use summaries from the conversation view.
+in the sliding window dominated orchestrator attention. Solved: the
+`conversation` module's `format_reply` uses notification summaries
+(generated by the Embedder worker) for replies over 800 chars. Both
+sliding window and semantic recall apply this truncation automatically.
 
 **Tool output dynamic summarization.** Instead of byte-truncating tool
 results at 16 KB, run a small model to summarize. Rejected for latency:
@@ -1161,17 +1252,18 @@ an extra LLM call per tool result adds 5-10s per iteration.
   via `&self` and run cooperatively in `tokio::join!`; no `Arc`, no
   `tokio::spawn`, no shared-nothing concurrency
 - **Three layers, strict import direction** — Gateway → Agent → Upstream.
-  Agent does not know which Gateway a task came from; Task carries its
-  own `mpsc::Sender<Message>` port. Layers communicate through value
-  types (Task / Message / Event / Payload), not service registries
+  Agent does not know which Gateway a message came from; Message carries
+  its own `mpsc::Sender<Notification>` port. Layers communicate through
+  value types (Message / Notification / Event / Payload), not service
+  registries
 - **Protect IM bytes, replay everything else** — the shutdown path
   guarantees media bytes land on disk. Content processing, agent
   execution, card rendering are all replayable via Recovery
 - **Store first, process later** — persist the message before any
   processing or acknowledgment. Crash at any point = no data loss
-- **Single task queue, sequential processing** — simplicity over
-  cross-chat parallelism. Per-chat FIFO is a documented future
-  enhancement, not a missing feature
+- **Sequential sync, parallel async** — sync messages processed one
+  at a time (history context consistency); async tasks run in parallel
+  via `FuturesUnordered`. Both driven cooperatively by `join!`
 - **High cohesion, low coupling** — each module owns its internal logic.
   Callers pass config sections, not pre-built internals. Internal types
   use `pub(crate)` or `pub(super)`, not `pub`. Trait objects at module

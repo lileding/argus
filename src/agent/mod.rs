@@ -33,20 +33,22 @@ pub(crate) trait EmbedService: Send + Sync {
     fn model_name(&self) -> &str;
 }
 
-pub(crate) struct Task {
+/// Inbound user message (Gateway → Agent).
+pub(crate) struct Message {
     pub(crate) msg_id: String,
     /// Database channel (e.g. "feishu:p2p:ou_xxx").
     pub(crate) channel: String,
     /// Database row ID (None if DB not available).
     pub(crate) db_msg_id: Option<i64>,
     pub(crate) ready: oneshot::Receiver<Payload>,
-    pub(crate) port: mpsc::Sender<Message>,
+    pub(crate) port: mpsc::Sender<Notification>,
 }
 
-pub(crate) struct Message {
+/// Outbound notification (Agent → Gateway).
+pub(crate) struct Notification {
     pub(crate) msg_id: String,
     /// Agent emits events; frontend consumes them to drive UI.
-    /// Dropping the sender signals "message complete".
+    /// Dropping the sender signals "notification complete".
     pub(crate) events: mpsc::Receiver<Event>,
 }
 
@@ -106,8 +108,8 @@ const MAX_BUDGET_REJECTIONS: usize = 5;
 // --- Agent ---
 
 pub(crate) struct Agent<'a, E: EmbedService> {
-    tx: mpsc::Sender<Task>,
-    rx: Mutex<mpsc::Receiver<Task>>,
+    tx: mpsc::Sender<Message>,
+    rx: Mutex<mpsc::Receiver<Message>>,
     db: &'a Database,
     orchestrator: Box<dyn upstream::Client>,
     synthesizer: Box<dyn upstream::Client>,
@@ -165,12 +167,12 @@ impl<'a, E: EmbedService> Agent<'a, E> {
         let mut rx = self.rx.lock().await;
         loop {
             tokio::select! {
-                task = rx.recv() => {
-                    let Some(task) = task else {
-                        debug!("agent task channel closed");
+                msg = rx.recv() => {
+                    let Some(msg) = msg else {
+                        debug!("agent message channel closed");
                         break;
                     };
-                    self.process_task(task).await;
+                    self.process_message(msg).await;
                 }
                 _ = cancel.cancelled() => {
                     info!("agent received shutdown signal");
@@ -181,27 +183,27 @@ impl<'a, E: EmbedService> Agent<'a, E> {
         info!("agent scheduler stopped");
     }
 
-    async fn process_task(&self, task: Task) {
-        let Task {
+    async fn process_message(&self, msg: Message) {
+        let Message {
             msg_id,
             channel,
             db_msg_id,
             ready,
             port,
-        } = task;
-        info!(channel, msg_id, "processing task");
+        } = msg;
+        info!(channel, msg_id, "processing message");
 
         // Open events channel → frontend shows thinking card.
         let (events_tx, events_rx) = mpsc::channel(16);
-        let msg = Message {
+        let notif = Notification {
             msg_id: msg_id.clone(),
             events: events_rx,
         };
-        if port.send(msg).await.is_err() {
+        if port.send(notif).await.is_err() {
             warn!("outbound channel closed, dropping message");
             return;
         }
-        debug!(channel, msg_id, "message posted to outbound port");
+        debug!(channel, msg_id, "notification posted to outbound port");
 
         // Wait for payload with timeout (media processing may hang).
         let payload = match tokio::time::timeout(std::time::Duration::from_secs(120), ready).await {
@@ -608,8 +610,8 @@ impl<'a, E: EmbedService> Agent<'a, E> {
         Ok((full_reply, usage))
     }
 
-    /// Clone the task submission channel for use by IM adapters.
-    pub(crate) fn port(&self) -> mpsc::Sender<Task> {
+    /// Clone the message submission channel for use by IM adapters.
+    pub(crate) fn port(&self) -> mpsc::Sender<Message> {
         self.tx.clone()
     }
 }

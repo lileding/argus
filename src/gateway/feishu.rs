@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::agent::{Event, Message, Payload, Task};
+use crate::agent::{Event, Message, Notification, Payload};
 use crate::config::{GatewayImConfig, MEDIA_DIR};
 use crate::database::{Database, InboundMessage};
 
@@ -23,10 +23,10 @@ struct MediaWork {
 }
 
 pub(super) struct Feishu<'a> {
-    task_tx: mpsc::Sender<Task>,
+    task_tx: mpsc::Sender<Message>,
     db: &'a Database,
-    tx: mpsc::Sender<Message>,
-    rx: Mutex<mpsc::Receiver<Message>>,
+    tx: mpsc::Sender<Notification>,
+    rx: Mutex<mpsc::Receiver<Notification>>,
     feishu_client: feishu::Client,
     workspace_dir: PathBuf,
     transcriber: Option<super::transcribe::TranscribeClient>,
@@ -38,7 +38,7 @@ pub(super) struct Feishu<'a> {
 
 impl<'a> Feishu<'a> {
     pub(super) fn new(
-        task_tx: mpsc::Sender<Task>,
+        task_tx: mpsc::Sender<Message>,
         db: &'a Database,
         cfg: &GatewayImConfig,
         workspace_dir: &Path,
@@ -119,13 +119,13 @@ impl<'a> Feishu<'a> {
                             tasks.push(Box::pin(self.process_media(work)));
                         }
                     }
-                    msg = rx.recv() => {
-                        let Some(msg) = msg else {
+                    notif = rx.recv() => {
+                        let Some(notif) = notif else {
                             debug!("outbound channel closed");
                             return;
                         };
-                        debug!(msg_id = %msg.msg_id, "outbound message received, rendering");
-                        tasks.push(Box::pin(self.render_one(&api, msg)));
+                        debug!(msg_id = %notif.msg_id, "outbound notification received, rendering");
+                        tasks.push(Box::pin(self.render_one(&api, notif)));
                     }
                     recover = recover_rx.recv() => {
                         if let Some(msg) = recover {
@@ -135,13 +135,13 @@ impl<'a> Feishu<'a> {
                     _ = tasks.next(), if !tasks.is_empty() => {}
                     _ = cancel.cancelled() => {
                         info!("feishu frontend shutting down, draining outbound");
-                        while let Ok(Some(msg)) =
+                        while let Ok(Some(notif)) =
                             tokio::time::timeout(
                                 std::time::Duration::from_millis(500),
                                 rx.recv(),
                             ).await
                         {
-                            tasks.push(Box::pin(self.render_one(&api, msg)));
+                            tasks.push(Box::pin(self.render_one(&api, notif)));
                         }
                         // Drain remaining tasks.
                         while tasks.next().await.is_some() {}
@@ -185,21 +185,21 @@ impl<'a> Feishu<'a> {
             p
         };
 
-        // Submit task to agent (same as normal flow).
+        // Submit message to agent (same as normal flow).
         let (ready_tx, ready_rx) = oneshot::channel();
-        let task = Task {
+        let agent_msg = Message {
             msg_id: msg.trigger_msg_id.clone(),
             channel: msg.channel,
             db_msg_id: Some(msg.db_msg_id),
             ready: ready_rx,
             port: self.tx.clone(),
         };
-        if let Err(e) = self.task_tx.send(task).await {
-            warn!(db_msg_id = msg.db_msg_id, error = %e, "recovery submit_task failed");
+        if let Err(e) = self.task_tx.send(agent_msg).await {
+            warn!(db_msg_id = msg.db_msg_id, error = %e, "recovery submit failed");
             return;
         }
         let _ = ready_tx.send(payload);
-        debug!(db_msg_id = msg.db_msg_id, "recovery task submitted");
+        debug!(db_msg_id = msg.db_msg_id, "recovery message submitted");
     }
 
     /// Slow path: download media, transcribe audio, send ready signal.
@@ -353,18 +353,18 @@ impl<'a> Feishu<'a> {
 
         let (ready_tx, ready_rx) = oneshot::channel();
 
-        let task = Task {
+        let agent_msg = Message {
             msg_id: msg_id.clone(),
             channel: channel.clone(),
             db_msg_id,
             ready: ready_rx,
             port: self.tx.clone(),
         };
-        if let Err(e) = self.task_tx.send(task).await {
-            warn!(msg_id, chat_id, error = %e, "submit_task failed");
+        if let Err(e) = self.task_tx.send(agent_msg).await {
+            warn!(msg_id, chat_id, error = %e, "submit message failed");
             return None;
         }
-        debug!(msg_id, chat_id, "task submitted to agent");
+        debug!(msg_id, chat_id, "message submitted to agent");
 
         // Return media work for the select loop to drive concurrently.
         Some(MediaWork {
@@ -610,21 +610,21 @@ impl<'a> Feishu<'a> {
         Ok(filename)
     }
 
-    /// Render a single message: open thinking card → consume events → update card.
-    /// Takes ownership of `msg` so it can live inside FuturesUnordered.
-    async fn render_one(&self, api: &feishu::api::Api, mut msg: Message) {
+    /// Render a single notification: open thinking card → consume events → update card.
+    /// Takes ownership of `notif` so it can live inside FuturesUnordered.
+    async fn render_one(&self, api: &feishu::api::Api, mut notif: Notification) {
         let lang = "zh";
 
         let card_id = match api
-            .reply_message(&msg.msg_id, "interactive", &thinking_card(lang))
+            .reply_message(&notif.msg_id, "interactive", &thinking_card(lang))
             .await
         {
             Ok(id) => {
-                debug!(msg_id = %msg.msg_id, card_id = %id, "thinking card opened");
+                debug!(msg_id = %notif.msg_id, card_id = %id, "thinking card opened");
                 Some(id)
             }
             Err(e) => {
-                warn!(msg_id = %msg.msg_id, error = %e, "failed to open thinking card");
+                warn!(msg_id = %notif.msg_id, error = %e, "failed to open thinking card");
                 None
             }
         };
@@ -633,7 +633,7 @@ impl<'a> Feishu<'a> {
         // (tool_name, display_text) — ordered by first appearance, deduped by name.
         let mut status_lines: Vec<(String, String)> = Vec::new();
 
-        while let Some(event) = msg.events.recv().await {
+        while let Some(event) = notif.events.recv().await {
             match event {
                 Event::ToolStatus { tool, text } => {
                     // Upsert: same tool name updates its line, new tool appends.
@@ -660,18 +660,18 @@ impl<'a> Feishu<'a> {
                     if let Some(cid) = &card_id {
                         match api.update_message(cid, &card_json).await {
                             Ok(()) => {
-                                info!(msg_id = %msg.msg_id, "reply updated on card");
+                                info!(msg_id = %notif.msg_id, "reply updated on card");
                             }
                             Err(e) => {
-                                warn!(msg_id = %msg.msg_id, error = %e, "card update failed, sending new reply");
+                                warn!(msg_id = %notif.msg_id, error = %e, "card update failed, sending new reply");
                                 let content = serde_json::json!({"text": text}).to_string();
-                                let _ = api.reply_message(&msg.msg_id, "text", &content).await;
+                                let _ = api.reply_message(&notif.msg_id, "text", &content).await;
                             }
                         }
                     } else {
                         let content = serde_json::json!({"text": text}).to_string();
-                        if let Err(e) = api.reply_message(&msg.msg_id, "text", &content).await {
-                            warn!(msg_id = %msg.msg_id, error = %e, "reply failed");
+                        if let Err(e) = api.reply_message(&notif.msg_id, "text", &content).await {
+                            warn!(msg_id = %notif.msg_id, error = %e, "reply failed");
                         }
                     }
                 }
@@ -684,7 +684,7 @@ impl<'a> Feishu<'a> {
                 .await;
         }
 
-        debug!(msg_id = %msg.msg_id, "message rendering complete");
+        debug!(msg_id = %notif.msg_id, "notification rendering complete");
     }
 }
 

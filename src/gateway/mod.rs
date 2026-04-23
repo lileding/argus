@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::agent::Task;
+use crate::agent::Message;
 use crate::config::GatewayImConfig;
 use crate::database::{Database, messages::UnrepliedMessage};
 use crate::upstream::Upstream;
@@ -28,7 +28,7 @@ pub(crate) struct Gateway<'a> {
 impl<'a> Gateway<'a> {
     pub(crate) fn new(
         configs: &HashMap<String, GatewayImConfig>,
-        port: mpsc::Sender<Task>,
+        port: mpsc::Sender<Message>,
         upstream_reg: &Upstream,
         db: &'a Database,
         workspace_dir: &Path,
