@@ -214,6 +214,7 @@ impl OpenAiResponsesClient {
         };
 
         Ok(Response {
+            reasoning_content: None,
             content,
             tool_calls,
             finish_reason,
@@ -280,23 +281,6 @@ impl Client for OpenAiResponsesClient {
         max_text_tokens: usize,
         options: &ChatOptions,
     ) -> ClientResult<Response> {
-        // Pre-flight: capture error body on failure (EventSource swallows it).
-        let body = self.build_request(messages, tools, true, options);
-        let preflight = self
-            .auth_request(self.http.post(self.responses_url()))
-            .json(&body)
-            .send()
-            .await?;
-        let status = preflight.status();
-        if !status.is_success() {
-            let error_body = preflight.text().await.unwrap_or_default();
-            tracing::warn!(status = status.as_u16(), body = %error_body, "chat request failed");
-            return Err(ClientError::Api {
-                status: status.as_u16(),
-                message: error_body,
-            });
-        }
-        // Status OK — proceed with SSE on a fresh request.
         let mut stream = self.chat_stream(messages, tools, options).await?;
 
         let mut content = String::new();
@@ -364,6 +348,7 @@ impl Client for OpenAiResponsesClient {
 
         Ok(Response {
             content,
+            reasoning_content: None,
             tool_calls,
             finish_reason,
             usage,
@@ -395,6 +380,7 @@ fn sse_to_stream(mut es: EventSource) -> impl Stream<Item = StreamChunk> {
                                 if !delta.is_empty() {
                                     yield StreamChunk {
                                         delta: delta.to_string(),
+                                        reasoning_delta: String::new(),
                                         tool_call_deltas: vec![],
                                         done: false,
                                         usage: None,
@@ -411,7 +397,7 @@ fn sse_to_stream(mut es: EventSource) -> impl Stream<Item = StreamChunk> {
                                 let id = item.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
                                 let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
                                 yield StreamChunk {
-                                    delta: String::new(),
+                                    delta: String::new(), reasoning_delta: String::new(),
                                     tool_call_deltas: vec![ToolCallDelta {
                                         index: tool_index,
                                         id: Some(id),
@@ -429,7 +415,7 @@ fn sse_to_stream(mut es: EventSource) -> impl Stream<Item = StreamChunk> {
                                 let delta = v.get("delta").and_then(|d| d.as_str()).unwrap_or("");
                                 if !delta.is_empty() {
                                     yield StreamChunk {
-                                        delta: String::new(),
+                                        delta: String::new(), reasoning_delta: String::new(),
                                         tool_call_deltas: vec![ToolCallDelta {
                                             index: tool_index,
                                             id: None,
@@ -459,7 +445,7 @@ fn sse_to_stream(mut es: EventSource) -> impl Stream<Item = StreamChunk> {
                                 None
                             };
                             yield StreamChunk {
-                                delta: String::new(),
+                                delta: String::new(), reasoning_delta: String::new(),
                                 tool_call_deltas: vec![],
                                 done: true,
                                 usage,
@@ -473,7 +459,7 @@ fn sse_to_stream(mut es: EventSource) -> impl Stream<Item = StreamChunk> {
                 Some(Ok(SseEvent::Open)) => {}
                 Some(Err(e)) => {
                     yield StreamChunk {
-                        delta: String::new(),
+                        delta: String::new(), reasoning_delta: String::new(),
                         tool_call_deltas: vec![],
                         done: true,
                         usage: None,
@@ -483,7 +469,7 @@ fn sse_to_stream(mut es: EventSource) -> impl Stream<Item = StreamChunk> {
                 }
                 None => {
                     yield StreamChunk {
-                        delta: String::new(),
+                        delta: String::new(), reasoning_delta: String::new(),
                         tool_call_deltas: vec![],
                         done: true,
                         usage: None,

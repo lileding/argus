@@ -141,6 +141,7 @@ impl OpenAiClient {
 
         Ok(Response {
             content: choice.message.content.clone().unwrap_or_default(),
+            reasoning_content: choice.message.reasoning_content.clone(),
             tool_calls,
             finish_reason,
             usage: Usage {
@@ -207,24 +208,6 @@ impl Client for OpenAiClient {
         max_text_tokens: usize,
         options: &ChatOptions,
     ) -> ClientResult<Response> {
-        // Pre-flight: send request manually to capture error body on failure.
-        // EventSource swallows response bodies on non-2xx status.
-        let body = self.build_request(messages, tools, true, options);
-        let preflight = self
-            .auth_request(self.http.post(self.chat_url()))
-            .json(&body)
-            .send()
-            .await?;
-        let status = preflight.status();
-        if !status.is_success() {
-            let error_body = preflight.text().await.unwrap_or_default();
-            tracing::warn!(status = status.as_u16(), body = %error_body, "chat request failed");
-            return Err(ClientError::Api {
-                status: status.as_u16(),
-                message: error_body,
-            });
-        }
-        // Status is OK — proceed with SSE on a fresh request.
         let mut stream = self.chat_stream(messages, tools, options).await?;
 
         let mut content = String::new();
@@ -235,6 +218,7 @@ impl Client for OpenAiClient {
         // Tool calls arrive incrementally: first delta has id+name, subsequent
         // deltas append to arguments.
         let mut pending_tools: Vec<PendingToolCall> = Vec::new();
+        let mut reasoning = String::new();
 
         while let Some(chunk) = stream.next().await {
             if let Some(err) = &chunk.error {
@@ -242,6 +226,7 @@ impl Client for OpenAiClient {
             }
 
             content.push_str(&chunk.delta);
+            reasoning.push_str(&chunk.reasoning_delta);
 
             // Accumulate tool call deltas.
             for tcd in &chunk.tool_call_deltas {
@@ -272,7 +257,12 @@ impl Client for OpenAiClient {
             }
 
             // Early abort: if text grows too long and no tool calls detected.
-            if pending_tools.is_empty() && content.len() / 4 > max_text_tokens {
+            // Skip when model is thinking (reasoning_delta seen) — it will
+            // produce tool calls after thinking.
+            if pending_tools.is_empty()
+                && reasoning.is_empty()
+                && content.len() / 4 > max_text_tokens
+            {
                 debug!(
                     text_len = content.len(),
                     max_text_tokens, "early abort: text exceeds threshold"
@@ -299,6 +289,11 @@ impl Client for OpenAiClient {
 
         Ok(Response {
             content,
+            reasoning_content: if reasoning.is_empty() {
+                None
+            } else {
+                Some(reasoning)
+            },
             tool_calls,
             finish_reason,
             usage,
@@ -316,7 +311,7 @@ fn sse_to_stream(mut es: EventSource) -> impl Stream<Item = StreamChunk> {
                 Some(Ok(SseEvent::Message(msg))) => {
                     let data = msg.data.trim();
                     if data == "[DONE]" {
-                        yield StreamChunk { delta: String::new(), tool_call_deltas: vec![], done: true, usage: None, error: None };
+                        yield StreamChunk { delta: String::new(), reasoning_delta: String::new(), tool_call_deltas: vec![], done: true, usage: None, error: None };
                         break;
                     }
                     if let Some(chunk) = parse_sse_data(data) {
@@ -326,7 +321,7 @@ fn sse_to_stream(mut es: EventSource) -> impl Stream<Item = StreamChunk> {
                 Some(Ok(SseEvent::Open)) => {}
                 Some(Err(e)) => {
                     yield StreamChunk {
-                        delta: String::new(),
+                        delta: String::new(), reasoning_delta: String::new(),
                         tool_call_deltas: vec![],
                         done: true,
                         usage: None,
@@ -335,7 +330,7 @@ fn sse_to_stream(mut es: EventSource) -> impl Stream<Item = StreamChunk> {
                     break;
                 }
                 None => {
-                    yield StreamChunk { delta: String::new(), tool_call_deltas: vec![], done: true, usage: None, error: None };
+                    yield StreamChunk { delta: String::new(), reasoning_delta: String::new(), tool_call_deltas: vec![], done: true, usage: None, error: None };
                     break;
                 }
             }
@@ -357,6 +352,7 @@ fn parse_sse_data(data: &str) -> Option<StreamChunk> {
         // Usage-only chunk — return it so token counts are captured.
         return usage.map(|u| StreamChunk {
             delta: String::new(),
+            reasoning_delta: String::new(),
             tool_call_deltas: vec![],
             done: false,
             usage: Some(u),
@@ -366,6 +362,7 @@ fn parse_sse_data(data: &str) -> Option<StreamChunk> {
 
     let delta = &choice.delta;
     let text = delta.content.as_deref().unwrap_or("");
+    let reasoning = delta.reasoning_content.as_deref().unwrap_or("");
 
     // Parse tool call deltas.
     let tool_call_deltas = delta
@@ -391,6 +388,7 @@ fn parse_sse_data(data: &str) -> Option<StreamChunk> {
 
     Some(StreamChunk {
         delta: text.to_string(),
+        reasoning_delta: reasoning.to_string(),
         tool_call_deltas,
         done,
         usage,
@@ -436,6 +434,8 @@ struct OaiMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OaiToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -488,6 +488,7 @@ impl From<&Message> for OaiMessage {
                 Role::Tool => "tool".into(),
             },
             content,
+            reasoning_content: msg.reasoning_content.clone(),
             tool_calls,
             tool_call_id: msg.tool_call_id.clone(),
         }
@@ -557,6 +558,8 @@ struct ChatChoiceMessage {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
     tool_calls: Option<Vec<OaiToolCall>>,
 }
 
@@ -596,6 +599,8 @@ struct SseChoice {
 struct SseDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<SseToolCallDelta>>,
 }

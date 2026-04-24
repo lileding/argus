@@ -25,6 +25,10 @@ pub(crate) struct Message {
     /// Plain text content. For multimodal messages, this is the text part.
     #[serde(default)]
     pub(crate) content: String,
+    /// Model's reasoning/thinking content. Must be preserved and passed
+    /// back in multi-turn conversations (DeepSeek, OpenAI o-series).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reasoning_content: Option<String>,
     /// Multimodal content parts (text + images). Empty for text-only messages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) parts: Vec<ContentPart>,
@@ -46,6 +50,7 @@ impl Message {
             content: content.into(),
             parts: vec![],
             tool_calls: vec![],
+            reasoning_content: None,
             tool_call_id: None,
             tool_name: None,
         }
@@ -57,6 +62,7 @@ impl Message {
             content: content.into(),
             parts: vec![],
             tool_calls: vec![],
+            reasoning_content: None,
             tool_call_id: None,
             tool_name: None,
         }
@@ -72,6 +78,7 @@ impl Message {
             content: text,
             parts,
             tool_calls: vec![],
+            reasoning_content: None,
             tool_call_id: None,
             tool_name: None,
         }
@@ -83,6 +90,7 @@ impl Message {
             content: content.into(),
             parts: vec![],
             tool_calls: vec![],
+            reasoning_content: None,
             tool_call_id: None,
             tool_name: None,
         }
@@ -97,6 +105,7 @@ impl Message {
         Self {
             role: Role::Tool,
             content: content.into(),
+            reasoning_content: None,
             parts: vec![],
             tool_calls: vec![],
             tool_call_id: Some(call_id.into()),
@@ -145,11 +154,11 @@ pub(crate) struct ToolCall {
 #[derive(Debug, Clone)]
 pub(crate) struct Response {
     pub(crate) content: String,
-    #[allow(dead_code)] // Read when tool system dispatches tool calls.
+    /// Model's reasoning/thinking content (DeepSeek, OpenAI o-series).
+    /// Must be passed back in subsequent requests for multi-turn.
+    pub(crate) reasoning_content: Option<String>,
     pub(crate) tool_calls: Vec<ToolCall>,
-    #[allow(dead_code)]
     pub(crate) finish_reason: FinishReason,
-    #[allow(dead_code)]
     pub(crate) usage: Usage,
 }
 
@@ -192,10 +201,10 @@ pub(crate) struct ToolCallDelta {
 #[derive(Debug, Clone)]
 pub(crate) struct StreamChunk {
     pub(crate) delta: String,
-    #[allow(dead_code)]
+    /// Reasoning/thinking content delta (DeepSeek, OpenAI o-series).
+    pub(crate) reasoning_delta: String,
     pub(crate) tool_call_deltas: Vec<ToolCallDelta>,
     pub(crate) done: bool,
-    #[allow(dead_code)]
     pub(crate) usage: Option<Usage>,
     pub(crate) error: Option<String>,
 }

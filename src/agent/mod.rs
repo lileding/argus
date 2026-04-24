@@ -562,8 +562,9 @@ impl<'a, E: EmbedService> Agent<'a, E> {
                 break;
             }
 
-            // Append assistant message with tool calls.
+            // Append assistant message with tool calls and reasoning.
             let mut asst = model::Message::assistant(&resp.content);
+            asst.reasoning_content = resp.reasoning_content.clone();
             asst.tool_calls = resp.tool_calls.clone();
             messages.push(asst);
 

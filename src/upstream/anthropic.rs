@@ -108,14 +108,21 @@ impl AnthropicClient {
                     }
                 }
                 Role::Assistant => {
-                    if msg.tool_calls.is_empty() {
+                    let has_thinking = msg.reasoning_content.is_some();
+                    if msg.tool_calls.is_empty() && !has_thinking {
                         api_messages.push(ApiMessage {
                             role: "assistant".into(),
                             content: serde_json::json!(msg.content),
                         });
                     } else {
-                        // Assistant with tool calls → content blocks.
+                        // Use content blocks when there are tool calls or thinking.
                         let mut blocks: Vec<serde_json::Value> = Vec::new();
+                        if let Some(thinking) = &msg.reasoning_content {
+                            blocks.push(serde_json::json!({
+                                "type": "thinking",
+                                "thinking": thinking
+                            }));
+                        }
                         if !msg.content.is_empty() {
                             blocks.push(serde_json::json!({"type": "text", "text": msg.content}));
                         }
@@ -194,10 +201,16 @@ impl AnthropicClient {
         }
 
         let mut content = String::new();
+        let mut reasoning_content: Option<String> = None;
         let mut tool_calls = Vec::new();
 
         for block in &resp.content {
             match block.block_type.as_str() {
+                "thinking" => {
+                    if let Some(thinking) = &block.thinking {
+                        reasoning_content = Some(thinking.clone());
+                    }
+                }
                 "text" => {
                     if let Some(text) = &block.text {
                         content.push_str(text);
@@ -228,6 +241,7 @@ impl AnthropicClient {
 
         Ok(Response {
             content,
+            reasoning_content,
             tool_calls,
             finish_reason,
             usage: Usage {
@@ -299,6 +313,7 @@ impl Client for AnthropicClient {
         let mut usage = Usage::default();
         let mut pending_tools: Vec<PendingToolCall> = Vec::new();
         let mut current_tool_active = false;
+        let mut has_reasoning = false;
 
         while let Some(chunk) = stream.next().await {
             if let Some(err) = &chunk.error {
@@ -306,6 +321,9 @@ impl Client for AnthropicClient {
             }
 
             content.push_str(&chunk.delta);
+            if !chunk.reasoning_delta.is_empty() {
+                has_reasoning = true;
+            }
 
             // Accumulate tool call deltas.
             for tcd in &chunk.tool_call_deltas {
@@ -336,8 +354,10 @@ impl Client for AnthropicClient {
             }
 
             // Early abort: text too long, no tool calls active or pending.
+            // Skip when model is thinking — it will produce tool calls after.
             if pending_tools.is_empty()
                 && !current_tool_active
+                && !has_reasoning
                 && content.len() / 4 > max_text_tokens
             {
                 debug!(
@@ -346,6 +366,7 @@ impl Client for AnthropicClient {
                 );
                 return Ok(Response {
                     content,
+                    reasoning_content: None,
                     tool_calls: vec![],
                     finish_reason: FinishReason::EarlyAbort,
                     usage,
@@ -371,6 +392,7 @@ impl Client for AnthropicClient {
 
         Ok(Response {
             content,
+            reasoning_content: None, // streaming doesn't accumulate thinking
             tool_calls,
             finish_reason,
             usage,
@@ -398,7 +420,7 @@ fn sse_to_stream(mut es: EventSource) -> impl Stream<Item = StreamChunk> {
                             // Extract prompt token count.
                             if let Some(message) = &event.message {
                                 yield StreamChunk {
-                                    delta: String::new(),
+                                    delta: String::new(), reasoning_delta: String::new(),
                                     tool_call_deltas: vec![],
                                     done: false,
                                     usage: Some(Usage {
@@ -419,7 +441,7 @@ fn sse_to_stream(mut es: EventSource) -> impl Stream<Item = StreamChunk> {
                                 && cb.block_type == "tool_use"
                             {
                                 yield StreamChunk {
-                                    delta: String::new(),
+                                    delta: String::new(), reasoning_delta: String::new(),
                                     tool_call_deltas: vec![ToolCallDelta {
                                         index: tool_index,
                                         id: Some(cb.id.clone().unwrap_or_default()),
@@ -438,6 +460,7 @@ fn sse_to_stream(mut es: EventSource) -> impl Stream<Item = StreamChunk> {
                                     "text_delta" => {
                                         yield StreamChunk {
                                             delta: delta.text.clone().unwrap_or_default(),
+                                            reasoning_delta: String::new(),
                                             tool_call_deltas: vec![],
                                             done: false,
                                             usage: None,
@@ -446,7 +469,7 @@ fn sse_to_stream(mut es: EventSource) -> impl Stream<Item = StreamChunk> {
                                     }
                                     "input_json_delta" => {
                                         yield StreamChunk {
-                                            delta: String::new(),
+                                            delta: String::new(), reasoning_delta: String::new(),
                                             tool_call_deltas: vec![ToolCallDelta {
                                                 index: tool_index,
                                                 id: None,
@@ -474,7 +497,7 @@ fn sse_to_stream(mut es: EventSource) -> impl Stream<Item = StreamChunk> {
                                 total_tokens: u.output_tokens,
                             });
                             yield StreamChunk {
-                                delta: String::new(),
+                                delta: String::new(), reasoning_delta: String::new(),
                                 tool_call_deltas: vec![],
                                 done: false,
                                 usage,
@@ -483,7 +506,7 @@ fn sse_to_stream(mut es: EventSource) -> impl Stream<Item = StreamChunk> {
                         }
                         "message_stop" => {
                             yield StreamChunk {
-                                delta: String::new(),
+                                delta: String::new(), reasoning_delta: String::new(),
                                 tool_call_deltas: vec![],
                                 done: true,
                                 usage: None,
@@ -497,7 +520,7 @@ fn sse_to_stream(mut es: EventSource) -> impl Stream<Item = StreamChunk> {
                 Some(Ok(SseEvent::Open)) => {}
                 Some(Err(e)) => {
                     yield StreamChunk {
-                        delta: String::new(),
+                        delta: String::new(), reasoning_delta: String::new(),
                         tool_call_deltas: vec![],
                         done: true,
                         usage: None,
@@ -507,7 +530,7 @@ fn sse_to_stream(mut es: EventSource) -> impl Stream<Item = StreamChunk> {
                 }
                 None => {
                     yield StreamChunk {
-                        delta: String::new(),
+                        delta: String::new(), reasoning_delta: String::new(),
                         tool_call_deltas: vec![],
                         done: true,
                         usage: None,
@@ -574,6 +597,8 @@ struct ContentBlock {
     block_type: String,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    thinking: Option<String>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
