@@ -5,7 +5,7 @@ use tracing::debug;
 
 /// Domain-specific vocabulary hints for Whisper.
 const TRANSCRIPTION_PROMPT: &str = "API, Kubernetes, Docker, GPU, LLM, transformer, embedding, \
-MLX, vLLM, omlx, ETF, hedge fund, quantitative, 莫扎特, 贝多芬, 巴赫, 肖邦, \
+ETF, hedge fund, quantitative, 莫扎特, 贝多芬, 巴赫, 肖邦, \
 sonata, concerto, fugue, symphony, étude, nocturne, prelude";
 
 #[derive(Debug, thiserror::Error)]

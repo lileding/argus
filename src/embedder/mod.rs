@@ -59,7 +59,12 @@ impl<'a> Embedder<'a> {
             ))
         })?;
         let base_url = up_cfg.effective_base_url();
-        let client = EmbeddingClient::new(base_url, &up_cfg.api_key, &config.model_name);
+        let client = EmbeddingClient::new(
+            base_url,
+            &up_cfg.api_key,
+            &config.model_name,
+            config.dimensions,
+        );
         let summarizer = upstream_reg.client_for(&config.summarizer)?;
 
         info!(

@@ -3,6 +3,19 @@
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+/// Max characters per input. OpenAI text-embedding-3-* has an 8192 token limit;
+/// for Chinese text ~2-3 tokens/char, so 2500 chars is a safe ceiling (~7500 tokens).
+const MAX_EMBED_CHARS: usize = 2500;
+
+/// Truncate a string to max chars, respecting UTF-8 boundaries.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        s.chars().take(max_chars).collect()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(super) enum EmbedClientError {
     #[error("http: {0}")]
@@ -23,6 +36,8 @@ pub(super) struct EmbeddingClient {
     url: String,
     api_key: String,
     model: String,
+    /// Optional output dimension (for OpenAI text-embedding-3-{small,large}).
+    dimensions: Option<usize>,
 }
 
 impl EmbeddingClient {
@@ -30,12 +45,18 @@ impl EmbeddingClient {
         &self.model
     }
 
-    pub(super) fn new(base_url: &str, api_key: &str, model: &str) -> Self {
+    pub(super) fn new(
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+        dimensions: Option<usize>,
+    ) -> Self {
         Self {
             http: reqwest::Client::new(),
             url: format!("{}/embeddings", base_url.trim_end_matches('/')),
             api_key: api_key.to_string(),
             model: model.to_string(),
+            dimensions,
         }
     }
 
@@ -48,10 +69,17 @@ impl EmbeddingClient {
     }
 
     /// Embed a batch of text strings. Returns vectors in the same order.
+    /// Inputs are truncated to MAX_EMBED_CHARS to stay within token limits.
     pub(super) async fn embed_batch(&self, texts: &[&str]) -> EmbedResult<Vec<Vec<f32>>> {
+        let truncated: Vec<String> = texts
+            .iter()
+            .map(|t| truncate_chars(t, MAX_EMBED_CHARS))
+            .collect();
+        let truncated_refs: Vec<&str> = truncated.iter().map(|s| s.as_str()).collect();
         let body = EmbedRequest {
             model: &self.model,
-            input: texts,
+            input: &truncated_refs,
+            dimensions: self.dimensions,
         };
 
         let mut req = self.http.post(&self.url).json(&body);
@@ -88,6 +116,8 @@ impl EmbeddingClient {
 struct EmbedRequest<'a> {
     model: &'a str,
     input: &'a [&'a str],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<usize>,
 }
 
 #[derive(Deserialize)]

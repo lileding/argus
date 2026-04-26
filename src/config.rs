@@ -48,6 +48,11 @@ pub(crate) struct EmbedderConfig {
     pub(crate) upstream: String,
     #[serde(default = "default_embedding_model")]
     pub(crate) model_name: String,
+    /// Output dimension. For OpenAI text-embedding-3-{small,large}, set to
+    /// match DB schema (768). Local models that produce a fixed dimension
+    /// can leave this unset.
+    #[serde(default)]
+    pub(crate) dimensions: Option<usize>,
     #[serde(default = "default_batch_size")]
     pub(crate) batch_size: usize,
     #[serde(default = "default_interval_secs")]
@@ -65,6 +70,7 @@ impl Default for EmbedderConfig {
         Self {
             upstream: String::new(),
             model_name: default_embedding_model(),
+            dimensions: None,
             batch_size: default_batch_size(),
             interval_secs: default_interval_secs(),
             summary_interval_ticks: default_summary_interval_ticks(),
