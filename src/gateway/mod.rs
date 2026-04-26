@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::agent::Message;
+use crate::agent::{Message, Notification};
 use crate::config::GatewayImConfig;
 use crate::database::{Database, messages::UnrepliedMessage};
 use crate::upstream::Upstream;
@@ -16,6 +16,9 @@ use crate::upstream::Upstream;
 #[async_trait::async_trait]
 trait Im: Send + Sync {
     async fn run(&self, cancel: &CancellationToken);
+    /// The IM's inbound notification channel (Agent → Gateway).
+    /// Used by Scheduler to inject cron-triggered notifications.
+    fn outbound_port(&self) -> mpsc::Sender<Notification>;
 }
 
 /// Gateway manages all IM adapters.
@@ -106,6 +109,20 @@ impl<'a> Gateway<'a> {
         } else {
             warn!(im = im_name, "no IM adapter for recovery");
         }
+    }
+
+    /// Look up the outbound port for the given channel by IM prefix.
+    /// Used by Scheduler to send cron-triggered notifications.
+    pub(crate) fn outbound_port(&self, channel: &str) -> Option<mpsc::Sender<Notification>> {
+        let im_name = if channel.starts_with("feishu:") {
+            "feishu"
+        } else {
+            return None;
+        };
+        self.ims
+            .iter()
+            .find(|(name, _)| name == im_name)
+            .map(|(_, im)| im.outbound_port())
     }
 
     pub(crate) async fn run(&self, cancel: &CancellationToken) {

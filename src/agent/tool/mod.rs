@@ -1,10 +1,13 @@
+mod cancel_cron;
 mod cli;
+mod create_cron;
 mod create_task;
 mod current_time;
 mod db;
 mod fetch;
 mod finish_task;
 mod forget;
+mod list_crons;
 mod list_docs;
 mod read_file;
 mod remember;
@@ -12,6 +15,7 @@ mod search;
 mod search_docs;
 mod search_history;
 mod skill;
+mod update_cron;
 mod write_file;
 
 use std::path::Path;
@@ -116,12 +120,20 @@ pub(super) fn build_registry<'a, E: EmbedService>(
         Box::new(search_history::SearchHistory::new(db, embed_service)),
         Box::new(db::Db::new(db)),
         Box::new(skill::ActivateSkill::new(skill_index)),
+        // Cron management is always available so cron-triggered tasks can
+        // self-cancel (one-shot reminder pattern) or modify themselves.
+        Box::new(list_crons::ListCrons::new(db)),
+        Box::new(cancel_cron::CancelCron::new(db)),
+        Box::new(update_cron::UpdateCron::new(db)),
     ];
     if include_create_task {
+        // Creation tools only in user-facing sync path — prevents recursive
+        // task/cron creation from inside async tasks or cron firings.
         tools.push(Box::new(create_task::CreateTask::new(
             task_tx,
             next_task_id,
         )));
+        tools.push(Box::new(create_cron::CreateCron::new(db)));
     }
 
     ToolRegistry { tools }

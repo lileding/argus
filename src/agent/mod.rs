@@ -68,13 +68,22 @@ pub(crate) enum Event {
     Reply { text: String },
 }
 
-/// Specification for an async background task, created by the `create_task` tool.
+/// Specification for an async background task.
 pub(crate) struct TaskSpec {
     pub(crate) id: u32,
     pub(crate) goal: String,
     pub(crate) channel: String,
     pub(crate) msg_id: String,
     pub(crate) port: mpsc::Sender<Notification>,
+    pub(crate) source: TaskSource,
+}
+
+/// Where a TaskSpec originated. Affects the completion notification header.
+pub(crate) enum TaskSource {
+    /// Created by the orchestrator via the create_task tool.
+    User,
+    /// Triggered by a cron schedule.
+    Cron { cron_id: i64 },
 }
 
 /// Async task budgets: 3× sync defaults.
@@ -107,7 +116,8 @@ RULES:
 - For opinions or reviews, search from 2-3 different angles for comprehensive coverage.
 - Do NOT answer from training knowledge alone — use tools to verify real-time facts.
 - Do NOT call the same tool with the same arguments twice.
-- For requests that need deep research, comprehensive reports, multi-step analysis, or code generation — call create_task instead of doing it yourself. create_task runs a background worker with 3× your tool budget. Use it when the user explicitly asks for a thorough/detailed report, or when the work clearly exceeds a quick answer."#;
+- For requests that need deep research, comprehensive reports, multi-step analysis, or code generation — call create_task instead of doing it yourself. create_task runs a background worker with 3× your tool budget. Use it when the user explicitly asks for a thorough/detailed report, or when the work clearly exceeds a quick answer.
+- For recurring/periodic requests ("every day at...", "remind me when...", "每天下午...") — call create_cron with a 6-field cron expression and a self-contained execution prompt. Use list_crons to show existing schedules, cancel_cron to stop one, update_cron to modify. Cron firings reuse the original message thread for replies."#;
 
 /// Orchestrator prompt for async background tasks — no create_task, no delegation.
 /// The finish_task summary is delivered directly to the user as the final output.
@@ -166,7 +176,8 @@ pub(crate) struct Agent<'a, E: EmbedService> {
     /// Async task submission channel (create_task tool → async_task_loop).
     task_tx: mpsc::Sender<TaskSpec>,
     task_rx: Mutex<mpsc::Receiver<TaskSpec>>,
-    next_task_id: AtomicU32,
+    /// Shared task ID counter (also used by Scheduler).
+    next_task_id: &'a AtomicU32,
     db: &'a Database,
     orchestrator: Box<dyn upstream::Client>,
     synthesizer: Box<dyn upstream::Client>,
@@ -188,6 +199,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
         db: &'a Database,
         embed_service: &'a E,
         workspace_dir: &'a Path,
+        next_task_id: &'a AtomicU32,
     ) -> Result<Self, upstream::types::ClientError> {
         let orchestrator = upstream_reg.client_for(&config.orchestrator)?;
         let synthesizer = upstream_reg.client_for(&config.synthesizer)?;
@@ -207,7 +219,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             rx: Mutex::new(rx),
             task_tx,
             task_rx: Mutex::new(task_rx),
-            next_task_id: AtomicU32::new(1),
+            next_task_id,
             db,
             orchestrator,
             synthesizer,
@@ -470,7 +482,7 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             &self.tavily_api_key,
             &self.skill_index,
             &self.task_tx,
-            &self.next_task_id,
+            self.next_task_id,
             include_create_task,
         );
 
@@ -797,8 +809,16 @@ impl<'a, E: EmbedService> Agent<'a, E> {
         let start = Instant::now();
 
         // Async tasks use a dedicated prompt — no delegation, no create_task.
+        // Append skill catalog so the worker can activate skills (e.g. food-tracker
+        // for schema lookup) instead of guessing table/column names.
+        let catalog = self.skill_index.catalog();
+        let task_prompt = if catalog.is_empty() {
+            TASK_ORCHESTRATOR_PROMPT.to_string()
+        } else {
+            format!("{TASK_ORCHESTRATOR_PROMPT}\n\n{catalog}")
+        };
         let mut messages = vec![
-            model::Message::system(TASK_ORCHESTRATOR_PROMPT),
+            model::Message::system(&task_prompt),
             model::Message::user(&spec.goal),
         ];
 
@@ -832,7 +852,12 @@ impl<'a, E: EmbedService> Agent<'a, E> {
             "async task completed"
         );
 
-        let header = format!("**[Task #{task_id} completed]**\n\n");
+        let header = match &spec.source {
+            TaskSource::User => format!("**[Task #{task_id} completed]**\n\n"),
+            TaskSource::Cron { cron_id } => {
+                format!("**[Task #{task_id} · Cron #{cron_id}]**\n\n")
+            }
+        };
         let full_reply = format!("{header}{summary}");
 
         // Send completion notification to Gateway (persistence handled by Gateway).
@@ -850,6 +875,11 @@ impl<'a, E: EmbedService> Agent<'a, E> {
     /// Clone the message submission channel for use by IM adapters.
     pub(crate) fn port(&self) -> mpsc::Sender<Message> {
         self.tx.clone()
+    }
+
+    /// Clone the async task submission channel for use by Scheduler.
+    pub(crate) fn task_port(&self) -> mpsc::Sender<TaskSpec> {
+        self.task_tx.clone()
     }
 }
 

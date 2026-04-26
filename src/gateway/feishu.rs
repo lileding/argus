@@ -718,6 +718,10 @@ impl super::Im for Feishu<'_> {
     async fn run(&self, cancel: &CancellationToken) {
         Feishu::run(self, cancel).await;
     }
+
+    fn outbound_port(&self) -> mpsc::Sender<Notification> {
+        self.tx.clone()
+    }
 }
 
 // --- Feishu card builders ---

@@ -4,7 +4,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use super::{Tool, ToolContext};
-use crate::agent::TaskSpec;
+use crate::agent::{TaskSource, TaskSpec};
 
 pub(super) struct CreateTask<'a> {
     task_tx: &'a mpsc::Sender<TaskSpec>,
@@ -63,6 +63,7 @@ impl Tool for CreateTask<'_> {
             channel: ctx.channel.to_string(),
             msg_id: ctx.msg_id.to_string(),
             port: ctx.port.clone(),
+            source: TaskSource::User,
         };
 
         if let Err(e) = self.task_tx.send(spec).await {

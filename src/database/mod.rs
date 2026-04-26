@@ -1,4 +1,5 @@
 mod conversation;
+pub(crate) mod crons;
 mod documents;
 mod memories;
 pub(crate) mod messages;
@@ -35,6 +36,7 @@ pub(crate) struct Database {
     pub(crate) documents: documents::Documents,
     pub(crate) memories: memories::Memories,
     pub(crate) traces: traces::Traces,
+    pub(crate) crons: crons::Crons,
 }
 
 impl Database {
@@ -67,7 +69,8 @@ impl Database {
             conversation: conversation::Conversation::new(pool.clone()),
             documents: documents::Documents::new(pool.clone()),
             memories: memories::Memories::new(pool.clone()),
-            traces: traces::Traces::new(pool),
+            traces: traces::Traces::new(pool.clone()),
+            crons: crons::Crons::new(pool),
         })
     }
 }
@@ -146,5 +149,9 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "007_conversation_view.sql",
         include_str!("../../migrations/007_conversation_view.sql"),
+    ),
+    (
+        "008_crons.sql",
+        include_str!("../../migrations/008_crons.sql"),
     ),
 ];

@@ -1,3 +1,5 @@
+use std::sync::atomic::AtomicU32;
+
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -8,6 +10,7 @@ use crate::database::Database;
 use crate::embedder::Embedder;
 use crate::gateway::Gateway;
 use crate::recovery::Recovery;
+use crate::scheduler::Scheduler;
 use crate::upstream::Upstream;
 
 mod agent;
@@ -17,6 +20,7 @@ mod embedder;
 mod gateway;
 mod recovery;
 mod render;
+mod scheduler;
 mod upstream;
 
 #[derive(Debug, thiserror::Error)]
@@ -64,12 +68,14 @@ async fn main() -> Result<(), AppError> {
     let db = Database::connect(&config.database).await?;
     let upstream = Upstream::new(&config.upstream);
     let embedder = Embedder::new(&config.embedder, &upstream, &db)?;
+    let next_task_id = AtomicU32::new(1);
     let agent = Agent::new(
         &config.agent,
         &upstream,
         &db,
         &embedder,
         &config.workspace_dir,
+        &next_task_id,
     )?;
     let gateway = Gateway::new(
         &config.gateway,
@@ -79,6 +85,7 @@ async fn main() -> Result<(), AppError> {
         &config.workspace_dir,
     );
     let recovery = Recovery::new(&db, &gateway);
+    let scheduler = Scheduler::new(&db, agent.task_port(), &gateway, &next_task_id);
 
     let cancel = CancellationToken::new();
 
@@ -87,6 +94,7 @@ async fn main() -> Result<(), AppError> {
         agent.run(&cancel),
         embedder.run(&cancel),
         recovery.run(&cancel),
+        scheduler.run(&cancel),
         shutdown_signal(&cancel),
     );
 

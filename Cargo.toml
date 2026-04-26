@@ -34,6 +34,7 @@ ratex-layout = { git = "https://github.com/erweixin/RaTeX" }
 ratex-render = { git = "https://github.com/erweixin/RaTeX", features = ["embed-fonts"] }
 ratex-types = { git = "https://github.com/erweixin/RaTeX" }
 regex = "1"
+cron = "0.12"
 
 [dev-dependencies]
 tempfile = "3"
