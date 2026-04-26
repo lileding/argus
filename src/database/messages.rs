@@ -97,11 +97,16 @@ impl Messages {
     /// Find messages that were never replied to (for crash recovery).
     /// Only looks at recent messages (last 24h) to avoid replaying ancient history.
     pub(crate) async fn unreplied(&self) -> super::DbResult<Vec<UnrepliedMessage>> {
+        // Only consider messages older than 5 minutes — this avoids racing
+        // with active processing (orchestrator + synthesizer + card delivery
+        // typically completes well within 5 minutes; reply_id is set by
+        // Gateway only after successful card delivery).
         let rows = sqlx::query(
             "SELECT id, channel, trigger_msg_id, msg_type, content, ready \
              FROM messages \
              WHERE reply_id IS NULL \
                AND trigger_msg_id IS NOT NULL \
+               AND created_at < NOW() - INTERVAL '5 minutes' \
                AND created_at > NOW() - INTERVAL '24 hours' \
              ORDER BY created_at \
              LIMIT 10",
