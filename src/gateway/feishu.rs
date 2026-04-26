@@ -461,8 +461,11 @@ impl<'a> Feishu<'a> {
         // Transcribe if client is configured.
         let transcript = if let Some(tc) = &self.transcriber {
             let abs_path = self.workspace_dir.join(MEDIA_DIR).join(&filename);
+            // Feishu voice files are OGG-wrapped Opus saved with .opus extension.
+            // Rename to .ogg for upstream Whisper APIs that don't recognize .opus.
+            let api_filename = filename.replace(".opus", ".ogg");
             match tokio::fs::read(&abs_path).await {
-                Ok(bytes) => match tc.transcribe(&bytes, &filename).await {
+                Ok(bytes) => match tc.transcribe(&bytes, &api_filename).await {
                     Ok(result) => {
                         info!(msg_id, confidence = result.confidence, "audio transcribed");
                         result.text
