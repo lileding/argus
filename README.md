@@ -1,111 +1,156 @@
 # Argus
 
-A personal AI assistant that runs as a server, connects to Feishu (Lark), and orchestrates multiple AI models to handle conversations, search the web, manage structured data, transcribe audio, and understand images.
+A personal AI assistant. Runs as a single binary, connects to Feishu (Lark) over WebSocket, orchestrates LLMs to handle conversation, web search, structured data, audio, images, document RAG, and scheduled tasks.
 
-## Architecture
+> One assistant, one memory, one timeline. Not a chatbot.
 
-**Two-phase agent**: an Orchestrator (tool calling) collects information, then a Synthesizer (answer generation) composes the response. Each phase can use a different model from a different provider.
+See [DESIGN.md](DESIGN.md) for the architecture.
+See [ROADMAP.md](ROADMAP.md) for what's next.
 
-**Multi-backend**: supports OpenAI, Anthropic, and Google Gemini APIs. Each agent role (orchestrator, synthesizer, transcription) independently selects its provider and model via config.
+## Highlights
 
-**Structured data**: a single `db` tool with CLI-style commands (`query`, `insert`, `count`, etc.) replaces raw SQL. The model never writes SQL — the tool generates parameterized queries internally.
+- **Two-phase agent** — Orchestrator (tool calling) → Synthesizer (answer composition). Each phase can use a different model from a different provider.
+- **Multi-backend** — OpenAI Chat Completions, OpenAI Responses (GPT-5+ reasoning + tools), Anthropic (extended thinking), Gemini, DeepSeek. All via `reqwest`, no SDKs.
+- **Async tasks** — long-running research jobs run in the background while the Agent keeps processing new messages.
+- **Cron** — persistent scheduled tasks. User says "每天九点告诉我天气", model creates a cron with a self-contained execution prompt.
+- **Document RAG** — uploaded files (PDF/DOCX/text) are chunked, embedded, and queryable via `search_docs`.
+- **Vision** — images sent in Feishu are base64-encoded and passed to vision-capable models.
+- **Audio** — Feishu voice messages are transcribed via OpenAI Whisper.
+- **Memory** — sliding window + pgvector semantic recall + pinned memories + long-reply summaries.
+- **Skills** — SKILL.md files (same format as Claude Code) define domain-specific behaviors. Loaded once at startup; activated on demand.
+- **Tracing** — every request recorded with full tool calls, normalized arguments, timings, model names.
+- **No `Arc`, no `tokio::spawn`** — five peer services run concurrently via `tokio::join!`, sharing references.
 
-**Full tracing**: every request is recorded with tool calls, arguments, results, timing, and model names. Designed as the foundation for future skill induction.
+## Architecture (one screen)
 
-See [DESIGN.md](DESIGN.md) for the complete architecture documentation.
+Five peer services driven by `tokio::join!`:
+
+| Service | Role |
+|---|---|
+| **Gateway** | IM adapters (Feishu); WS inbound, media, card rendering |
+| **Agent** | `sync_message_loop` (sequential) + `async_task_loop` (parallel) via `join!` |
+| **Embedder** | Background: embeds rows, summarizes long replies, ingests docs |
+| **Recovery** | Replays unreplied messages on restart and every 5 min |
+| **Scheduler** | Scans `crons` every 60s, fires due jobs into the Agent |
+
+Strict three-layer import direction: **Gateway → Agent → Upstream**.
 
 ## Quick Start
 
 ```bash
-# Prerequisites: Go 1.26+, PostgreSQL with pgvector, Rust toolchain (for LaTeX rendering)
+# Prereqs: Rust toolchain (edition 2024), PostgreSQL with pgvector, Docker (for the DB)
 
-# Clone and build
 git clone https://github.com/lileding/argus.git
 cd argus
-make build
 
-# Set up PostgreSQL
-make up  # starts PostgreSQL via docker-compose
+# Start PostgreSQL + pgvector
+docker compose up -d
 
 # Configure
-cp config.example.yaml ~/.argus/config.yaml
-# Edit ~/.argus/config.yaml — set your API keys and Feishu credentials
+cp config.example.toml ~/.config/argus/argus.toml
+# Edit: set Feishu app_id/app_secret, pick upstreams + API keys
 
 # Run
-./bin/argus
+make run
 ```
 
 ## Configuration
 
-Argus uses named **upstreams** (model providers) and per-role model selection:
+TOML config (default `~/.config/argus/argus.toml`, override with `--config`).
 
-```yaml
-upstreams:
-  openai:
-    type: openai
-    base_url: "https://api.openai.com/v1"
-    api_key: "sk-..."
-  anthropic:
-    type: anthropic
-    api_key: "sk-ant-..."
-  gemini:
-    type: gemini
-    api_key: "AIza..."
-  local:
-    type: openai
-    base_url: "http://localhost:8000/v1"
-    api_key: "omlx"
+Named **upstreams** + per-role model selection:
 
-model:
-  orchestrator:
-    upstream: openai
-    model_name: "gpt-5.4"
-    max_tokens: 4096
-  synthesizer:
-    upstream: gemini
-    model_name: "gemini-2.5-flash-lite"
-    max_tokens: 32768
-  transcription:
-    upstream: local
-    model_name: "whisper-large-v3"
+```toml
+workspace_dir = "~/.local/share/argus"
+
+[gateway.feishu]
+app_id     = "cli_..."
+app_secret = "..."
+
+[gateway.feishu.transcription]
+upstream   = "openai"
+model_name = "whisper-1"
+
+[upstream.openai-r]                # GPT-5+ with reasoning + tools
+type    = "openai-response"
+api_key = "sk-..."
+
+[upstream.gemini]
+type    = "gemini"
+api_key = "AIza..."
+
+[upstream.deepseek]                # OpenAI-compatible API
+type     = "openai"
+base_url = "https://api.deepseek.com/"
+api_key  = "sk-..."
+
+[agent.orchestrator]
+upstream   = "openai-r"
+model_name = "gpt-5.5"
+max_tokens = 32768
+
+[agent.synthesizer]
+upstream   = "gemini"
+model_name = "gemini-2.5-flash-lite"
+max_tokens = 32768
+
+[embedder]
+upstream   = "openai"
+model_name = "text-embedding-3-small"
+dimensions = 768                   # truncate to match DB schema vector(768)
+
+[embedder.summarizer]
+upstream   = "gemini"
+model_name = "gemini-2.5-flash-lite"
+
+[database]
+dsn = "postgres://argus:argus@localhost:5432/argus?sslmode=disable"
 ```
 
-See [config.example.yaml](config.example.yaml) for all options.
+See [config.example.toml](config.example.toml).
 
-## Features
+### Upstream types
 
-- **Feishu integration**: text, image, audio, rich text, and file messages
-- **Vision**: images sent via Feishu are passed to vision-capable models (GPT-5.4, Gemini, Claude)
-- **Audio**: Whisper transcription with confidence-based LLM correction
-- **Web search**: Tavily (LLM-optimized) with DuckDuckGo fallback
-- **Structured data**: CLI+JSON `db` tool (query, insert, update, count, create, describe, list)
-- **Skills**: SKILL.md files define domain-specific behaviors (e.g. food tracking)
-- **Memory**: sliding window + semantic recall (pgvector) + pinned memories
-- **LaTeX**: display math rendered to PNG via embedded RaTeX (Rust/CGo)
-- **Streaming**: SSE token streaming with Feishu card updates
-- **Tracing**: full request traces with tool calls, timing, and normalized args
+| Type | Endpoint | Use |
+|---|---|---|
+| `openai` | `/v1/chat/completions` | OpenAI Chat Completions, DeepSeek, Groq, local servers |
+| `openai-response` | `/v1/responses` | GPT-5+ with reasoning + tools (Chat Completions rejects this combo) |
+| `anthropic` | `/v1/messages` | Native Anthropic API; supports extended thinking |
+| `gemini` | OpenAI-compatible Gemini endpoint | Reuses the OpenAI client |
+
+### Recommended setups
+
+| Orchestrator | Synthesizer | ~Cost/mo | Notes |
+|---|---|---|---|
+| GPT-5.5 (`openai-response`) | Gemini 2.5 Flash Lite | $15 | Best instruction following |
+| Claude Sonnet 4.6 | Gemini 2.5 Flash Lite | $10 | Strong reasoning, native thinking |
+| DeepSeek-V4-Pro | DeepSeek-V4-Flash | $2 | Best value |
 
 ## Tools
 
 | Tool | Purpose |
-|------|---------|
-| `search` | Web search (Tavily / DuckDuckGo) |
-| `fetch` | Fetch URL content as readable text |
-| `db` | Structured data (query/insert/update/count/create/describe/list) |
-| `read_file` | Read workspace files |
-| `write_file` | Write to `.users/` directory |
-| `cli` | Execute shell commands via sandbox |
-| `activate_skill` | Load skill instructions on demand |
-| `remember` / `forget` | Manage pinned memories |
-| `current_time` | Current date/time |
-| `finish_task` | Signal orchestrator → synthesizer transition |
+|---|---|
+| `finish_task` | Sentinel — orchestrator → synthesizer transition |
+| `current_time` | Date/time with timezone |
+| `search` | Web search (Tavily, DuckDuckGo fallback) |
+| `fetch` | URL → readable text |
+| `read_file` / `write_file` | File I/O (write restricted to `.users/`) |
+| `cli` | Shell commands on host |
+| `db` | Structured data (CLI+JSON, 7 verbs, no raw SQL) |
+| `remember` / `forget` | Pinned memories |
+| `search_docs` / `list_docs` | Document RAG |
+| `search_history` | Conversation history search |
+| `activate_skill` | Load a skill's full instructions on demand |
+| `create_task` | Spawn an async background task |
+| `create_cron` / `list_crons` / `cancel_cron` / `update_cron` | Scheduled tasks |
 
 ## Development
 
 ```bash
-make build      # build binary (includes RaTeX Rust library)
-make test       # run tests
-make run        # build + run with ./workspace
+make all       # cargo build
+make run       # build + run with ./workspace/config.toml
+make check     # fmt + clippy + test
+make test      # cargo test --workspace
 ```
 
 ## License

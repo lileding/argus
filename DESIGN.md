@@ -55,24 +55,29 @@ The Agent does not `use` any Gateway type; each `Task` carries its own
 `mpsc::Sender<Message>` port, so reply events route themselves back
 to the originating IM adapter.
 
-### Four Peer Services
+### Five Peer Services
 
-`main.rs` creates four top-level services and runs them concurrently
+`main.rs` creates five top-level services and runs them concurrently
 via `tokio::join!`. All services share references (`&self`) — no
 `Arc`, no `spawn`:
 
 ```rust
 let upstream = Upstream::new(&config.upstream);
 let embedder = Embedder::new(&config.embedder, &upstream, &db)?;
-let agent = Agent::new(&config.agent, &upstream, &db, &embedder, &config.workspace_dir)?;
-let gateway = Gateway::new(&config.gateway, agent.port(), &upstream, &db, &config.workspace_dir);
+let next_task_id = AtomicU32::new(1);  // shared by Agent and Scheduler
+let agent = Agent::new(&config.agent, &upstream, &db, &embedder,
+                        &config.workspace_dir, &next_task_id)?;
+let gateway = Gateway::new(&config.gateway, agent.port(), &upstream, &db,
+                            &config.workspace_dir);
 let recovery = Recovery::new(&db, &gateway);
+let scheduler = Scheduler::new(&db, agent.task_port(), &gateway, &next_task_id);
 
 tokio::join!(
     gateway.run(&cancel),
     agent.run(&cancel),
     embedder.run(&cancel),
     recovery.run(&cancel),
+    scheduler.run(&cancel),
     shutdown_signal(&cancel),
 );
 ```
@@ -82,7 +87,8 @@ tokio::join!(
 | **Gateway** | Manages all IM adapters. Each adapter runs its own `select!` loop: WS inbound, outbound rendering, media processing, recovery replay — all in a single `FuturesUnordered` pool |
 | **Agent** | Two sub-loops via `join!`: `sync_message_loop` processes messages sequentially; `async_task_loop` drives background tasks in `FuturesUnordered` |
 | **Embedder** | Background worker: embeds unembedded rows (messages, notifications, memories, chunks), summarizes long assistant replies, ingests queued documents |
-| **Recovery** | Scans for unreplied messages at startup and every 5 minutes, replays them through the Gateway |
+| **Recovery** | Scans for unreplied messages at startup and every 5 minutes (only those older than 5 min, to avoid racing with active processing); replays them through the Gateway |
+| **Scheduler** | Scans persistent crons every 60 seconds; due jobs are submitted to the Agent's async task path with `TaskSource::Cron` |
 
 ### Message, Notification, Event
 
@@ -188,6 +194,13 @@ Recovery handles the state combinations:
 **Cards are not re-attached.** Feishu rejects `update` calls on older
 message IDs after a process restart. Replay opens a fresh card per
 replayed task.
+
+**Race window**: `reply_id` is set by the Gateway only after successful
+card delivery. During the orchestrator+synthesizer+render cycle, an
+in-flight message has `reply_id IS NULL`. To avoid Recovery double-
+processing such messages, the unreplied query requires
+`created_at < NOW() - 5 minutes`. Anything younger is assumed to be
+either active or recently completed.
 
 ### Shutdown
 
@@ -319,12 +332,128 @@ The notification replies to the original trigger message, creating a
 reply thread in Feishu. The Gateway renders it as a normal card
 (thinking → reply).
 
-#### v1 Limitations
+#### Limitations
 
-- No persistence: tasks are lost on restart
-- No retry: failure is final
-- No user interaction: no progress queries, no cancellation
-- No dedicated model config: reuses sync orchestrator/synthesizer
+- No persistence: tasks are lost on restart (use Cron for periodic
+  schedules, see next section)
+- No retry: failure is final; the error is delivered as the result
+- No progress queries or cancellation
+- Reuses sync orchestrator/synthesizer model config
+
+---
+
+## Cron (Persistent Scheduled Tasks)
+
+Cron jobs are user-defined recurring tasks. They survive restarts and
+fire on a schedule, reusing the async task execution path.
+
+#### Trigger: `create_cron` Tool
+
+The orchestrator extracts a 6-field cron expression and a self-
+contained execution prompt from the user's natural-language request:
+
+```
+User: "每天上午九点告诉我当日天气"
+→ create_cron(
+    cron_expr: "0 0 9 * * *",
+    goal: "查询北京今天的天气，包含温度、空气质量、风力，简洁汇总"
+  )
+→ "Cron #4 created"
+```
+
+The cron is persisted in the `crons` table with `channel`, `msg_id`
+(for reply routing), `enabled`, `last_run_at`, `created_at`.
+
+#### Scheduler Service
+
+`Scheduler` is a peer service that:
+- Scans `crons WHERE enabled = TRUE` every 60 seconds
+- For each cron: parses `cron_expr` (system local timezone), computes
+  the next firing time after `last_run_at` (or `created_at` for new
+  crons — never `epoch`, to avoid backfilling past matches)
+- If `next <= now`: builds a `TaskSpec` with `source: TaskSource::Cron`,
+  routes through `Gateway::outbound_port(channel)` to find the right
+  IM adapter, submits to the Agent's `task_tx`, updates `last_run_at`
+- No catch-up: missed firings during downtime are dropped, only the
+  next scheduled time triggers
+
+#### Cron Management Tools
+
+| Tool | Purpose |
+|------|---------|
+| `create_cron(cron_expr, goal)` | Create a new cron (sync path only) |
+| `list_crons()` | List active crons in the current channel |
+| `cancel_cron(id)` | Soft delete (`enabled=false`) |
+| `update_cron(id, cron_expr?, goal?)` | Modify; updates `msg_id` to current message so future runs reply in the active context. `last_run_at` is preserved |
+
+`list_crons` / `cancel_cron` / `update_cron` are available in **all**
+execution paths (sync, async tasks, cron-triggered runs). This enables
+the **one-shot reminder** pattern: a cron with goal "do X then call
+cancel_cron on this cron" runs exactly once.
+
+`create_cron` and `create_task` are restricted to the user-facing
+sync path to prevent recursive/runaway creation.
+
+#### Notification Header
+
+Cron-triggered notifications include both IDs:
+- User async task: `[Task #87 completed]`
+- Cron firing: `[Task #88 · Cron #4]`
+
+The Task ID comes from a shared `AtomicU32` counter (resets on restart);
+the Cron ID is the persistent DB row ID.
+
+---
+
+## Thinking / Reasoning
+
+Modern models support **thinking** (Anthropic extended thinking) or
+**reasoning** (OpenAI o-series, GPT-5+, DeepSeek-V4-Pro). Argus
+exposes this as a per-call option, not a per-client config.
+
+#### `ChatOptions`
+
+The `Client` trait's chat methods take a `&ChatOptions` parameter:
+
+```rust
+pub(crate) struct ChatOptions {
+    /// Thinking/reasoning token budget. 0 = instant mode (no thinking).
+    pub(crate) thinking_budget: usize,
+}
+```
+
+- **Sync messages**: pass `ChatOptions::default()` → instant mode
+- **Async tasks** (and cron-triggered): pass `ChatOptions { thinking_budget: 10000 }` → reasoning enabled
+
+Each provider client translates this differently:
+
+| Provider | Wire format |
+|----------|-------------|
+| **Anthropic** | Request adds `"thinking": {"type": "enabled", "budget_tokens": N}`. Response thinking blocks are extracted into `Response.reasoning_content`. Streaming `thinking_delta` events are accumulated separately and **don't trigger early-abort**. |
+| **OpenAI Responses API** (`/v1/responses`, type `openai-response`) | Request adds `"reasoning": {"effort": "medium"}`. Used for GPT-5+ with tools (Chat Completions rejects this combo). |
+| **OpenAI Chat Completions** (`/v1/chat/completions`, type `openai`) | Adds `"reasoning_effort": "medium"`. Works for DeepSeek-V4-Pro and others; rejected by GPT-5+ when tools are present. |
+
+#### Multi-turn Reasoning State
+
+DeepSeek and similar APIs require the **`reasoning_content`** from each
+assistant response to be passed back in subsequent requests, otherwise
+they return 400 errors. Argus solves this by:
+
+- `Message` and `Response` carry an optional `reasoning_content: Option<String>`
+- The orchestrator loop preserves `reasoning_content` on each appended
+  assistant message
+- Both streaming (`reasoning_delta` accumulated) and non-streaming paths
+  populate it
+- Anthropic equivalents: thinking blocks are reconstructed in the
+  request when the assistant message has `reasoning_content` set
+
+#### Early Abort Adjustment
+
+The text-only early-abort heuristic (cancel after 80 tokens of text
+without tool calls) is **disabled when `reasoning_delta` has been
+seen** in the stream. Thinking models often produce a short text
+preamble before tools — aborting during the preamble would prevent
+tool calls from ever happening.
 
 ---
 
@@ -351,14 +480,20 @@ on task pop, then awaits `ready` until content is ready.
 
 ```
 Feishu audio → download → save .opus to .files/
-    → Whisper v3 transcription (OpenAI-compatible /v1/audio/transcriptions)
+    → rename .opus → .ogg for Whisper API (Feishu sends OGG-wrapped
+       Opus but uses .opus extension; Whisper rejects .opus)
+    → OpenAI Whisper API (/v1/audio/transcriptions, model: whisper-1)
     → verbose_json response with avg_logprob per segment
     → confidence computed as mean(avg_logprob)
     → text sent to orchestrator
 ```
 
+The on-disk file keeps `.opus` (matches Feishu's naming); only the
+filename sent to the Whisper API is rewritten. The rename is in the
+Feishu adapter, not the generic transcription client.
+
 The transcription prompt includes domain vocabulary hints for:
-- Technology terms (API, Kubernetes, Docker, LLM, MLX, vLLM, omlx)
+- Technology terms (API, Kubernetes, Docker, LLM, transformer)
 - Finance terms (ETF, hedge fund, quantitative)
 - Classical composers in Chinese/Latin (Chopin 肖邦, Beethoven 贝多芬, ...)
 
@@ -544,23 +679,31 @@ agent role (orchestrator, synthesizer, transcription, embedding,
 summarization) selects its own upstream and model independently.
 
 ```toml
-[upstream.local]
+[upstream.openai]
 type = "openai"
-base_url = "http://localhost:8000/v1"
-api_key = "omlx"
-timeout_secs = 240
+api_key = "sk-..."
+
+[upstream.openai-r]            # for GPT-5+ with reasoning + tools
+type = "openai-response"
+api_key = "sk-..."
 
 [upstream.anthropic]
 type = "anthropic"
-api_key = "sk-ant-xxx"
+api_key = "sk-ant-..."
 
 [upstream.gemini]
 type = "gemini"
 api_key = "..."
 
+[upstream.deepseek]
+type = "openai"                # DeepSeek API is OpenAI-compatible
+base_url = "https://api.deepseek.com/"
+api_key = "sk-..."
+
 [agent.orchestrator]
-upstream = "anthropic"
-model_name = "claude-haiku-4-5"
+upstream = "deepseek"
+model_name = "deepseek-v4-pro"
+max_tokens = 32768
 
 [agent.synthesizer]
 upstream = "gemini"
@@ -568,31 +711,36 @@ model_name = "gemini-2.5-flash-lite"
 max_tokens = 32768
 ```
 
-Three upstream types, all implemented with `reqwest` (no SDKs):
+Four upstream types, all implemented with `reqwest` (no SDKs):
 
-| Type | Endpoint | Auth |
-|------|----------|------|
-| `openai` | Any OpenAI-compatible API | Bearer token |
-| `anthropic` | Anthropic Messages API | `x-api-key` header |
-| `gemini` | Google Gemini via OpenAI-compatible endpoint | API key (in URL or bearer) |
-
-Gemini is accessed through Google's OpenAI-compatible endpoint
-(`generativelanguage.googleapis.com/v1beta/openai`), reusing the
-OpenAI client implementation.
+| Type | Endpoint | Notes |
+|------|----------|-------|
+| `openai` | `/v1/chat/completions` (any OpenAI-compatible API) | Used for OpenAI Chat Completions, DeepSeek, local servers, Groq, etc. |
+| `openai-response` | `/v1/responses` | OpenAI Responses API. Required for GPT-5+ with reasoning + tools (Chat Completions rejects this combo with 400) |
+| `anthropic` | `/v1/messages` | Native Anthropic Messages API; supports extended thinking |
+| `gemini` | Google's OpenAI-compatible endpoint | Reuses the OpenAI client; `generativelanguage.googleapis.com/v1beta/openai` |
 
 ### Recommended Configurations
 
-| Orchestrator | Synthesizer | Cost | Quality |
+| Orchestrator | Synthesizer | Cost | Notes |
 |---|---|---|---|
-| Claude Haiku 4.5 | Gemini 2.5 Flash Lite | ~$5/mo | Good quality, best value |
-| GPT-5.4 | Gemini 2.5 Flash Lite | ~$15/mo | Excellent tool calling + fast synthesis |
-| Qwen 3.5 (local) | Qwen 3.5 (local) | $0 | Functional but needs all harness guardrails |
+| GPT-5.5 (`openai-response`) | Gemini 2.5 Flash Lite | ~$15/mo | Best instruction-following; supports reasoning + tools |
+| Claude Sonnet 4.6 | Gemini 2.5 Flash Lite | ~$10/mo | Strong reasoning; native extended thinking |
+| DeepSeek-V4-Pro | DeepSeek-V4-Flash | ~$2/mo | Best value; reasoning works in Chat Completions |
+| Claude Haiku 4.5 | Gemini 2.5 Flash Lite | ~$5/mo | Cheap, fast, good quality |
 
-### Local Models (Transcription + Embedding)
+### Online vs Local
 
-Local models serve two specialized roles:
-- **Transcription**: Whisper Large v3 via OpenAI-compatible endpoint
-- **Embedding**: modernbert-embed-base (768 dim) via OpenAI-compatible endpoint
+**Default**: online APIs for everything.
+- Transcription: OpenAI `whisper-1`
+- Embedding: OpenAI `text-embedding-3-small` with `dimensions: 768`
+  (matches the DB schema's `vector(768)` columns)
+
+Local models can still be configured via an `openai`-type upstream
+pointing at a local server (vLLM, omlx, Ollama, etc.) — useful for
+sensitive workloads or zero-cost experimentation. Note that switching
+embedding providers invalidates existing vectors — wipe them with
+`UPDATE … SET embedding = NULL` to trigger re-embedding.
 
 ---
 
@@ -700,7 +848,11 @@ them (via `activate_skill`), not create or modify them.
 | `search_history` | Semantic search over conversation history | 2/turn |
 | `db` | Structured data access (see below) | 6/turn |
 | `activate_skill` | Load a skill's full instructions on demand | — |
-| `create_task` | Create an async background task (returns task ID) | — |
+| `create_task` | Create an async background task (sync path only) | — |
+| `create_cron` | Create a recurring scheduled task (sync path only) | — |
+| `list_crons` | List active crons in the current channel | — |
+| `cancel_cron` | Soft-delete a cron by ID | — |
+| `update_cron` | Modify an existing cron's expression or goal | — |
 
 ### Tool Trait
 
@@ -827,6 +979,12 @@ The `Embedder` runs two interval loops:
   for long, unsummarized assistant replies in `notifications`. Uses the
   synthesizer model.
 
+The OpenAI `text-embedding-3-small` model has an 8192-token input
+limit. Argus truncates each input to **2500 characters** before
+sending (a conservative ceiling for CJK text where 1 char ≈ 2-3
+tokens). Document chunks (≤1500 chars) are unaffected; very long
+notifications are truncated.
+
 ### Notification Summaries
 
 Long agent replies stored in `notifications` are summarized by the
@@ -942,6 +1100,20 @@ CREATE TABLE tool_calls (
     duration_ms     INT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Persistent cron jobs (migration 008)
+CREATE TABLE crons (
+    id          BIGSERIAL PRIMARY KEY,
+    cron_expr   TEXT NOT NULL,                   -- 6-field, system local TZ
+    goal        TEXT NOT NULL,                   -- self-contained execution prompt
+    channel     TEXT NOT NULL,
+    msg_id      TEXT NOT NULL,                   -- updated by update_cron
+    enabled     BOOLEAN NOT NULL DEFAULT TRUE,   -- soft-delete via false
+    last_run_at TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX crons_enabled_channel_idx ON crons(enabled, channel);
 ```
 
 IVFFlat cosine indexes on all embedding columns. Agent-created business
@@ -962,6 +1134,7 @@ pub(crate) struct Database {
     pub(crate) documents: Documents,
     pub(crate) memories: Memories,
     pub(crate) traces: Traces,
+    pub(crate) crons: Crons,
 }
 ```
 
@@ -997,22 +1170,28 @@ app_secret = ""
 # base_url = "https://open.feishu.cn"  # default; use Lark URL for international
 
 [gateway.feishu.transcription]
-upstream = "local"
-model_name = "whisper-large-v3"
+upstream = "openai"
+model_name = "whisper-1"
 
-[upstream.local]
+[upstream.openai]
 type = "openai"
-base_url = "http://localhost:8000/v1"
-api_key = "omlx"
-timeout_secs = 240
+api_key = ""
+
+[upstream.openai-r]              # GPT-5+ with reasoning + tools
+type = "openai-response"
+api_key = ""
 
 [upstream.anthropic]
 type = "anthropic"
 api_key = ""
-# timeout_secs = 120  # default
 
 [upstream.gemini]
 type = "gemini"
+api_key = ""
+
+[upstream.deepseek]
+type = "openai"
+base_url = "https://api.deepseek.com/"
 api_key = ""
 
 [agent]
@@ -1021,9 +1200,9 @@ orchestrator_context_window = 10
 tavily_api_key = ""
 
 [agent.orchestrator]
-upstream = "anthropic"
-model_name = "claude-haiku-4-5"
-max_tokens = 4096
+upstream = "openai-r"
+model_name = "gpt-5.5"
+max_tokens = 32768
 
 [agent.synthesizer]
 upstream = "gemini"
@@ -1034,11 +1213,12 @@ max_tokens = 32768
 dsn = "postgres://argus:argus@localhost:5432/argus?sslmode=disable"
 
 [embedder]
-upstream = "local"
-model_name = "modernbert-embed-base"
+upstream = "openai"
+model_name = "text-embedding-3-small"
+dimensions = 768                 # truncate to match DB schema vector(768)
 batch_size = 32
 interval_secs = 30
-summary_interval_ticks = 10  # summarize every 10 × interval_secs = 300s
+summary_interval_ticks = 10      # summarize every 10 × interval_secs = 300s
 
 [embedder.summarizer]
 upstream = "gemini"
@@ -1061,12 +1241,12 @@ feishu/                      Feishu SDK (workspace member)
     pbbp2.rs                 Feishu binary protocol (protobuf)
     types.rs                 FeishuEvent, Error, API types
 src/
-  main.rs                    Entry point, --config flag, tokio::join! four services
+  main.rs                    Entry point, --config flag, tokio::join! five services
   config.rs                  TOML config + tilde expansion + path resolution
   agent/
-    mod.rs                   Message/Notification/Event types, Agent struct,
-                             sync_message_loop + async_task_loop (join!),
-                             run_orchestrator, run_synthesizer, run_task,
+    mod.rs                   Message/Notification/Event/TaskSpec/TaskSource,
+                             Agent struct, sync_message_loop + async_task_loop
+                             (join!), run_orchestrator, run_synthesizer, run_task,
                              prompts, tool budgets
     harness.rs               Context curation: semantic recall + sliding window +
                              pinned memories
@@ -1087,32 +1267,42 @@ src/
       list_docs.rs           List indexed documents
       search_history.rs      Conversation history semantic search
       skill.rs               activate_skill tool
-      create_task.rs         Async task creation tool
+      create_task.rs         Async task creation (sync path only)
+      create_cron.rs         Cron creation (sync path only)
+      list_crons.rs          List crons (always available)
+      cancel_cron.rs         Soft-delete cron (always available)
+      update_cron.rs         Modify cron (always available)
   gateway/
-    mod.rs                   Gateway struct, Im trait, recovery routing
+    mod.rs                   Gateway struct, Im trait (with outbound_port),
+                             recovery routing, channel→IM lookup for Scheduler
     feishu.rs                Feishu adapter: WS inbound, media processing,
-                             card rendering, recovery handler
+                             card rendering, recovery handler, .opus → .ogg rename
     transcribe.rs            Whisper transcription client (OpenAI-compatible)
   upstream/
-    mod.rs                   Upstream registry, client_for factory
-    types.rs                 Client trait, Message, ToolCall, Response,
-                             StreamChunk, ChunkStream, errors (thiserror)
-    openai.rs                OpenAI-compatible client (also used for Gemini)
-    anthropic.rs             Anthropic Messages API client
+    mod.rs                   Upstream registry, client_for factory (4 provider types)
+    types.rs                 Client trait, Message (with reasoning_content),
+                             ChatOptions, ToolCall, Response, StreamChunk,
+                             ChunkStream, errors (thiserror)
+    openai.rs                OpenAI Chat Completions (also Gemini, DeepSeek, local)
+    openai_responses.rs      OpenAI Responses API (/v1/responses) for GPT-5+ reasoning
+    anthropic.rs             Anthropic Messages API (with extended thinking)
   database/
     mod.rs                   Database struct, migration runner, sub-objects
-    messages.rs              Messages table operations
+    messages.rs              Messages table (5-min recovery threshold in unreplied)
     notifications.rs         Notifications table (agent replies)
     conversation.rs          Conversation view queries (recall + recent)
     documents.rs             Documents + chunks tables
     memories.rs              Memories table
     traces.rs                Traces + tool_calls tables, TraceBuilder
+    crons.rs                 Crons table CRUD (channel-scoped operations)
   embedder/
     mod.rs                   Embedder service: embed/summarize/ingest cycles
-    client.rs                Embedding HTTP client (OpenAI-compatible)
+    client.rs                Embedding HTTP client (OpenAI-compatible, with
+                             dimensions param + 2500-char input truncation)
     docindex.rs              Document ingestion: extract → chunk → save
   render.rs                  LaTeX detection + RaTeX rendering + Feishu card building
-  recovery.rs                Recovery service: scan unreplied + replay
+  recovery.rs                Recovery service: scan unreplied (>5min) + replay
+  scheduler.rs               Scheduler service: scan crons every 60s, fire matched
 migrations/
   001_init.sql               messages table
   002_memory_system.sql      pgvector + memories + documents + chunks
@@ -1121,6 +1311,7 @@ migrations/
   005_message_summary.sql    summary column for assistant replies
   006_reply_content.sql      Split messages → messages + notifications
   007_conversation_view.sql  conversation view
+  008_crons.sql              crons table
 ```
 
 ---
@@ -1133,9 +1324,10 @@ migrations/
 | Async runtime | Tokio |
 | IM | Feishu WebSocket (not webhook) + REST API |
 | Feishu SDK | Workspace member crate (`feishu/`): WS via `tokio-tungstenite`, PBBP2 via `prost` |
-| Chat Model | Multi-backend: OpenAI, Anthropic (native), Gemini (OpenAI-compatible) |
-| Transcription | Whisper Large v3 via OpenAI-compatible `/v1/audio/transcriptions` |
-| Embedding | modernbert-embed-base (768 dim) via OpenAI-compatible `/v1/embeddings` |
+| Chat Model | Multi-backend: OpenAI Chat Completions, OpenAI Responses (GPT-5+ reasoning), Anthropic (native, with extended thinking), Gemini (OpenAI-compatible), DeepSeek (OpenAI-compatible) |
+| Transcription | OpenAI Whisper (`whisper-1`) via `/v1/audio/transcriptions` |
+| Embedding | OpenAI `text-embedding-3-small` with `dimensions: 768` via `/v1/embeddings` |
+| Cron parsing | `cron` crate (6-field, system local timezone) |
 | Database | PostgreSQL + pgvector (required) |
 | SQL | sqlx (compile-time-safe queries, PgPool) |
 | HTTP | reqwest + reqwest-eventsource (SSE streaming) |
@@ -1174,31 +1366,9 @@ migrations/
 
 ---
 
-## Future Work
+## Roadmap
 
-- **Async task persistence and retry.** Currently v1: no persistence,
-  no retry, tasks lost on restart. Future: persist TaskSpec to DB,
-  resume on startup, retry on failure.
-
-- **Async task user interaction.** Query task status, cancel running
-  tasks, dedicated model config per task.
-
-- **Per-chat FIFO within Agent.** Currently uses a single global
-  sequential loop. Per-chat parallelism would allow cross-chat
-  concurrency while preserving per-chat ordering.
-
-- **Cron / scheduled tasks.** Cron-driven triggers that create async
-  tasks on a schedule.
-
-- **Sandbox abstraction.** The CLI tool runs commands directly on the
-  host. Re-introduce sandbox abstraction (Docker, VM) if production
-  deployment requires isolation.
-
-- **Group Silent Listening.** Listed as an interaction mode but not
-  implemented. Group messages without @mention are silently dropped.
-
-- **Skill hot-reload.** Skills are loaded once at startup. Adding a
-  file watcher or periodic rescan would restore hot-reload capability.
+Forward-looking work is tracked in [ROADMAP.md](ROADMAP.md).
 
 ---
 
