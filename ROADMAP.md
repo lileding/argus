@@ -62,7 +62,37 @@ sinks = [
 
 The **default channel is implicit** — it always exists, has no name,
 cannot be configured. Any sink not listed under a configured channel
-is routed to it.
+is routed to it. In the data layer, `channel_id IS NULL` represents
+the default channel.
+
+### Data layer
+
+New table:
+
+```sql
+CREATE TABLE channels (
+    id    BIGSERIAL PRIMARY KEY,
+    name  TEXT NOT NULL UNIQUE,
+    sinks JSONB NOT NULL DEFAULT '[]'  -- [{gateway, kind, id}, ...]
+);
+```
+
+Existing tables — replace `channel TEXT` with `channel_id BIGINT NULL
+REFERENCES channels(id)`. NULL = default channel.
+
+| Table | Change |
+|---|---|
+| `messages` | `channel TEXT NOT NULL` → `channel_id BIGINT NULL`; add `sink TEXT` (originating sink, for round-trip reply) |
+| `notifications` | inherits via `message_id` (no change) |
+| `documents` | `channel TEXT NULL` → `channel_id BIGINT NULL` |
+| `chunks` | inherits via `document_id` (no change) |
+| `crons` | `channel TEXT NOT NULL` → `channel_id BIGINT NULL` |
+| `traces` | rename `chat_id TEXT NOT NULL` → `channel_id BIGINT NULL` |
+| `tool_calls` | inherits via `trace_id` (no change) |
+| `memories` | **add** `channel_id BIGINT NULL` |
+
+Migration: existing rows get `channel_id = NULL` (everything goes to
+the default channel).
 
 ### Out of scope (for this phase)
 
