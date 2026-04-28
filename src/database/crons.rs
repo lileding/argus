@@ -7,7 +7,10 @@ pub(crate) struct Cron {
     pub(crate) id: i64,
     pub(crate) cron_expr: String,
     pub(crate) goal: String,
-    pub(crate) channel: String,
+    /// Originating sink (for routing the cron-triggered notification back).
+    pub(crate) sink: String,
+    /// Channel ID for tenant isolation. None = default channel.
+    pub(crate) channel_id: Option<i64>,
     pub(crate) msg_id: String,
     pub(crate) last_run_at: Option<DateTime<Utc>>,
     pub(crate) created_at: DateTime<Utc>,
@@ -27,16 +30,18 @@ impl Crons {
         &self,
         cron_expr: &str,
         goal: &str,
-        channel: &str,
+        sink: &str,
+        channel_id: Option<i64>,
         msg_id: &str,
     ) -> super::DbResult<i64> {
         let row = sqlx::query(
-            "INSERT INTO crons (cron_expr, goal, channel, msg_id) \
-             VALUES ($1, $2, $3, $4) RETURNING id",
+            "INSERT INTO crons (cron_expr, goal, sink, channel_id, msg_id) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING id",
         )
         .bind(cron_expr)
         .bind(goal)
-        .bind(channel)
+        .bind(sink)
+        .bind(channel_id)
         .bind(msg_id)
         .fetch_one(&self.pool)
         .await?;
@@ -46,7 +51,7 @@ impl Crons {
     /// List all enabled crons (used by Scheduler).
     pub(crate) async fn list_enabled(&self) -> super::DbResult<Vec<Cron>> {
         let rows = sqlx::query(
-            "SELECT id, cron_expr, goal, channel, msg_id, last_run_at, created_at \
+            "SELECT id, cron_expr, goal, sink, channel_id, msg_id, last_run_at, created_at \
              FROM crons WHERE enabled = TRUE",
         )
         .fetch_all(&self.pool)
@@ -58,7 +63,8 @@ impl Crons {
                 id: r.get("id"),
                 cron_expr: r.get("cron_expr"),
                 goal: r.get("goal"),
-                channel: r.get("channel"),
+                sink: r.get("sink"),
+                channel_id: r.get("channel_id"),
                 msg_id: r.get("msg_id"),
                 last_run_at: r.get("last_run_at"),
                 created_at: r.get("created_at"),
@@ -67,12 +73,18 @@ impl Crons {
     }
 
     /// List enabled crons for a specific channel (used by list_crons tool).
-    pub(crate) async fn list_for_channel(&self, channel: &str) -> super::DbResult<Vec<Cron>> {
+    /// `channel_id = None` lists default-channel crons.
+    pub(crate) async fn list_for_channel(
+        &self,
+        channel_id: Option<i64>,
+    ) -> super::DbResult<Vec<Cron>> {
         let rows = sqlx::query(
-            "SELECT id, cron_expr, goal, channel, msg_id, last_run_at, created_at \
-             FROM crons WHERE enabled = TRUE AND channel = $1 ORDER BY id",
+            "SELECT id, cron_expr, goal, sink, channel_id, msg_id, last_run_at, created_at \
+             FROM crons WHERE enabled = TRUE \
+               AND channel_id IS NOT DISTINCT FROM $1 \
+             ORDER BY id",
         )
-        .bind(channel)
+        .bind(channel_id)
         .fetch_all(&self.pool)
         .await?;
 
@@ -82,7 +94,8 @@ impl Crons {
                 id: r.get("id"),
                 cron_expr: r.get("cron_expr"),
                 goal: r.get("goal"),
-                channel: r.get("channel"),
+                sink: r.get("sink"),
+                channel_id: r.get("channel_id"),
                 msg_id: r.get("msg_id"),
                 last_run_at: r.get("last_run_at"),
                 created_at: r.get("created_at"),
@@ -92,13 +105,15 @@ impl Crons {
 
     /// Soft-delete (disable) a cron. Returns true if a row was actually disabled.
     /// The channel filter prevents cross-channel cancellation.
-    pub(crate) async fn cancel(&self, id: i64, channel: &str) -> super::DbResult<bool> {
+    pub(crate) async fn cancel(&self, id: i64, channel_id: Option<i64>) -> super::DbResult<bool> {
         let result = sqlx::query(
             "UPDATE crons SET enabled = FALSE, updated_at = NOW() \
-             WHERE id = $1 AND channel = $2 AND enabled = TRUE",
+             WHERE id = $1 \
+               AND channel_id IS NOT DISTINCT FROM $2 \
+               AND enabled = TRUE",
         )
         .bind(id)
-        .bind(channel)
+        .bind(channel_id)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -110,7 +125,7 @@ impl Crons {
     pub(crate) async fn update(
         &self,
         id: i64,
-        channel: &str,
+        channel_id: Option<i64>,
         cron_expr: Option<&str>,
         goal: Option<&str>,
         msg_id: &str,
@@ -121,13 +136,15 @@ impl Crons {
              goal = COALESCE($2, goal), \
              msg_id = $3, \
              updated_at = NOW() \
-             WHERE id = $4 AND channel = $5 AND enabled = TRUE",
+             WHERE id = $4 \
+               AND channel_id IS NOT DISTINCT FROM $5 \
+               AND enabled = TRUE",
         )
         .bind(cron_expr)
         .bind(goal)
         .bind(msg_id)
         .bind(id)
-        .bind(channel)
+        .bind(channel_id)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)

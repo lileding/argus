@@ -94,11 +94,11 @@ impl<'a> Gateway<'a> {
 
     /// Replay an unreplied message through the appropriate IM adapter.
     pub(crate) async fn replay(&self, msg: UnrepliedMessage) {
-        // Route by channel prefix: "feishu:..." → feishu IM.
-        let im_name = if msg.channel.starts_with("feishu:") {
+        // Route by sink prefix: "feishu:..." → feishu IM.
+        let im_name = if msg.sink.starts_with("feishu:") {
             "feishu"
         } else {
-            warn!(channel = msg.channel, "unknown IM for recovery, skipping");
+            warn!(sink = msg.sink, "unknown IM for recovery, skipping");
             return;
         };
 
@@ -111,10 +111,10 @@ impl<'a> Gateway<'a> {
         }
     }
 
-    /// Look up the outbound port for the given channel by IM prefix.
+    /// Look up the outbound port for the given sink by IM prefix.
     /// Used by Scheduler to send cron-triggered notifications.
-    pub(crate) fn outbound_port(&self, channel: &str) -> Option<mpsc::Sender<Notification>> {
-        let im_name = if channel.starts_with("feishu:") {
+    pub(crate) fn outbound_port(&self, sink: &str) -> Option<mpsc::Sender<Notification>> {
+        let im_name = if sink.starts_with("feishu:") {
             "feishu"
         } else {
             return None;

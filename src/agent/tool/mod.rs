@@ -30,7 +30,10 @@ use super::EmbedService;
 /// Execution context passed to every tool call.
 #[derive(Clone)]
 pub(super) struct ToolContext<'a> {
-    pub(super) channel: &'a str,
+    /// Originating sink (for routing notifications back to the right IM endpoint).
+    pub(super) sink: &'a str,
+    /// Channel ID for tenant isolation. None = default channel.
+    pub(super) channel_id: Option<i64>,
     pub(super) msg_id: &'a str,
     pub(super) port: &'a tokio::sync::mpsc::Sender<super::Notification>,
 }

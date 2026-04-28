@@ -22,14 +22,14 @@ pub(super) async fn build_context(
     db: &Database,
     embedder: Option<&dyn super::EmbedService>,
     system_prompt: &str,
-    channel: &str,
+    channel_id: Option<i64>,
     user_text: &str,
     exclude_msg_id: Option<i64>,
     context_window: usize,
     image_parts: Vec<model::ContentPart>,
 ) -> Vec<model::Message> {
     // Build system prompt with pinned memories.
-    let system_content = if let Ok(memories) = db.memories.list_active().await {
+    let system_content = if let Ok(memories) = db.memories.list_active(channel_id).await {
         if memories.is_empty() {
             system_prompt.to_string()
         } else {
@@ -61,7 +61,7 @@ pub(super) async fn build_context(
         // 1. Search user messages (conversation view).
         if let Ok(results) = db
             .conversation
-            .search(&vec, channel, exclude_msg_id, 10)
+            .search(&vec, channel_id, exclude_msg_id, 10)
             .await
         {
             for (row_id, similarity, user_msg, reply_msg) in &results {
@@ -110,7 +110,7 @@ pub(super) async fn build_context(
     // Sliding window: recent conversation turns (excluding current message).
     if let Ok(recent) = db
         .conversation
-        .recent(channel, exclude_msg_id, context_window as i64)
+        .recent(channel_id, exclude_msg_id, context_window as i64)
         .await
     {
         for (row_id, user_msg, reply_msg) in &recent {

@@ -44,7 +44,7 @@ impl<'a> Tool for Forget<'a> {
         })
     }
 
-    async fn execute(&self, _ctx: &super::ToolContext<'_>, args: &str) -> String {
+    async fn execute(&self, ctx: &super::ToolContext<'_>, args: &str) -> String {
         let parsed: Args = match serde_json::from_str(args) {
             Ok(a) => a,
             Err(e) => return format!("error: invalid arguments: {e}"),
@@ -55,7 +55,7 @@ impl<'a> Tool for Forget<'a> {
             Err(e) => return format!("error: invalid id \"{}\": {e}", parsed.id),
         };
 
-        match self.db.memories.deactivate(id).await {
+        match self.db.memories.deactivate(id, ctx.channel_id).await {
             Ok(true) => format!("Memory {id} forgotten."),
             Ok(false) => format!("error: memory {id} not found or already forgotten"),
             Err(e) => format!("error: {e}"),

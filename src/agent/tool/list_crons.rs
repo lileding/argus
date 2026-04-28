@@ -33,7 +33,7 @@ impl Tool for ListCrons<'_> {
     }
 
     async fn execute(&self, ctx: &ToolContext<'_>, _args: &str) -> String {
-        match self.db.crons.list_for_channel(ctx.channel).await {
+        match self.db.crons.list_for_channel(ctx.channel_id).await {
             Ok(crons) if crons.is_empty() => "No active scheduled tasks.".to_string(),
             Ok(crons) => {
                 let mut out = String::new();

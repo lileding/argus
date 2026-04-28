@@ -69,7 +69,7 @@ impl Tool for UpdateCron<'_> {
         match self
             .db
             .crons
-            .update(id, ctx.channel, cron_expr, goal, ctx.msg_id)
+            .update(id, ctx.channel_id, cron_expr, goal, ctx.msg_id)
             .await
         {
             Ok(true) => format!("Cron #{id} updated."),

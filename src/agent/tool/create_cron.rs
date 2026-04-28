@@ -69,7 +69,7 @@ impl Tool for CreateCron<'_> {
         match self
             .db
             .crons
-            .create(cron_expr, goal, ctx.channel, ctx.msg_id)
+            .create(cron_expr, goal, ctx.sink, ctx.channel_id, ctx.msg_id)
             .await
         {
             Ok(id) => format!(

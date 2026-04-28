@@ -23,16 +23,16 @@ impl Traces {
     pub(crate) async fn begin(
         &self,
         message_id: i64,
-        chat_id: &str,
+        channel_id: Option<i64>,
         orch_model: &str,
         synth_model: &str,
     ) -> super::DbResult<TraceBuilder> {
         let row = sqlx::query(
-            "INSERT INTO traces (message_id, chat_id, orchestrator_model, synthesizer_model) \
+            "INSERT INTO traces (message_id, channel_id, orchestrator_model, synthesizer_model) \
              VALUES ($1, $2, $3, $4) RETURNING id",
         )
         .bind(message_id)
-        .bind(chat_id)
+        .bind(channel_id)
         .bind(orch_model)
         .bind(synth_model)
         .fetch_one(&self.pool)

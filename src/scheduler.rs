@@ -111,13 +111,13 @@ impl<'a> Scheduler<'a> {
             }
 
             // Due — fire it.
-            let port = match self.gateway.outbound_port(&cron.channel) {
+            let port = match self.gateway.outbound_port(&cron.sink) {
                 Some(p) => p,
                 None => {
                     warn!(
                         cron_id = cron.id,
-                        channel = cron.channel,
-                        "no outbound port for channel, skipping"
+                        sink = cron.sink,
+                        "no outbound port for sink, skipping"
                     );
                     continue;
                 }
@@ -127,7 +127,8 @@ impl<'a> Scheduler<'a> {
             let spec = TaskSpec {
                 id: task_id,
                 goal: cron.goal.clone(),
-                channel: cron.channel.clone(),
+                sink: cron.sink.clone(),
+                channel_id: cron.channel_id,
                 msg_id: cron.msg_id.clone(),
                 port,
                 source: TaskSource::Cron { cron_id: cron.id },

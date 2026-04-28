@@ -189,7 +189,8 @@ impl<'a> Feishu<'a> {
         let (ready_tx, ready_rx) = oneshot::channel();
         let agent_msg = Message {
             msg_id: msg.trigger_msg_id.clone(),
-            channel: msg.channel,
+            sink: msg.sink,
+            channel_id: msg.channel_id,
             db_msg_id: Some(msg.db_msg_id),
             ready: ready_rx,
             port: self.tx.clone(),
@@ -323,16 +324,20 @@ impl<'a> Feishu<'a> {
             .and_then(|h| h.create_time.as_deref())
             .and_then(|t| t.parse::<i64>().ok())
             .and_then(chrono::DateTime::from_timestamp_millis);
-        let channel = if chat_type == "p2p" {
+        let sink = if chat_type == "p2p" {
             format!("feishu:p2p:{chat_id}")
         } else {
             format!("feishu:group:{chat_id}")
         };
+        // Channel mapping is not yet implemented; everything goes to the
+        // default channel (NULL channel_id).
+        let channel_id: Option<i64> = None;
         let db_msg_id = match self
             .db
             .messages
             .save_received(&InboundMessage {
-                channel: &channel,
+                sink: &sink,
+                channel_id,
                 content: &raw_content,
                 msg_type: &msg_type,
                 sender_id,
@@ -355,7 +360,8 @@ impl<'a> Feishu<'a> {
 
         let agent_msg = Message {
             msg_id: msg_id.clone(),
-            channel: channel.clone(),
+            sink: sink.clone(),
+            channel_id,
             db_msg_id,
             ready: ready_rx,
             port: self.tx.clone(),

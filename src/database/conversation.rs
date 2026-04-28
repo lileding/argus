@@ -29,18 +29,19 @@ impl Conversation {
     /// Returns (row_id, user_msg, optional_reply_msg) in chronological order.
     pub(crate) async fn recent(
         &self,
-        channel: &str,
+        channel_id: Option<i64>,
         exclude_id: Option<i64>,
         limit: i64,
     ) -> super::DbResult<Vec<(i64, model::Message, Option<model::Message>)>> {
         let rows = sqlx::query(
             "SELECT id, user_content, reply_content, reply_summary \
              FROM conversation \
-             WHERE channel = $1 AND ($2::bigint IS NULL OR id != $2) \
+             WHERE channel_id IS NOT DISTINCT FROM $1 \
+               AND ($2::bigint IS NULL OR id != $2) \
              ORDER BY user_ts DESC \
              LIMIT $3",
         )
-        .bind(channel)
+        .bind(channel_id)
         .bind(exclude_id)
         .bind(limit)
         .fetch_all(&self.pool)
@@ -67,7 +68,7 @@ impl Conversation {
     pub(crate) async fn search(
         &self,
         embedding: &[f32],
-        channel: &str,
+        channel_id: Option<i64>,
         exclude_id: Option<i64>,
         limit: i64,
     ) -> super::DbResult<Vec<(i64, f64, model::Message, Option<model::Message>)>> {
@@ -76,13 +77,14 @@ impl Conversation {
             "SELECT id, user_content, reply_content, reply_summary, \
                     1 - (user_embedding <=> $1) AS similarity \
              FROM conversation \
-             WHERE channel = $2 AND user_embedding IS NOT NULL \
+             WHERE channel_id IS NOT DISTINCT FROM $2 \
+               AND user_embedding IS NOT NULL \
                AND ($3::bigint IS NULL OR id != $3) \
              ORDER BY user_embedding <=> $1 \
              LIMIT $4",
         )
         .bind(vec)
-        .bind(channel)
+        .bind(channel_id)
         .bind(exclude_id)
         .bind(limit)
         .fetch_all(&self.pool)
@@ -114,7 +116,7 @@ impl Conversation {
     pub(crate) async fn search_with_time(
         &self,
         embedding: &[f32],
-        channel: &str,
+        channel_id: Option<i64>,
         limit: i64,
     ) -> super::DbResult<Vec<(f64, chrono::DateTime<chrono::Utc>, String, Option<String>)>> {
         let vec = Vector::from(embedding.to_vec());
@@ -122,12 +124,13 @@ impl Conversation {
             "SELECT user_content, reply_content, reply_summary, user_ts, \
                     1 - (user_embedding <=> $1) AS similarity \
              FROM conversation \
-             WHERE channel = $2 AND user_embedding IS NOT NULL \
+             WHERE channel_id IS NOT DISTINCT FROM $2 \
+               AND user_embedding IS NOT NULL \
              ORDER BY user_embedding <=> $1 \
              LIMIT $3",
         )
         .bind(vec)
-        .bind(channel)
+        .bind(channel_id)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;

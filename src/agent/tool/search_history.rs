@@ -69,7 +69,7 @@ impl<'a, E: EmbedService> Tool for SearchHistory<'a, E> {
         let results = match self
             .db
             .conversation
-            .search_with_time(&embedding, ctx.channel, limit)
+            .search_with_time(&embedding, ctx.channel_id, limit)
             .await
         {
             Ok(r) => r,

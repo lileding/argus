@@ -145,7 +145,8 @@ mod tests {
         let result = tool
             .execute(
                 &super::super::ToolContext {
-                    channel: "test",
+                    sink: "test",
+                    channel_id: None,
                     msg_id: "test",
                     port: &tokio::sync::mpsc::channel(1).0,
                 },
@@ -162,7 +163,8 @@ mod tests {
         let result = tool
             .execute(
                 &super::super::ToolContext {
-                    channel: "test",
+                    sink: "test",
+                    channel_id: None,
                     msg_id: "test",
                     port: &tokio::sync::mpsc::channel(1).0,
                 },
@@ -180,7 +182,8 @@ mod tests {
         let result = tool
             .execute(
                 &super::super::ToolContext {
-                    channel: "test",
+                    sink: "test",
+                    channel_id: None,
                     msg_id: "test",
                     port: &tokio::sync::mpsc::channel(1).0,
                 },
@@ -197,7 +200,8 @@ mod tests {
         let result = tool
             .execute(
                 &super::super::ToolContext {
-                    channel: "test",
+                    sink: "test",
+                    channel_id: None,
                     msg_id: "test",
                     port: &tokio::sync::mpsc::channel(1).0,
                 },

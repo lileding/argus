@@ -1,3 +1,4 @@
+mod channels;
 mod conversation;
 pub(crate) mod crons;
 mod documents;
@@ -37,6 +38,8 @@ pub(crate) struct Database {
     pub(crate) memories: memories::Memories,
     pub(crate) traces: traces::Traces,
     pub(crate) crons: crons::Crons,
+    #[allow(dead_code)]
+    pub(crate) channels: channels::Channels,
 }
 
 impl Database {
@@ -70,7 +73,8 @@ impl Database {
             documents: documents::Documents::new(pool.clone()),
             memories: memories::Memories::new(pool.clone()),
             traces: traces::Traces::new(pool.clone()),
-            crons: crons::Crons::new(pool),
+            crons: crons::Crons::new(pool.clone()),
+            channels: channels::Channels::new(pool),
         })
     }
 }
@@ -153,5 +157,9 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "008_crons.sql",
         include_str!("../../migrations/008_crons.sql"),
+    ),
+    (
+        "009_channels.sql",
+        include_str!("../../migrations/009_channels.sql"),
     ),
 ];

@@ -51,7 +51,7 @@ impl<'a> Tool for Remember<'a> {
         })
     }
 
-    async fn execute(&self, _ctx: &super::ToolContext<'_>, args: &str) -> String {
+    async fn execute(&self, ctx: &super::ToolContext<'_>, args: &str) -> String {
         let parsed: Args = match serde_json::from_str(args) {
             Ok(a) => a,
             Err(e) => return format!("error: invalid arguments: {e}"),
@@ -70,7 +70,7 @@ impl<'a> Tool for Remember<'a> {
         match self
             .db
             .memories
-            .save(&parsed.category, &parsed.content)
+            .save(&parsed.category, &parsed.content, ctx.channel_id)
             .await
         {
             Ok(id) => format!(

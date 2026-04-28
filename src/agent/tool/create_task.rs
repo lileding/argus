@@ -60,7 +60,8 @@ impl Tool for CreateTask<'_> {
         let spec = TaskSpec {
             id,
             goal: goal.clone(),
-            channel: ctx.channel.to_string(),
+            sink: ctx.sink.to_string(),
+            channel_id: ctx.channel_id,
             msg_id: ctx.msg_id.to_string(),
             port: ctx.port.clone(),
             source: TaskSource::User,

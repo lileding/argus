@@ -49,7 +49,7 @@ impl Tool for CancelCron<'_> {
             Ok(a) => a,
             Err(e) => return format!("error: invalid arguments: {e}"),
         };
-        match self.db.crons.cancel(parsed.id, ctx.channel).await {
+        match self.db.crons.cancel(parsed.id, ctx.channel_id).await {
             Ok(true) => format!("Cron #{} cancelled.", parsed.id),
             Ok(false) => format!("error: Cron #{} not found in this chat", parsed.id),
             Err(e) => format!("error: {e}"),

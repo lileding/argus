@@ -4,7 +4,10 @@ use sqlx::{PgPool, Row};
 
 /// Parameters for saving a new inbound message.
 pub(crate) struct InboundMessage<'a> {
-    pub(crate) channel: &'a str,
+    /// Originating sink (IM endpoint string, e.g. "feishu:p2p:ou_xxx").
+    pub(crate) sink: &'a str,
+    /// Channel ID for tenant isolation. None = default channel.
+    pub(crate) channel_id: Option<i64>,
     pub(crate) content: &'a str,
     pub(crate) msg_type: &'a str,
     pub(crate) sender_id: &'a str,
@@ -27,11 +30,12 @@ impl Messages {
     pub(crate) async fn save_received(&self, msg: &InboundMessage<'_>) -> super::DbResult<i64> {
         let row = sqlx::query(
             "INSERT INTO messages \
-                (channel, content, msg_type, sender_id, trigger_msg_id, source_ts, ready) \
-             VALUES ($1, $2, $3, $4, $5, $6, FALSE) \
+                (sink, channel_id, content, msg_type, sender_id, trigger_msg_id, source_ts, ready) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE) \
              RETURNING id",
         )
-        .bind(msg.channel)
+        .bind(msg.sink)
+        .bind(msg.channel_id)
         .bind(msg.content)
         .bind(msg.msg_type)
         .bind(msg.sender_id)
@@ -102,7 +106,7 @@ impl Messages {
         // typically completes well within 5 minutes; reply_id is set by
         // Gateway only after successful card delivery).
         let rows = sqlx::query(
-            "SELECT id, channel, trigger_msg_id, msg_type, content, ready \
+            "SELECT id, sink, channel_id, trigger_msg_id, msg_type, content, ready \
              FROM messages \
              WHERE reply_id IS NULL \
                AND trigger_msg_id IS NOT NULL \
@@ -118,7 +122,8 @@ impl Messages {
             .iter()
             .map(|r| UnrepliedMessage {
                 db_msg_id: r.get("id"),
-                channel: r.get("channel"),
+                sink: r.get("sink"),
+                channel_id: r.get("channel_id"),
                 trigger_msg_id: r
                     .get::<Option<String>, _>("trigger_msg_id")
                     .unwrap_or_default(),
@@ -133,7 +138,8 @@ impl Messages {
 /// A message that needs recovery (no reply yet).
 pub(crate) struct UnrepliedMessage {
     pub(crate) db_msg_id: i64,
-    pub(crate) channel: String,
+    pub(crate) sink: String,
+    pub(crate) channel_id: Option<i64>,
     pub(crate) trigger_msg_id: String,
     pub(crate) msg_type: String,
     pub(crate) content: String,

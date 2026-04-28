@@ -17,12 +17,19 @@ impl Memories {
         Self { pool }
     }
 
-    /// List all active memories (for prompt injection).
-    pub(crate) async fn list_active(&self) -> super::DbResult<Vec<Memory>> {
+    /// List all active memories for a channel (for prompt injection).
+    /// `channel_id = None` lists default-channel memories.
+    pub(crate) async fn list_active(
+        &self,
+        channel_id: Option<i64>,
+    ) -> super::DbResult<Vec<Memory>> {
         let rows = sqlx::query(
             "SELECT category, content FROM memories \
-             WHERE active = TRUE ORDER BY created_at",
+             WHERE active = TRUE \
+               AND channel_id IS NOT DISTINCT FROM $1 \
+             ORDER BY created_at",
         )
+        .bind(channel_id)
         .fetch_all(&self.pool)
         .await?;
 
@@ -53,25 +60,41 @@ impl Memories {
     }
 
     /// Save a new pinned memory. Returns the memory ID.
-    pub(crate) async fn save(&self, category: &str, content: &str) -> super::DbResult<i64> {
+    pub(crate) async fn save(
+        &self,
+        category: &str,
+        content: &str,
+        channel_id: Option<i64>,
+    ) -> super::DbResult<i64> {
         let row = sqlx::query(
-            "INSERT INTO memories (category, content, active) \
-             VALUES ($1, $2, TRUE) RETURNING id",
+            "INSERT INTO memories (category, content, channel_id, active) \
+             VALUES ($1, $2, $3, TRUE) RETURNING id",
         )
         .bind(category)
         .bind(content)
+        .bind(channel_id)
         .fetch_one(&self.pool)
         .await?;
         Ok(row.get("id"))
     }
 
-    /// Deactivate a memory by ID. Returns true if a memory was actually deactivated.
-    pub(crate) async fn deactivate(&self, id: i64) -> super::DbResult<bool> {
-        let result =
-            sqlx::query("UPDATE memories SET active = FALSE WHERE id = $1 AND active = TRUE")
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
+    /// Deactivate a memory by ID, scoped to the given channel.
+    /// Returns true if a memory was actually deactivated.
+    pub(crate) async fn deactivate(
+        &self,
+        id: i64,
+        channel_id: Option<i64>,
+    ) -> super::DbResult<bool> {
+        let result = sqlx::query(
+            "UPDATE memories SET active = FALSE \
+             WHERE id = $1 \
+               AND channel_id IS NOT DISTINCT FROM $2 \
+               AND active = TRUE",
+        )
+        .bind(id)
+        .bind(channel_id)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected() > 0)
     }
 
