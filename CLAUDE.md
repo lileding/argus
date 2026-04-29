@@ -2,25 +2,13 @@
 
 ## Pre-commit Review Workflow
 
-Every `git commit` must go through a codex review cycle:
-
-1. **Before committing**, spawn a `codex` CLI Agent to review the staged diff. The review prompt must include:
-   - Read all changed files
-   - Check against DESIGN.md architectural requirements
-   - Check against the Design Principles below (mandatory)
-   - Look for: correctness, race conditions, error handling, Rust idiom, test coverage
-   - Format as: 主要问题 (numbered, with file:line) / 次要问题 / 已做好的点
-
-2. **Show the review to the user** — paste the full review output.
-
-3. **Fix issues** the user agrees should be fixed. Iterate:
+1. **Fix issues** the user agrees should be fixed. Iterate:
    - Fix → re-run `cargo fmt && cargo clippy --workspace -- -D warnings && cargo test --workspace`
-   - If needed, re-review with codex
    - Repeat until review passes or remaining issues are explicitly deferred
 
-4. **Then ask to confirm commit**.
+2. **Then ask to confirm commit**.
 
-## Design Principles (STRICT — codex must enforce)
+## Design Principles
 
 ### Read DESIGN.md
 
