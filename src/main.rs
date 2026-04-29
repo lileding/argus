@@ -76,7 +76,7 @@ async fn main() -> Result<(), AppError> {
         &embedder,
         &config.workspace_dir,
         &next_task_id,
-    )?;
+    );
     let gateway = Gateway::new(
         &config.gateway,
         agent.port(),
@@ -85,7 +85,12 @@ async fn main() -> Result<(), AppError> {
         &config.workspace_dir,
     );
     let recovery = Recovery::new(&db, &gateway);
-    let scheduler = Scheduler::new(&db, agent.task_port(), &gateway, &next_task_id);
+    let scheduler = Scheduler::new(
+        &db,
+        agent.task_port(),
+        gateway.outbound_port(),
+        &next_task_id,
+    );
 
     let cancel = CancellationToken::new();
 

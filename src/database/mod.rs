@@ -38,7 +38,6 @@ pub(crate) struct Database {
     pub(crate) memories: memories::Memories,
     pub(crate) traces: traces::Traces,
     pub(crate) crons: crons::Crons,
-    #[allow(dead_code)]
     pub(crate) channels: channels::Channels,
 }
 

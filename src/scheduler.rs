@@ -14,16 +14,16 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::agent::{TaskSource, TaskSpec};
+use crate::agent::{Notification, TaskSource, TaskSpec};
 use crate::database::Database;
-use crate::gateway::Gateway;
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(60);
 
 pub(crate) struct Scheduler<'a> {
     db: &'a Database,
     task_tx: mpsc::Sender<TaskSpec>,
-    gateway: &'a Gateway<'a>,
+    /// Single outbound port — Gateway dispatches by Notification.sink internally.
+    outbound_tx: mpsc::Sender<Notification>,
     next_task_id: &'a AtomicU32,
 }
 
@@ -31,13 +31,13 @@ impl<'a> Scheduler<'a> {
     pub(crate) fn new(
         db: &'a Database,
         task_tx: mpsc::Sender<TaskSpec>,
-        gateway: &'a Gateway<'a>,
+        outbound_tx: mpsc::Sender<Notification>,
         next_task_id: &'a AtomicU32,
     ) -> Self {
         Self {
             db,
             task_tx,
-            gateway,
+            outbound_tx,
             next_task_id,
         }
     }
@@ -110,19 +110,8 @@ impl<'a> Scheduler<'a> {
                 continue; // not due yet
             }
 
-            // Due — fire it.
-            let port = match self.gateway.outbound_port(&cron.sink) {
-                Some(p) => p,
-                None => {
-                    warn!(
-                        cron_id = cron.id,
-                        sink = cron.sink,
-                        "no outbound port for sink, skipping"
-                    );
-                    continue;
-                }
-            };
-
+            // Due — fire it. Sink-existence checks happen inside the Gateway
+            // dispatcher when the notification is later produced.
             let task_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
             let spec = TaskSpec {
                 id: task_id,
@@ -130,7 +119,7 @@ impl<'a> Scheduler<'a> {
                 sink: cron.sink.clone(),
                 channel_id: cron.channel_id,
                 msg_id: cron.msg_id.clone(),
-                port,
+                port: self.outbound_tx.clone(),
                 source: TaskSource::Cron { cron_id: cron.id },
             };
 

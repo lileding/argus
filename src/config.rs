@@ -121,6 +121,11 @@ pub(crate) struct AgentConfig {
     pub(crate) orchestrator: RoleConfig,
     #[serde(default)]
     pub(crate) synthesizer: RoleConfig,
+    /// Named channel routes. Each key is the channel name; sinks listed under
+    /// it map to that channel. Sinks not listed in any route fall back to the
+    /// implicit default channel (channel_id = NULL).
+    #[serde(default)]
+    pub(crate) routes: HashMap<String, RouteConfig>,
 }
 
 impl Default for AgentConfig {
@@ -131,8 +136,15 @@ impl Default for AgentConfig {
             orchestrator_context_window: default_context_window(),
             orchestrator: RoleConfig::default(),
             synthesizer: RoleConfig::default(),
+            routes: HashMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub(crate) struct RouteConfig {
+    #[serde(default)]
+    pub(crate) sinks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

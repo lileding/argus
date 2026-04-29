@@ -25,8 +25,13 @@ struct MediaWork {
 pub(super) struct Feishu<'a> {
     task_tx: mpsc::Sender<Message>,
     db: &'a Database,
-    tx: mpsc::Sender<Notification>,
-    rx: Mutex<mpsc::Receiver<Notification>>,
+    /// Outbound port shared across the Gateway. Stamped onto every Message
+    /// (and TaskSpec) so the Agent can reply without knowing the IM topology.
+    outbound_tx: mpsc::Sender<Notification>,
+    /// Internal queue: the Gateway dispatcher pushes notifications destined
+    /// for this IM in here; `run()` consumes them inside its select loop.
+    inbox_tx: mpsc::Sender<Notification>,
+    inbox_rx: Mutex<mpsc::Receiver<Notification>>,
     feishu_client: feishu::Client,
     workspace_dir: PathBuf,
     transcriber: Option<super::transcribe::TranscribeClient>,
@@ -39,13 +44,14 @@ pub(super) struct Feishu<'a> {
 impl<'a> Feishu<'a> {
     pub(super) fn new(
         task_tx: mpsc::Sender<Message>,
+        outbound_tx: mpsc::Sender<Notification>,
         db: &'a Database,
         cfg: &GatewayImConfig,
         workspace_dir: &Path,
         transcriber: Option<super::transcribe::TranscribeClient>,
         recover_rx: mpsc::Receiver<crate::database::messages::UnrepliedMessage>,
     ) -> Self {
-        let (tx, rx) = mpsc::channel(64);
+        let (inbox_tx, inbox_rx) = mpsc::channel(64);
 
         // Ensure media directory exists.
         let media_dir = workspace_dir.join(MEDIA_DIR);
@@ -62,8 +68,9 @@ impl<'a> Feishu<'a> {
         Feishu {
             task_tx,
             db,
-            tx,
-            rx: Mutex::new(rx),
+            outbound_tx,
+            inbox_tx,
+            inbox_rx: Mutex::new(inbox_rx),
             feishu_client,
             workspace_dir: workspace_dir.to_path_buf(),
             transcriber,
@@ -76,7 +83,7 @@ impl<'a> Feishu<'a> {
     pub(super) async fn run(&self, cancel: &CancellationToken) {
         info!("feishu frontend started");
 
-        let mut rx = self.rx.lock().await;
+        let mut rx = self.inbox_rx.lock().await;
         let mut recover_rx = self.recover_rx.lock().await;
         let api = self.feishu_client.api();
         // All async work (media download + outbound render) goes into one
@@ -193,7 +200,7 @@ impl<'a> Feishu<'a> {
             channel_id: msg.channel_id,
             db_msg_id: Some(msg.db_msg_id),
             ready: ready_rx,
-            port: self.tx.clone(),
+            port: self.outbound_tx.clone(),
         };
         if let Err(e) = self.task_tx.send(agent_msg).await {
             warn!(db_msg_id = msg.db_msg_id, error = %e, "recovery submit failed");
@@ -329,8 +336,9 @@ impl<'a> Feishu<'a> {
         } else {
             format!("feishu:group:{chat_id}")
         };
-        // Channel mapping is not yet implemented; everything goes to the
-        // default channel (NULL channel_id).
+        // Gateway does not know about channels — only sinks. The Agent
+        // dispatcher stamps the routed channel_id and it is backfilled into
+        // this row by `save_notification` (atomic with reply_id).
         let channel_id: Option<i64> = None;
         let db_msg_id = match self
             .db
@@ -364,7 +372,7 @@ impl<'a> Feishu<'a> {
             channel_id,
             db_msg_id,
             ready: ready_rx,
-            port: self.tx.clone(),
+            port: self.outbound_tx.clone(),
         };
         if let Err(e) = self.task_tx.send(agent_msg).await {
             warn!(msg_id, chat_id, error = %e, "submit message failed");
@@ -709,7 +717,7 @@ impl<'a> Feishu<'a> {
             && let Err(e) = self
                 .db
                 .notifications
-                .save_notification(notif.db_msg_id, text)
+                .save_notification(notif.db_msg_id, notif.channel_id, text)
                 .await
         {
             warn!(msg_id = %notif.msg_id, error = %e, "save_notification failed");
@@ -725,8 +733,8 @@ impl super::Im for Feishu<'_> {
         Feishu::run(self, cancel).await;
     }
 
-    fn outbound_port(&self) -> mpsc::Sender<Notification> {
-        self.tx.clone()
+    fn notification_tx(&self) -> &mpsc::Sender<Notification> {
+        &self.inbox_tx
     }
 }
 

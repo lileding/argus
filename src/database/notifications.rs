@@ -12,11 +12,12 @@ impl Notifications {
     }
 
     /// Save a notification and link it to the originating message (if any).
-    /// Uses a transaction: INSERT notification → UPDATE messages.reply_id.
-    /// Returns the notification ID.
+    /// Uses a transaction: INSERT notification → UPDATE messages (reply_id +
+    /// channel_id backfill in the same statement). Returns the notification ID.
     pub(crate) async fn save_notification(
         &self,
         message_id: Option<i64>,
+        channel_id: Option<i64>,
         content: &str,
     ) -> super::DbResult<i64> {
         let mut tx = self.pool.begin().await?;
@@ -34,8 +35,9 @@ impl Notifications {
         let notif_id: i64 = row.get("id");
 
         if let Some(msg_id) = message_id {
-            sqlx::query("UPDATE messages SET reply_id = $1 WHERE id = $2")
+            sqlx::query("UPDATE messages SET reply_id = $1, channel_id = $2 WHERE id = $3")
                 .bind(notif_id)
+                .bind(channel_id)
                 .bind(msg_id)
                 .execute(&mut *tx)
                 .await?;
