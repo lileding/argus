@@ -27,8 +27,8 @@ Five peer services driven by `tokio::join!`:
 
 | Service | Role |
 |---|---|
-| **Gateway** | IM adapters (Feishu); WS inbound, media, card rendering |
-| **Agent** | `sync_message_loop` (sequential) + `async_task_loop` (parallel) via `join!` |
+| **Gateway** | IM adapters (Feishu); WS inbound, media, card rendering. Single outbound MPSC; an internal dispatcher routes each `Notification` to the matching IM by `sink` prefix |
+| **Agent** | Top-level dispatcher routes each inbound message (by `sink`) and each task (by `channel_id`) to a per-channel `Processor`. Each Processor runs `sync_message_loop` (sequential) + `async_task_loop` (parallel) via `join!` |
 | **Embedder** | Background: embeds rows, summarizes long replies, ingests docs |
 | **Recovery** | Replays unreplied messages on restart and every 5 min |
 | **Scheduler** | Scans `crons` every 60s, fires due jobs into the Agent |

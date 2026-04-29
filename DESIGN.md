@@ -33,13 +33,18 @@ Argus is structured as three layers with strict import boundaries:
 ```
 ┌────────────────────────────────┐
 │  Gateway                       │  IM adapters, media processing,
-│  (Feishu; future Slack)        │  card rendering
+│  (Feishu; future Slack)        │  card rendering. Single outbound
+│                                │  MPSC; internal dispatcher routes
+│                                │  Notifications by sink prefix.
 └────────────────────────────────┘
-              │  Task → mpsc
-              ▼
+        Message │ ▲ Notification
+                ▼ │
 ┌────────────────────────────────┐
-│  Agent                         │  task scheduler, two-phase execution,
-│  (orchestrator + synthesizer)  │  trace persistence
+│  Agent                         │  Top-level dispatcher routes by
+│  (dispatcher + per-channel     │  sink (Message) or channel_id
+│   Processors)                  │  (TaskSpec) to a per-channel
+│                                │  Processor running orchestrator +
+│                                │  synthesizer.
 └────────────────────────────────┘
               │  uses
               ▼
@@ -51,9 +56,11 @@ Argus is structured as three layers with strict import boundaries:
 ```
 
 Import direction is **Gateway → Agent → Upstream**, never reversed.
-The Agent does not `use` any Gateway type; each `Task` carries its own
-`mpsc::Sender<Message>` port, so reply events route themselves back
-to the originating IM adapter.
+The Agent does not `use` any Gateway type; each `Message` carries its
+own `mpsc::Sender<Notification>` port (cloned from the Gateway's single
+outbound MPSC), so the Agent emits replies without knowing which IM is
+on the other end. The Gateway dispatches each `Notification` to the
+right IM by parsing the `sink` prefix (e.g. `feishu:p2p:ou_xxx`).
 
 ### Five Peer Services
 
@@ -84,21 +91,32 @@ tokio::join!(
 
 | Service | Responsibility |
 |---------|---------------|
-| **Gateway** | Manages all IM adapters. Each adapter runs its own `select!` loop: WS inbound, outbound rendering, media processing, recovery replay — all in a single `FuturesUnordered` pool |
-| **Agent** | Two sub-loops via `join!`: `sync_message_loop` processes messages sequentially; `async_task_loop` drives background tasks in `FuturesUnordered` |
+| **Gateway** | Manages all IM adapters. Each adapter runs its own `select!` loop: WS inbound, card rendering, media processing, recovery replay — all in a single `FuturesUnordered` pool. Owns one outbound MPSC; an internal dispatcher reads it and forwards each `Notification` to the matching IM by `sink` prefix |
+| **Agent** | Top-level dispatcher + per-channel Processors. The dispatcher stamps `channel_id` from the live routing table (`sink` → channel_id) and forwards each Message/TaskSpec to the right Processor (or the built-in default). Each Processor runs two sub-loops via `join!`: `sync_message_loop` (sequential) and `async_task_loop` (`FuturesUnordered`) |
 | **Embedder** | Background worker: embeds unembedded rows (messages, notifications, memories, chunks), summarizes long assistant replies, ingests queued documents |
 | **Recovery** | Scans for unreplied messages at startup and every 5 minutes (only those older than 5 min, to avoid racing with active processing); replays them through the Gateway |
-| **Scheduler** | Scans persistent crons every 60 seconds; due jobs are submitted to the Agent's async task path with `TaskSource::Cron` |
+| **Scheduler** | Scans persistent crons every 60 seconds; due jobs are submitted to the Agent's async task path with `TaskSource::Cron`. Sends through the Gateway's single outbound port — channel routing happens inside the Agent dispatcher |
 
 ### Message, Notification, Event
+
+Two type aliases pin down the routing vocabulary:
+
+```rust
+/// Channel id (DB row in `channels`). `None` = the implicit default channel.
+pub(crate) type Channel = i64;
+
+/// IM endpoint string, e.g. `feishu:p2p:ou_xxx`, `feishu:group:oc_xxx`.
+pub(crate) type Sink = String;
+```
 
 ```rust
 pub(crate) struct Message {               // Gateway → Agent (inbound)
     pub(crate) msg_id: String,
-    pub(crate) channel: String,           // e.g. "feishu:p2p:ou_xxx"
+    pub(crate) sink: Sink,                // routing source of truth
+    pub(crate) channel_id: Option<Channel>, // stamped by Agent dispatcher
     pub(crate) db_msg_id: Option<i64>,
     pub(crate) ready: oneshot::Receiver<Payload>,
-    pub(crate) port: mpsc::Sender<Notification>,
+    pub(crate) port: mpsc::Sender<Notification>,  // = Gateway outbound
 }
 
 pub(crate) struct Payload {
@@ -107,7 +125,10 @@ pub(crate) struct Payload {
 }
 
 pub(crate) struct Notification {          // Agent → Gateway (outbound)
+    pub(crate) sink: Sink,                // Gateway dispatches by prefix
     pub(crate) msg_id: String,
+    pub(crate) db_msg_id: Option<i64>,
+    pub(crate) channel_id: Option<Channel>,  // backfilled into messages row
     pub(crate) events: mpsc::Receiver<Event>,
 }
 
@@ -123,30 +144,82 @@ no DB round-trip between Gateway and Agent after media is ready.
 Dropping the `events` sender is the sole "this notification is done"
 signal; no explicit `close()` method.
 
+`Notification.channel_id` is set by the Processor (which knows its own
+channel) and is used by `save_notification` to atomically backfill
+`messages.channel_id` in the same transaction as `reply_id`. The
+Gateway never reasons about channels — it only sees `sink`.
+
+### Channels and Routing
+
+A **channel** is the tenant unit: a logical conversation context that
+owns its own history, memory, and cron schedule. **Sinks** are IM
+endpoints (DM / group); sinks map many-to-one to channels. NULL
+`channel_id` is the implicit default channel — always available, no
+configuration needed.
+
+Channels are declared in TOML:
+
+```toml
+[agent.routes.darkness]
+sinks = ["feishu:p2p:ou_xxx", "feishu:group:oc_yyy"]
+```
+
+On startup, `Agent::run` upserts each route into the `channels` table
+and builds the live routing table. Sinks listed in TOML are routed to
+the corresponding `Processor`; everything else falls through to the
+built-in default Processor.
+
+Two routing rules, by intent:
+
+- **Inbound `Message` routes by `sink`.** History identity is stamped
+  at write time and never rewritten. The dispatcher looks up
+  `routes[msg.sink]`, stamps `msg.channel_id`, and forwards to the
+  matching Processor. If a sink moves between channels later, old rows
+  retain the channel they were originally written into.
+
+- **`TaskSpec` routes by `channel_id`.** A cron created in channel #5
+  always fires in channel #5, even if its origin sink later migrates
+  to a different channel. The cron is scheduled against history
+  integrity, not the current routing table.
+
 ### Per-Message Lifecycle
 
 ```
-Gateway inbound (select! loop)        Agent sync_message_loop
-──────────────────────────────        ──────────────────────────
-WS event arrives                      msg ← mpsc::recv
-  dedup by message_id                 notif := Notification { events }
-  INSERT raw message (ready=false)    msg.port.send(notif)
-  Message{ready_rx} constructed       payload := msg.ready.await
-  msg_tx.send(msg)                    execute(payload, events_tx)
-  → returns MediaWork                 drop(events_tx)
+Gateway inbound (select! loop)   Agent dispatcher       Processor.sync_loop
+──────────────────────────────   ────────────────────   ──────────────────────
+WS event arrives                 msg ← agent_rx          msg ← proc_rx
+  dedup by message_id            cid := routes[sink]     notif = Notification {
+  INSERT raw message             msg.channel_id = cid      sink, channel_id, events
+   (ready=false, channel_id=     proc := processors        }
+    NULL — backfilled later)        .get(cid)             msg.port.send(notif)
+  Message{ ready_rx,                .unwrap_or(default)   payload := ready.await
+           sink,                  proc.tx.send(msg)       execute(payload, events_tx)
+           port=outbound_tx                               drop(events_tx)
+         }
+  agent_tx.send(msg)
+  → returns MediaWork
 
-FuturesUnordered                      Gateway render (same select!)
-────────────────                      ──────────────────────────────
-download bytes → DB(ready=true)       notif ← outbound mpsc
-process → ready_tx.send(payload)      reply_message → thinking card
-                                      for event in notif.events:
-                                          update_message(card)
-                                      finalize card
+FuturesUnordered                 Gateway dispatcher      Gateway render (IM)
+────────────────                 ────────────────────    ──────────────────────────
+download bytes → DB(ready=true)  notif ← outbound_rx     notif ← im.inbox
+process → ready_tx.send(payload) im_name :=              reply_message → card
+                                   sink_prefix(sink)     for event in notif.events:
+                                 ims[im_name]                update_message
+                                   .inbox.send(notif)    save_notification(
+                                                           db_msg_id, channel_id,
+                                                           text)  ← atomic with
+                                                           reply_id, backfills
+                                                           channel_id on the row
 ```
 
-Agent calls `port.send(notif)` **before** waiting on `ready` — this
-preserves the "thinking card appears instantly, even while audio is
-transcribing" UX.
+The Agent's Processor calls `port.send(notif)` **before** waiting on
+`ready` — this preserves the "thinking card appears instantly, even
+while audio is transcribing" UX.
+
+`messages.channel_id` is initially written as NULL (the Gateway does
+not know about channels). It is backfilled atomically with `reply_id`
+when `save_notification` runs, using the `channel_id` field that
+travelled on the `Notification`.
 
 ### Content State Machine
 
@@ -181,9 +254,10 @@ from the last 24 hours.
 ```
 On startup:
   1. Recovery.scan() queries messages with no reply
-  2. For each row: route by channel prefix (e.g. "feishu:..." → feishu IM)
+  2. For each row: route by sink prefix (e.g. "feishu:..." → feishu IM)
   3. Gateway.replay(msg) sends through the IM's recover channel
   4. IM adapter receives, reprocesses if needed, constructs Message → agent
+     (Agent dispatcher then stamps channel_id from the live routing table)
 ```
 
 Recovery handles the state combinations:
@@ -210,21 +284,26 @@ how to exit based on its own semantics:
 ```
 cancel.cancel()
     │
-    ├── Gateway (each IM adapter):
-    │     drain outbound queue, drain in-flight FuturesUnordered, return
-    ├── Agent (two sub-loops via join!):
-    │     sync_message_loop: current message completes naturally, then return
-    │     async_task_loop: break immediately, drop in-flight tasks, return
+    ├── Gateway:
+    │     dispatcher drains outbound queue (500ms), exits.
+    │     Each IM adapter drains its FuturesUnordered (media + render).
+    ├── Agent:
+    │     dispatcher loops exit immediately (no new fan-out).
+    │     Each Processor (per channel + default) runs its own join!:
+    │       sync_message_loop: current message finishes, then return
+    │       async_task_loop:   break, drop in-flight tasks, return
     ├── Embedder:
     │     break interval loop, return
+    ├── Scheduler:
+    │     break scan loop, return
     └── Recovery:
           break scan loop, return
 ```
 
 Gateway `select!` on cancel: drains remaining outbound messages with a
 500ms timeout, then drains all in-flight futures (media + render).
-Agent `sync_message_loop` completes whatever message is currently
-mid-execution — no new messages are pulled. `async_task_loop` exits
+Agent's per-channel Processors complete whatever message is currently
+mid-execution — no new messages are pulled. The async loop exits
 immediately; in-flight async tasks are dropped (no persistence, no
 retry in v1).
 
@@ -258,7 +337,8 @@ messages.
 
 #### Concurrency Model
 
-`Agent::run()` uses `tokio::join!` to run two sub-loops as peers:
+Each `Processor` (one per channel, plus the built-in default) uses
+`tokio::join!` to run two sub-loops as peers:
 
 ```rust
 async fn run(&self, cancel: &CancellationToken) {
@@ -270,16 +350,20 @@ async fn run(&self, cancel: &CancellationToken) {
 ```
 
 - **`sync_message_loop`**: sequential message processing. Pops from
-  `msg_rx`, runs orchestrator → synthesizer, one at a time. On cancel,
-  finishes the current message then returns.
+  the Processor's `msg_rx`, runs orchestrator → synthesizer, one at a
+  time. On cancel, finishes the current message then returns.
 - **`async_task_loop`**: drives a `FuturesUnordered` pool of background
-  tasks. Pops `TaskSpec` from `task_rx`, pushes `run_task` futures into
-  the pool. On cancel, returns immediately (drops in-flight tasks).
+  tasks. Pops `TaskSpec` from the Processor's `task_rx`, pushes
+  `run_task` futures into the pool. On cancel, returns immediately
+  (drops in-flight tasks).
 
 Both loops yield at `.await` points. `join!` polls them cooperatively
 within a single tokio task — when `sync_message_loop` awaits an HTTP
 response, `join!` polls `async_task_loop`, which drives background
-tasks forward. No `Arc`, no `tokio::spawn`.
+tasks forward. The top-level `Agent::run` joins all Processors plus
+the two dispatcher loops. No `Arc<Mutex>`, no `tokio::spawn` (the
+`Arc<Processor>` aliasing comes from sinks-many-to-one-channel sharing,
+not from spawning).
 
 #### Trigger: `create_task` Tool
 
@@ -315,9 +399,11 @@ cycle, reusing the same model clients and tool set:
 TaskSpec {
     id: u32,                          // #35
     goal: String,                     // "Research Google TPU..."
-    channel: String,                  // "feishu:p2p:ou_xxx"
+    sink: Sink,                       // "feishu:p2p:ou_xxx" — return path
+    channel_id: Option<Channel>,      // selects the Processor that runs it
     msg_id: String,                   // original trigger message
-    port: mpsc::Sender<Notification>, // for completion notification
+    port: mpsc::Sender<Notification>, // Gateway outbound port
+    source: TaskSource,               // User | Cron { cron_id }
 }
 ```
 
@@ -361,8 +447,9 @@ User: "每天上午九点告诉我当日天气"
 → "Cron #4 created"
 ```
 
-The cron is persisted in the `crons` table with `channel`, `msg_id`
-(for reply routing), `enabled`, `last_run_at`, `created_at`.
+The cron is persisted in the `crons` table with `sink` and
+`channel_id` (the Processor that should run it), `msg_id` (for reply
+threading), `enabled`, `last_run_at`, `created_at`.
 
 #### Scheduler Service
 
@@ -372,8 +459,11 @@ The cron is persisted in the `crons` table with `channel`, `msg_id`
   the next firing time after `last_run_at` (or `created_at` for new
   crons — never `epoch`, to avoid backfilling past matches)
 - If `next <= now`: builds a `TaskSpec` with `source: TaskSource::Cron`,
-  routes through `Gateway::outbound_port(channel)` to find the right
-  IM adapter, submits to the Agent's `task_tx`, updates `last_run_at`
+  populates `sink` + `channel_id` from the cron row, attaches the
+  Gateway's single outbound port, submits to the Agent's `task_tx`,
+  updates `last_run_at`. The Agent dispatcher routes to the matching
+  Processor (or default if `channel_id` is NULL); the Processor's
+  Notification is later routed to the IM by the Gateway dispatcher
 - No catch-up: missed firings during downtime are dropped, only the
   next scheduled time triggers
 
@@ -998,14 +1088,24 @@ and is retried next cycle.
 
 ## Data Model (PostgreSQL + pgvector)
 
-After all migrations (001–007), the schema has evolved to separate user
-messages from agent replies:
+After all migrations (001–009), the schema separates user messages
+from agent replies and scopes everything by channel:
 
 ```sql
+-- Channels (migration 009): the tenant unit. NULL channel_id elsewhere
+-- = the implicit default channel (no row needed).
+CREATE TABLE channels (
+    id    BIGSERIAL PRIMARY KEY,
+    name  TEXT NOT NULL UNIQUE,
+    sinks JSONB NOT NULL DEFAULT '[]'   -- TOML-declared sinks (record-only;
+                                        -- live routing reads in-memory map)
+);
+
 -- User messages (inbound only; assistant/tool rows deleted in migration 006)
 CREATE TABLE messages (
     id              BIGSERIAL PRIMARY KEY,
-    channel         TEXT NOT NULL DEFAULT '',   -- "feishu:p2p:ou_xxx" or "feishu:group:oc_xxx"
+    sink            TEXT NOT NULL DEFAULT '',   -- "feishu:p2p:ou_xxx" or "feishu:group:oc_xxx"
+    channel_id      BIGINT REFERENCES channels(id),  -- NULL = default channel; backfilled atomically with reply_id
     content         TEXT NOT NULL,              -- raw content (JSON for non-text types)
     msg_type        TEXT NOT NULL DEFAULT 'text',
     file_paths      TEXT[],
@@ -1030,7 +1130,7 @@ CREATE TABLE notifications (
 
 -- Conversation view: joins ready messages with their replies
 CREATE VIEW conversation AS
-SELECT m.id, m.channel, m.content AS user_content,
+SELECT m.id, m.channel_id, m.content AS user_content,
        m.embedding AS user_embedding, m.created_at AS user_ts,
        n.content AS reply_content, n.summary AS reply_summary,
        n.created_at AS reply_ts
@@ -1038,9 +1138,10 @@ FROM messages m
 LEFT JOIN notifications n ON n.id = m.reply_id
 WHERE m.ready = TRUE;
 
--- Agent-curated persistent memories
+-- Agent-curated persistent memories (channel-scoped after migration 009)
 CREATE TABLE memories (
     id         BIGSERIAL PRIMARY KEY,
+    channel_id BIGINT REFERENCES channels(id),  -- NULL = default channel
     content    TEXT NOT NULL,
     category   TEXT NOT NULL DEFAULT 'general',
     embedding  vector(768),
@@ -1054,7 +1155,7 @@ CREATE TABLE documents (
     id         BIGSERIAL PRIMARY KEY,
     filename   TEXT NOT NULL,
     file_path  TEXT NOT NULL,
-    channel    TEXT,
+    channel_id BIGINT REFERENCES channels(id),  -- NULL = default channel
     status     TEXT NOT NULL DEFAULT 'pending',  -- pending / processing / ready / error
     error_msg  TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -1069,12 +1170,12 @@ CREATE TABLE chunks (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Request tracing
+-- Request tracing (chat_id replaced by channel_id in migration 009)
 CREATE TABLE traces (
     id                       BIGSERIAL PRIMARY KEY,
     message_id               BIGINT NOT NULL,
     reply_id                 BIGINT,
-    chat_id                  TEXT NOT NULL,
+    channel_id               BIGINT REFERENCES channels(id),  -- NULL = default channel
     orchestrator_model       TEXT NOT NULL DEFAULT '',
     synthesizer_model        TEXT NOT NULL DEFAULT '',
     iterations               INT NOT NULL DEFAULT 0,
@@ -1101,19 +1202,20 @@ CREATE TABLE tool_calls (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Persistent cron jobs (migration 008)
+-- Persistent cron jobs (migration 008; channel split in 009)
 CREATE TABLE crons (
     id          BIGSERIAL PRIMARY KEY,
     cron_expr   TEXT NOT NULL,                   -- 6-field, system local TZ
     goal        TEXT NOT NULL,                   -- self-contained execution prompt
-    channel     TEXT NOT NULL,
+    sink        TEXT NOT NULL,                   -- IM endpoint for the completion notification
+    channel_id  BIGINT REFERENCES channels(id),  -- selects the Processor; NULL = default
     msg_id      TEXT NOT NULL,                   -- updated by update_cron
     enabled     BOOLEAN NOT NULL DEFAULT TRUE,   -- soft-delete via false
     last_run_at TIMESTAMPTZ,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE INDEX crons_enabled_channel_idx ON crons(enabled, channel);
+CREATE INDEX crons_enabled_channel_id_idx ON crons(enabled, channel_id);
 ```
 
 IVFFlat cosine indexes on all embedding columns. Agent-created business
@@ -1135,6 +1237,7 @@ pub(crate) struct Database {
     pub(crate) memories: Memories,
     pub(crate) traces: Traces,
     pub(crate) crons: Crons,
+    pub(crate) channels: Channels,
 }
 ```
 
@@ -1209,6 +1312,13 @@ upstream = "gemini"
 model_name = "gemini-2.5-flash-lite"
 max_tokens = 32768
 
+# Optional named channels. Each table key (e.g. "darkness") becomes a
+# channel name in the `channels` DB table; the listed sinks are routed
+# to that channel's Processor. Sinks not listed under any route fall
+# through to the implicit default channel.
+[agent.routes.darkness]
+sinks = ["feishu:p2p:ou_xxx"]
+
 [database]
 dsn = "postgres://argus:argus@localhost:5432/argus?sslmode=disable"
 
@@ -1245,9 +1355,12 @@ src/
   config.rs                  TOML config + tilde expansion + path resolution
   agent/
     mod.rs                   Message/Notification/Event/TaskSpec/TaskSource,
-                             Agent struct, sync_message_loop + async_task_loop
-                             (join!), run_orchestrator, run_synthesizer, run_task,
-                             prompts, tool budgets
+                             Channel/Sink type aliases, Agent struct (top-level
+                             dispatcher: routes Messages by sink, TaskSpecs by
+                             channel_id), prompts, tool budgets
+    processor.rs             Processor (per-channel): sync_message_loop +
+                             async_task_loop via join!, run_orchestrator,
+                             run_synthesizer, run_task
     harness.rs               Context curation: semantic recall + sliding window +
                              pinned memories
     skill.rs                 SkillIndex: load SKILL.md files at startup, catalog
@@ -1273,8 +1386,9 @@ src/
       cancel_cron.rs         Soft-delete cron (always available)
       update_cron.rs         Modify cron (always available)
   gateway/
-    mod.rs                   Gateway struct, Im trait (with outbound_port),
-                             recovery routing, channel→IM lookup for Scheduler
+    mod.rs                   Gateway struct, Im trait, single outbound MPSC,
+                             dispatcher that routes Notifications by sink prefix,
+                             recovery routing
     feishu.rs                Feishu adapter: WS inbound, media processing,
                              card rendering, recovery handler, .opus → .ogg rename
     transcribe.rs            Whisper transcription client (OpenAI-compatible)
@@ -1289,12 +1403,16 @@ src/
   database/
     mod.rs                   Database struct, migration runner, sub-objects
     messages.rs              Messages table (5-min recovery threshold in unreplied)
-    notifications.rs         Notifications table (agent replies)
+    notifications.rs         Notifications table (atomic save_notification:
+                             INSERT notif + UPDATE messages.reply_id +
+                             channel_id backfill in one transaction)
     conversation.rs          Conversation view queries (recall + recent)
     documents.rs             Documents + chunks tables
     memories.rs              Memories table
     traces.rs                Traces + tool_calls tables, TraceBuilder
     crons.rs                 Crons table CRUD (channel-scoped operations)
+    channels.rs              Channels table (upsert by name, list_all for
+                             startup reconciliation against TOML config)
   embedder/
     mod.rs                   Embedder service: embed/summarize/ingest cycles
     client.rs                Embedding HTTP client (OpenAI-compatible, with
@@ -1312,6 +1430,8 @@ migrations/
   006_reply_content.sql      Split messages → messages + notifications
   007_conversation_view.sql  conversation view
   008_crons.sql              crons table
+  009_channels.sql           channels table; messages/crons gain sink + channel_id;
+                             documents/traces/memories switch to channel_id
 ```
 
 ---
