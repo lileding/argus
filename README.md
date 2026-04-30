@@ -134,7 +134,7 @@ See [config.example.toml](config.example.toml).
 | `current_time` | Date/time with timezone |
 | `search` | Web search (Tavily, DuckDuckGo fallback) |
 | `fetch` | URL → readable text |
-| `read_file` / `write_file` | File I/O (write restricted to `.users/`) |
+| `read_file` / `write_file` | File I/O (write restricted to `user/`) |
 | `cli` | Shell commands on host |
 | `db` | Structured data (CLI+JSON, 7 verbs, no raw SQL) |
 | `remember` / `forget` | Pinned memories |

@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 /// Subdirectory under workspace for downloaded media files.
-pub(crate) const MEDIA_DIR: &str = ".files";
+pub(crate) const MEDIA_DIR: &str = "media";
 
 /// Subdirectory under workspace for user-created files (write_file tool).
-pub(crate) const USER_DIR: &str = ".users";
+pub(crate) const USER_DIR: &str = "user";
 
 /// Subdirectory under workspace for skill definitions.
 pub(crate) const SKILLS_DIR: &str = "skills";

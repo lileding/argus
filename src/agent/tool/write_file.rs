@@ -30,7 +30,7 @@ impl<'a> Tool for WriteFile<'a> {
     }
 
     fn description(&self) -> &str {
-        "Write content to a file. The file is always created under the .users/ directory in \
+        "Write content to a file. The file is always created under the user/ directory in \
          the workspace. Provide a relative path (e.g. \"notes/todo.txt\")."
     }
 
@@ -40,7 +40,7 @@ impl<'a> Tool for WriteFile<'a> {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "File path relative to the .users/ directory."
+                    "description": "File path relative to the user/ directory."
                 },
                 "content": {
                     "type": "string",
@@ -132,7 +132,7 @@ mod tests {
             result.starts_with("wrote"),
             "expected success, got: {result}"
         );
-        let written = std::fs::read_to_string(dir.path().join(".users/notes.txt")).unwrap();
+        let written = std::fs::read_to_string(dir.path().join("user/notes.txt")).unwrap();
         assert_eq!(written, "hello");
     }
 
@@ -155,7 +155,7 @@ mod tests {
             result.starts_with("wrote"),
             "expected success, got: {result}"
         );
-        let written = std::fs::read_to_string(dir.path().join(".users/sub/deep/file.txt")).unwrap();
+        let written = std::fs::read_to_string(dir.path().join("user/sub/deep/file.txt")).unwrap();
         assert_eq!(written, "nested");
     }
 
@@ -177,7 +177,7 @@ mod tests {
             )
             .await;
         assert!(result.starts_with("wrote"));
-        let written = std::fs::read_to_string(dir.path().join(".users/test.txt")).unwrap();
+        let written = std::fs::read_to_string(dir.path().join("user/test.txt")).unwrap();
         assert_eq!(written, content);
     }
 

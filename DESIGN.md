@@ -554,10 +554,10 @@ Argus handles all Feishu message types natively:
 | Message Type | Processing |
 |-------------|-----------|
 | **text** | Fast path: extract text from JSON, instant |
-| **image** | Download to `.files/` + save file_path |
+| **image** | Download to `media/` + save file_path |
 | **post** (rich text) | Extract text + download embedded images |
 | **audio** | Download `.opus` → Whisper transcription (OpenAI-compatible endpoint) |
-| **file** (PDF, docx, etc.) | Download to `.files/` → register for document RAG ingestion |
+| **file** (PDF, docx, etc.) | Download to `media/` → register for document RAG ingestion |
 
 Media processing runs as async futures inside the IM adapter's
 `FuturesUnordered` pool. The inbound path is fast: parse → dedup →
@@ -569,7 +569,7 @@ on task pop, then awaits `ready` until content is ready.
 ### Audio Pipeline
 
 ```
-Feishu audio → download → save .opus to .files/
+Feishu audio → download → save .opus to media/
     → rename .opus → .ogg for Whisper API (Feishu sends OGG-wrapped
        Opus but uses .opus extension; Whisper rejects .opus)
     → OpenAI Whisper API (/v1/audio/transcriptions, model: whisper-1)
@@ -929,7 +929,7 @@ them (via `activate_skill`), not create or modify them.
 | `search` | Web search (Tavily API, DuckDuckGo fallback) | 3/turn |
 | `fetch` | URL → readable text (HTML stripped via `scraper` crate) | 4/turn |
 | `read_file` | Read file contents (anywhere in workspace) | — |
-| `write_file` | Write file (restricted to `.users/` directory) | 3/turn |
+| `write_file` | Write file (restricted to `user/` directory) | 3/turn |
 | `cli` | Execute shell commands on host (`bash -c` or `sh -c`) | 5/turn |
 | `remember` | Pin a persistent memory (pgvector indexed) | 3/turn |
 | `forget` | Deactivate a pinned memory by ID | — |
@@ -968,9 +968,9 @@ not `Arc`).
 
 - `read_file`: can read anywhere in workspace. Binary files return a
   description instead of raw bytes.
-- `write_file`: **restricted to `.users/` directory**. The tool silently
-  prepends `.users/` to any path. The model cannot overwrite skills
-  (`.skills/`), media (`.files/`), or config files.
+- `write_file`: **restricted to `user/` directory**. The tool silently
+  prepends `user/` to any path. The model cannot overwrite skills
+  (`skills/`), media (`media/`), or config files.
 - `cli`: direct host execution (`bash -c`). No sandbox abstraction —
   runs on the host machine with no resource limits. Suitable for
   development on a personal Mac.
@@ -1034,10 +1034,10 @@ cap is 200. `query` without `sort` defaults to `created_at DESC`.
 
 ## Media Storage
 
-All downloaded media is saved to `{workspace_dir}/.files/`:
+All downloaded media is saved to `{workspace_dir}/media/`:
 
 ```
-workspace/.files/
+workspace/media/
   img_v3_xxx.png          # Feishu images
   file_v3_xxx.opus        # Voice messages
   file_v3_xxx.pdf         # Uploaded files → ingested into pgvector
@@ -1371,7 +1371,7 @@ src/
       search.rs              Web search (Tavily + DuckDuckGo fallback)
       fetch.rs               URL → readable text (HTML stripped via scraper)
       read_file.rs           Read file (workspace)
-      write_file.rs          Write file (.users/ only)
+      write_file.rs          Write file (user/ only)
       cli.rs                 Shell commands (host execution)
       db.rs                  Structured DB tool (7 verbs, typed casts)
       remember.rs            Pin a memory
