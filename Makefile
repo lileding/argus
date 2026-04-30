@@ -1,10 +1,10 @@
-.PHONY: rebuild run test check clean
+.PHONY: rebuild image test check clean
 
 all:
 	cargo build
 
-run:
-	RUST_LOG=info,argus=debug,feishu=debug cargo run -- --config ./workspace/config.toml
+image:
+	docker build -t argus:latest .
 
 test:
 	cargo test --workspace

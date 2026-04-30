@@ -58,4 +58,7 @@ api_key = ""
 # timeout_secs = 240
 
 [database]
-dsn = "postgres://argus:argus@localhost:5432/argus?sslmode=disable"
+# Inside the docker compose stack, "db" resolves to the postgres service.
+# When running argus on the host (e.g. `cargo run` for debugging), use
+# `localhost:5432` instead.
+dsn = "postgres://argus:argus@db:5432/argus?sslmode=disable"

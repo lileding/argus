@@ -41,8 +41,12 @@
 
 ```
 make check    # cargo fmt --check + cargo clippy + cargo test
-make run      # RUST_LOG + cargo run
+make image    # docker build -t argus:latest .
 ```
+
+argus runs in docker. The local test environment (compose, config,
+media, user, skills) lives in `workspace/` and is gitignored.
+Workflow: `make image` to rebuild, then `cd workspace && docker compose up -d argus`.
 
 ## Architecture
 

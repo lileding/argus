@@ -37,21 +37,71 @@ Strict three-layer import direction: **Gateway → Agent → Upstream**.
 
 ## Quick Start
 
+argus runs in docker. Build the image, then deploy alongside a
+PostgreSQL+pgvector container.
+
 ```bash
-# Prereqs: Rust toolchain (edition 2024), PostgreSQL with pgvector, Docker (for the DB)
+# Prereqs: Docker, Rust toolchain (edition 2024) — only needed for `make check`
 
 git clone https://github.com/lileding/argus.git
 cd argus
 
-# Start PostgreSQL + pgvector
-docker compose up -d
+# Build the runtime image (musl-static + alpine, ~107 MB)
+make image
+```
 
-# Configure
-cp config.example.toml ~/.config/argus/argus.toml
+Create a working directory with your config and a compose file
+(example below). The `workspace/` path inside this repo is gitignored
+so you can develop your test env there without leaking secrets.
+
+```bash
+mkdir -p mywork/{media,user,skills,backups}
+cp config.example.toml mywork/config.toml
 # Edit: set Feishu app_id/app_secret, pick upstreams + API keys
+#       set [database] dsn = "postgres://argus:argus@db:5432/argus?sslmode=disable"
+```
 
-# Run
-make run
+`mywork/docker-compose.yml`:
+
+```yaml
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: argus
+      POSTGRES_USER: argus
+      POSTGRES_PASSWORD: argus
+    volumes:
+      - argus_pgdata:/var/lib/postgresql/data
+    ports: ["5432:5432"]
+    networks: [argus-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U argus -d argus"]
+      interval: 5s
+      retries: 10
+
+  argus:
+    image: argus:latest
+    depends_on:
+      db: { condition: service_healthy }
+    volumes:
+      - ./config.toml:/app/config.toml:ro
+      - ./media:/app/workspace/media
+      - ./user:/app/workspace/user
+      - ./skills:/app/workspace/skills:ro
+    networks: [argus-net]
+    restart: unless-stopped
+
+volumes:
+  argus_pgdata:
+
+networks:
+  argus-net:
+    driver: bridge
+```
+
+```bash
+cd mywork && docker compose up -d
 ```
 
 ## Configuration
@@ -147,11 +197,15 @@ See [config.example.toml](config.example.toml).
 ## Development
 
 ```bash
-make all       # cargo build
-make run       # build + run with ./workspace/config.toml
-make check     # fmt + clippy + test
-make test      # cargo test --workspace
+make all       # cargo build (host)
+make check     # fmt + clippy + test (host)
+make test      # cargo test --workspace (host)
+make image     # docker build -t argus:latest .
 ```
+
+Iterate by `make image` then `docker compose up -d argus` from your
+working directory (e.g. `workspace/`). Compose does not auto-rebuild —
+each code change requires an explicit `make image`.
 
 ## License
 

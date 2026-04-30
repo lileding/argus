@@ -1252,9 +1252,10 @@ All async UPDATE statements use precondition WHERE clauses:
 | `set_summary` (notifications) | `WHERE summary IS NULL` |
 | `update_status` (documents) | State machine enforcement via valid_from_states |
 
-Database is **required** — no fallback to in-memory store. PostgreSQL with
-pgvector must be running. `docker-compose.yaml` provided for one-command
-setup.
+Database is **required** — no fallback to in-memory store. PostgreSQL
+with pgvector must be running. The standard deployment puts both
+argus and the DB into a docker compose stack; see the Deployment
+section.
 
 ---
 
@@ -1461,11 +1462,34 @@ migrations/
 | CLI | clap (derive) |
 | Errors | thiserror (structured, per-module error enums) |
 | Auth | Mutex + Notify lock-free-during-HTTP pattern (not RwLock) |
-| Deployment | Single binary, `--config` flag, `docker-compose.yaml` for PostgreSQL |
+| Deployment | Multi-stage `Dockerfile` (musl-static build → alpine runtime, ~107 MB). argus + pgvector run in a docker compose stack |
 
 ---
 
-## Deployment Constraints
+## Deployment
+
+argus runs as a docker container alongside a pgvector container in a
+single compose stack. The repo ships a `Dockerfile` (multi-stage:
+musl-static rust build → alpine runtime); local test environments
+(compose file, `config.toml`, `media/`, `user/`, `skills/`, `backups/`)
+live in `workspace/` and are gitignored.
+
+```
+host
+ └── docker compose stack (network: argus-net)
+      ├── argus container         /app/argus, mounts config.toml +
+      │                           workspace dirs, depends on db
+      └── pgvector/pg16 (db)      named volume argus_pgdata,
+                                  ports 5432:5432 exposed for dev tools
+```
+
+Workflow:
+- `make image` → `docker build -t argus:latest .` (rebuild on code change)
+- `docker compose up -d` from your working dir
+- The compose does not auto-rebuild on source change — explicit
+  `make image` is required between iterations
+
+### Deployment Constraints
 
 - **Single instance only.** Task ordering relies on a single mpsc
   channel inside the Agent. The `FuturesUnordered` pool in the Feishu
@@ -1473,9 +1497,11 @@ migrations/
   the task queue would need to move to a database-backed mechanism
   (e.g. `SKIP LOCKED`) and the WS connection would need leader election.
 
-- **Host execution.** The `cli` tool runs commands directly on the host
-  via `bash -c` or `sh -c`. No sandbox abstraction, no Docker isolation,
-  no resource limits. Suitable for a trusted personal machine.
+- **Container execution.** The `cli` tool runs commands inside the
+  argus container (`bash -c` / `sh -c`). The container ships with a
+  basic toolchain (`bash`, `curl`, `jq`, `git`, `python3`,
+  `poppler-utils`) — no sandbox layer beyond container isolation, no
+  resource limits. Suitable for a trusted personal deployment.
 
 - **WebSocket, not webhook.** Feishu events arrive via a persistent
   WebSocket connection (Feishu's newer protocol), not via HTTP webhook
